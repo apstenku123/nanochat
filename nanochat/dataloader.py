@@ -1,9 +1,11 @@
 from collections import deque
+import os
 
+import numpy as np
 import torch
 import pyarrow.parquet as pq
 
-from nanochat.common import get_dist_info
+from nanochat.common import get_dist_info, get_base_dir
 from nanochat.dataset import list_parquet_files
 from nanochat.tokenizer import get_tokenizer
 
@@ -91,4 +93,140 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
 def tokenizing_distributed_data_loader(*args, **kwargs):
     # helper function that only emits the inputs/targets and not the state_dict
     for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state(*args, **kwargs):
+        yield inputs, targets
+
+
+# =============================================================================
+# Fast binary dataloader (for pre-tokenized data)
+# =============================================================================
+
+def list_bin_files(data_dir=None):
+    """List all .bin files in the tokenized data directory."""
+    if data_dir is None:
+        data_dir = os.path.join(get_base_dir(), "tokenized_data")
+    if not os.path.exists(data_dir):
+        return []
+    bin_files = sorted([
+        os.path.join(data_dir, f) for f in os.listdir(data_dir)
+        if f.endswith('.bin')
+    ])
+    return bin_files
+
+
+def load_bin_file(path):
+    """Memory-map a binary token file. Returns (memmap, num_tokens)."""
+    # Read header to get token count
+    with open(path, 'rb') as f:
+        header = np.frombuffer(f.read(8), dtype=np.uint64)
+        num_tokens = int(header[0])
+    # Memory-map the data portion (skip 8-byte header)
+    data = np.memmap(path, dtype=np.uint16, mode='r', offset=8, shape=(num_tokens,))
+    return data, num_tokens
+
+
+def binary_distributed_data_loader_with_state(B, T, split, device="cuda", resume_state_dict=None):
+    """
+    Fast dataloader that reads pre-tokenized binary files.
+
+    This is much faster than tokenizing_distributed_data_loader because:
+    1. No tokenization overhead
+    2. Memory-mapped files for fast random access
+    3. Simple sequential reads with minimal Python overhead
+
+    Args:
+        B: batch size (number of sequences per batch)
+        T: sequence length
+        split: "train" or "val"
+        device: target device
+        resume_state_dict: optional dict with {"file_idx", "position"} to resume from
+
+    Yields:
+        (inputs, targets, state_dict) where inputs/targets are (B, T) tensors
+    """
+    assert split in ["train", "val"], "split must be 'train' or 'val'"
+
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+
+    # Get all binary files
+    bin_files = list_bin_files()
+    assert len(bin_files) > 0, "No tokenized .bin files found. Run: python -m scripts.pretokenize"
+
+    # Split: last file is val, rest is train
+    bin_files = bin_files[:-1] if split == "train" else bin_files[-1:]
+
+    # Load and concatenate all files (memory-mapped, so this is cheap)
+    all_data = []
+    file_boundaries = [0]  # cumulative token counts
+    for path in bin_files:
+        data, num_tokens = load_bin_file(path)
+        all_data.append(data)
+        file_boundaries.append(file_boundaries[-1] + num_tokens)
+
+    total_tokens = file_boundaries[-1]
+    tokens_per_batch = B * T * ddp_world_size  # tokens consumed per iteration across all ranks
+    needed_tokens = B * T + 1  # +1 for the target at last position
+
+    # Helper to get tokens from position
+    def get_tokens_at(global_pos, count):
+        """Get `count` tokens starting at global_pos, wrapping around if needed."""
+        tokens = []
+        pos = global_pos % total_tokens
+        remaining = count
+
+        while remaining > 0:
+            # Find which file this position is in
+            file_idx = 0
+            for i, boundary in enumerate(file_boundaries[1:], 1):
+                if pos < boundary:
+                    file_idx = i - 1
+                    break
+
+            # Get position within file
+            file_start = file_boundaries[file_idx]
+            file_end = file_boundaries[file_idx + 1]
+            pos_in_file = pos - file_start
+
+            # How many tokens can we get from this file?
+            available = file_end - pos
+            to_take = min(remaining, available)
+
+            # Get the tokens
+            tokens.extend(all_data[file_idx][pos_in_file:pos_in_file + to_take])
+            remaining -= to_take
+            pos = (pos + to_take) % total_tokens
+
+        return tokens
+
+    # Resume state or start fresh
+    if resume_state_dict is not None:
+        global_pos = resume_state_dict.get("global_pos", 0)
+    else:
+        global_pos = 0
+
+    # Each rank gets a different slice of the data
+    rank_offset = ddp_rank * (B * T)
+
+    while True:
+        # Calculate this rank's starting position
+        pos = (global_pos + rank_offset) % total_tokens
+
+        # Get tokens for this batch
+        tokens = get_tokens_at(pos, needed_tokens)
+
+        # Create tensors
+        use_cuda = device == "cuda"
+        scratch = torch.tensor(tokens, dtype=torch.long, pin_memory=use_cuda)
+        inputs = scratch[:-1].view(B, T).to(device=device, non_blocking=use_cuda)
+        targets = scratch[1:].view(B, T).to(device=device, non_blocking=use_cuda)
+
+        state_dict = {"global_pos": global_pos}
+        yield inputs, targets, state_dict
+
+        # Advance global position for next iteration
+        global_pos = (global_pos + tokens_per_batch) % total_tokens
+
+
+def binary_distributed_data_loader(*args, **kwargs):
+    """Helper that only yields inputs/targets without state_dict."""
+    for inputs, targets, state_dict in binary_distributed_data_loader_with_state(*args, **kwargs):
         yield inputs, targets

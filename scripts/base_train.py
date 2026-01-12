@@ -12,7 +12,26 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 """
 
 import os
+import shutil
+
+# Triton SM121a auto-fix: Triton bundles ptxas 12.8 which doesn't support SM121a (GB10)
+# We need system ptxas from CUDA 13.0+ for GB10/DGX Spark
+if not os.environ.get("TRITON_PTXAS_PATH"):
+    for ptxas in ["/usr/local/cuda/bin/ptxas", shutil.which("ptxas")]:
+        if ptxas and os.path.exists(ptxas):
+            os.environ["TRITON_PTXAS_PATH"] = ptxas
+            break
+
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+# GB10 SM count fix: PyTorch's is_big_gpu() requires 68 SMs but GB10 has 48
+# Force max_autotune_gemm to work on GB10 by setting env var before torch import
+os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_GEMM"] = "1"
+
+# Persistent cache for autotune results (survives reboot, faster subsequent runs)
+CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", ".cache", "torchinductor")
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = CACHE_DIR
 import argparse
 import time
 from contextlib import nullcontext
@@ -20,9 +39,22 @@ from contextlib import nullcontext
 import wandb
 import torch
 
-from nanochat.gpt import GPT, GPTConfig
+# Fix Liger-Kernel graph breaks: LigerFusedLinearCrossEntropy calls .item() internally
+# which causes torch.compile graph breaks. This config enables capturing scalar outputs.
+torch._dynamo.config.capture_scalar_outputs = True
+
+# Patch is_big_gpu to return True for GB10 (48 SMs < 68 SM threshold)
+# This eliminates the "Not enough SMs to use max_autotune_gemm mode" warning
+try:
+    import torch._inductor.utils as inductor_utils
+    inductor_utils.is_big_gpu = lambda index=0: True
+except Exception:
+    pass
+
+from nanochat.gpt import GPT, GPTConfig, select_precision, make_autocast_ctx
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
+from nanochat import kernels
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
@@ -66,17 +98,46 @@ parser.add_argument("--core_metric_every", type=int, default=2000, help="evaluat
 parser.add_argument("--core_metric_max_per_task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample_every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save_every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+# Dataloader
+parser.add_argument("--tokenizer_threads", type=int, default=4, help="number of threads for tokenization")
+parser.add_argument("--tokenizer_batch_size", type=int, default=128, help="batch size for tokenization")
 # Output
 parser.add_argument("--model_tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# Precision (NVFP4/FP8/BF16)
+parser.add_argument("--precision", type=str, default="auto", help="precision: auto|nvfp4|fp8|bf16")
+parser.add_argument("--nvfp4_disable_rht", type=bool, default=True, help="disable Random Hadamard Transform (required for SM121/GB10)")
+parser.add_argument("--nvfp4_disable_sr", type=bool, default=False, help="disable Stochastic Rounding")
+# Kernel backend
+parser.add_argument("--kernel", type=str, default="current", choices=["current", "liger", "triton"], help="kernel backend: current (PyTorch), liger (Liger-Kernel), triton (Unsloth-style)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+
+# Set kernel backend
+kernels.set_kernel_backend(args.kernel)
 # -----------------------------------------------------------------------------
 
 # Compute init
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+
+# PyTorch performance optimizations
+if device_type == "cuda":
+    torch.backends.cudnn.benchmark = True  # auto-tune cuDNN algorithms
+    torch.set_float32_matmul_precision('high')  # TF32 on Ampere+, faster matmuls
+    # Note: Don't use legacy allow_tf32 API - conflicts with set_float32_matmul_precision
+
+# Set up precision plan and autocast context factory
+precision_plan = select_precision(target=args.precision, disable_rht=args.nvfp4_disable_rht, disable_sr=args.nvfp4_disable_sr)
+print0(f"Precision: {precision_plan.name}")
+autocast_ctx = make_autocast_ctx(precision_plan, device_type)
+
+# NVFP4 on SM121 requires batch_size >= 2
+if "NVFP4" in precision_plan.name and args.device_batch_size < 2:
+    print0(f"WARNING: NVFP4 requires device_batch_size >= 2, but got {args.device_batch_size}")
+    print0("Automatically increasing device_batch_size to 2")
+    args.device_batch_size = 2
+
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 
@@ -141,6 +202,11 @@ with torch.device("meta"):
 model.to_empty(device=device) # All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # All tensors get initialized
 
+# When using TE precision (NVFP4/FP8), convert model to bfloat16 for proper mixed precision
+if precision_plan.use_te:
+    model.to(dtype=torch.bfloat16)
+    print0("Converted model to bfloat16 for TE training")
+
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
@@ -202,7 +268,7 @@ if resuming:
 # Initialize the DataLoaders for train/val
 tokens_dir = os.path.join(base_dir, "tokenized_data")
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state(args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+train_loader = tokenizing_distributed_data_loader_with_state(args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, tokenizer_threads=args.tokenizer_threads, tokenizer_batch_size=args.tokenizer_batch_size)
 build_val_loader = lambda: tokenizing_distributed_data_loader(args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
@@ -255,7 +321,7 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with autocast_ctx:
+        with autocast_ctx():
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
@@ -273,7 +339,7 @@ while True:
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
-        with autocast_ctx:
+        with autocast_ctx():
             results = evaluate_model(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
@@ -300,7 +366,7 @@ while True:
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
-            with autocast_ctx:
+            with autocast_ctx():
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
@@ -339,7 +405,7 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
+        with autocast_ctx():
             loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
@@ -368,8 +434,19 @@ while True:
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt
-    promised_flops_per_sec_h100 = 989e12 * ddp_world_size # bfloat16 H100 SXM and without 2:4 sparsity
-    mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
+    # Theoretical peak FLOPS for MFU calculation (dense, no 2:4 sparsity)
+    # H100 SXM BF16: 989 TFLOPS sparse, ~495 TFLOPS dense
+    # GB10 NVFP4: 1000 TFLOPS sparse, ~500 TFLOPS dense; BF16: ~62 TFLOPS
+    # We use dense numbers since nanochat doesn't use 2:4 structured sparsity
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
+    if "GB10" in gpu_name:
+        # GB10: use NVFP4 peak if using TE precision, else BF16
+        promised_flops = 500e12 if precision_plan.use_te else 62e12
+    else:
+        # Default to H100 dense BF16
+        promised_flops = 495e12
+    promised_flops_total = promised_flops * ddp_world_size
+    mfu = 100 * flops_per_sec / promised_flops_total # in %
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     # Calculate ETA based on average time per step (excluding first 10 steps)

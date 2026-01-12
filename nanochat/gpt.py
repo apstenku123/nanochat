@@ -9,11 +9,14 @@ Notable features:
 - no learnable params in rmsnorm
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
+- Optional NVFP4/FP8 training via Transformer Engine
 """
 
 import math
+from contextlib import nullcontext
 from functools import partial
 from dataclasses import dataclass
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,6 +25,124 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
+from nanochat import kernels
+
+# ==============================================================================
+# Transformer Engine Support (optional, for NVFP4/FP8 training)
+# ==============================================================================
+TE_AVAILABLE = False
+te = None
+TE_Format = None
+TE_NVFP4BlockScaling = None
+TE_DelayedScaling = None
+
+try:
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import Format as TE_Format
+    from transformer_engine.common.recipe import DelayedScaling as TE_DelayedScaling
+    try:
+        from transformer_engine.common.recipe import NVFP4BlockScaling as TE_NVFP4BlockScaling
+    except ImportError:
+        pass
+    TE_AVAILABLE = True
+except ImportError:
+    pass
+
+
+def check_te_capability(feature: str) -> Tuple[bool, str]:
+    """Check if TE supports a feature on current hardware."""
+    if not TE_AVAILABLE:
+        return False, "TE not installed"
+    fn_name = f"is_{feature}_available"
+    if not hasattr(te, fn_name):
+        return False, f"te.{fn_name} missing"
+    try:
+        res = getattr(te, fn_name)(return_reason=True)
+        if isinstance(res, tuple):
+            return bool(res[0]), str(res[1])
+        return bool(res), ""
+    except Exception:
+        try:
+            return bool(getattr(te, fn_name)()), ""
+        except Exception:
+            return False, "Check crashed"
+
+
+@dataclass
+class PrecisionPlan:
+    """Describes the precision strategy for training."""
+    name: str
+    recipe: Optional[Any]
+    use_te: bool
+
+
+def select_precision(
+    target: str = "auto",
+    disable_rht: bool = True,
+    disable_sr: bool = False,
+) -> PrecisionPlan:
+    """
+    Select precision plan based on hardware capabilities.
+
+    Args:
+        target: "auto", "nvfp4", "fp8", or "bf16"
+        disable_rht: Disable Random Hadamard Transform (required for SM121/GB10)
+        disable_sr: Disable Stochastic Rounding
+
+    Returns:
+        PrecisionPlan with recipe configuration
+    """
+    nvfp4_ok, nv4_r = check_te_capability("nvfp4")
+    fp8_ok, fp8_r = check_te_capability("fp8")
+
+    print0(f"HW Capability: NVFP4={nvfp4_ok} ({nv4_r}) | FP8={fp8_ok}")
+
+    # 1. NVFP4 Strategy (Blackwell)
+    if target in ["auto", "nvfp4"] and nvfp4_ok and TE_NVFP4BlockScaling:
+        try:
+            # CRITICAL: override_linear_precision=(False, False, True)
+            # (Fwd=FP4, Bwd=FP4, WGrad=BF16) - keeps weight updates clean
+            recipe = TE_NVFP4BlockScaling(
+                fp4_format=getattr(TE_Format, "E2M1", None),
+                override_linear_precision=(False, False, True),
+                disable_rht=disable_rht,
+                disable_stochastic_rounding=disable_sr,
+            )
+            name = "NVFP4 (E2M1) + WGrad BF16"
+            if disable_sr:
+                name += " [no SR]"
+        except TypeError:
+            # Fallback for older TE versions
+            recipe = TE_NVFP4BlockScaling(fp4_format=getattr(TE_Format, "E2M1", None))
+            name = "NVFP4 (E2M1)"
+        return PrecisionPlan(name, recipe, True)
+
+    # 2. FP8 Strategy (Hopper)
+    if target in ["auto", "fp8", "nvfp4"] and fp8_ok:
+        fmt = getattr(TE_Format, "HYBRID", getattr(TE_Format, "E4M3", None))
+        recipe = TE_DelayedScaling(fp8_format=fmt)
+        return PrecisionPlan("FP8 (Hybrid)", recipe, True)
+
+    # 3. Fallback (BF16)
+    return PrecisionPlan("PyTorch BF16", None, False)
+
+
+def make_autocast_ctx(plan: PrecisionPlan, device_type: str = "cuda"):
+    """
+    Create autocast context factory for the precision plan.
+    Returns a callable that creates a fresh context each time.
+    """
+    if plan.use_te and plan.recipe is not None and TE_AVAILABLE:
+        def te_ctx():
+            if hasattr(te, "autocast"):
+                return te.autocast(enabled=True, recipe=plan.recipe)
+            return te.fp8_autocast(enabled=True, fp8_recipe=plan.recipe)
+        return te_ctx
+    elif device_type == "cuda":
+        return lambda: torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+    else:
+        return nullcontext
+
 
 @dataclass
 class GPTConfig:
@@ -35,7 +156,8 @@ class GPTConfig:
 
 def norm(x):
     # Purely functional rmsnorm with no learnable params
-    return F.rms_norm(x, (x.size(-1),))
+    # Uses optimized kernel when available (liger/triton backend)
+    return kernels.rms_norm(x)
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -292,20 +414,37 @@ class GPT(nn.Module):
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            # Training: compute loss
+            # Use fused linear + cross entropy when available (liger/triton backend)
+            # This avoids materializing the huge logits tensor, saving ~60% memory
+            backend = kernels.get_kernel_backend()
+            if backend in ["liger", "triton"] and kernels.LIGER_AVAILABLE:
+                # Fused path: hidden_states -> loss (no logits materialized)
+                # Note: we need to use only the non-padded vocab portion of lm_head
+                # The lm_head weight is (padded_vocab_size, n_embd), we slice to (vocab_size, n_embd)
+                lm_head_weight = self.lm_head.weight[:self.config.vocab_size, :]
+                loss = kernels.fused_linear_cross_entropy(
+                    x, lm_head_weight, targets,
+                    ignore_index=-1, softcap=softcap
+                )
+                return loss
+            else:
+                # Standard path: compute logits then cross entropy
+                logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor
+                logits = logits[..., :self.config.vocab_size] # slice to remove padding
+                logits = logits.float() # switch to fp32 for logit softcap and loss computation
+                logits = softcap * torch.tanh(logits / softcap) # squash the logits
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+                return loss
         else:
-            # inference: just return the logits directly
+            # Inference: return logits
+            logits = self.lm_head(x)
+            logits = logits[..., :self.config.vocab_size]
+            logits = logits.float()
+            logits = softcap * torch.tanh(logits / softcap)
             return logits
 
     @torch.inference_mode()
