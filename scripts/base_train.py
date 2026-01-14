@@ -108,7 +108,7 @@ parser.add_argument("--model_tag", type=str, default=None, help="override model 
 # Precision (NVFP4/FP8/BF16)
 parser.add_argument("--precision", type=str, default="auto", help="precision: auto|nvfp4|fp8|bf16")
 parser.add_argument("--nvfp4_disable_rht", type=bool, default=True, help="disable Random Hadamard Transform (required for SM121/GB10)")
-parser.add_argument("--nvfp4_disable_sr", type=bool, default=False, help="disable Stochastic Rounding")
+parser.add_argument("--nvfp4_disable_sr", type=bool, default=True, help="disable Stochastic Rounding (required for SM121/GB10)")
 # Kernel backend
 parser.add_argument("--kernel", type=str, default="current", choices=["current", "liger", "triton"], help="kernel backend: current (PyTorch), liger (Liger-Kernel), triton (Unsloth-style)")
 args = parser.parse_args()
@@ -200,14 +200,11 @@ if args.depth != 12:
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-# Create a new model with random weights
+# Create a new model with random weights (directly on CUDA, no meta device)
 model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern)
-with torch.device("meta"):
-    # All tensors are created as meta tensors (they have shape/dtype but no data)
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
-model.to_empty(device=device) # All tensors get storage on target device but with uninitialized (garbage) data
-model.init_weights() # All tensors get initialized
+model_config = GPTConfig(**model_config_kwargs)
+model = GPT(model_config)
+model.init_weights()
 
 # When using TE precision (NVFP4/FP8), convert model to bfloat16 for proper mixed precision
 if precision_plan.use_te:
