@@ -1,15 +1,17 @@
 """
 Optimized Triton kernels for nanochat training.
 
-Provides three kernel backends:
+Provides four kernel backends:
 - current: PyTorch native operations
 - liger: Liger-Kernel optimized Triton kernels
+- cce: Apple Cut Cross Entropy (most memory efficient)
 - triton: Custom Triton kernels (Unsloth-style)
 
 The biggest wins come from:
 1. FusedLinearCrossEntropy: Fuses lm_head projection with cross entropy
    - Avoids materializing huge logits tensor (B*T*V floats)
    - Can save 50-60% memory and speed up training
+   - CCE saves even more: 28GB -> 1GB on some models!
 2. Fused RMSNorm: Reduces memory bandwidth
 3. Optimized RoPE: Better memory access patterns
 """
@@ -22,12 +24,12 @@ from typing import Optional, Literal
 # Kernel backend selection
 # =============================================================================
 
-KERNEL_BACKEND: Literal["current", "liger", "triton"] = "current"
+KERNEL_BACKEND: Literal["current", "liger", "cce", "triton"] = "current"
 
 def set_kernel_backend(backend: str):
     """Set the kernel backend for training."""
     global KERNEL_BACKEND
-    assert backend in ["current", "liger", "triton"], f"Unknown backend: {backend}"
+    assert backend in ["current", "liger", "cce", "triton"], f"Unknown backend: {backend}"
     KERNEL_BACKEND = backend
     print(f"Kernel backend: {KERNEL_BACKEND}")
 
@@ -45,6 +47,17 @@ try:
     from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction
     from liger_kernel.ops.rope import LigerRopeFunction
     LIGER_AVAILABLE = True
+except ImportError:
+    pass
+
+# =============================================================================
+# Apple Cut Cross Entropy imports (optional)
+# =============================================================================
+
+CCE_AVAILABLE = False
+try:
+    from cut_cross_entropy import linear_cross_entropy as cce_linear_cross_entropy
+    CCE_AVAILABLE = True
 except ImportError:
     pass
 
@@ -227,6 +240,43 @@ def fused_linear_cross_entropy_liger(
     return loss
 
 
+def fused_linear_cross_entropy_cce(
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int = -1,
+    softcap: Optional[float] = None,
+) -> torch.Tensor:
+    """Apple Cut Cross Entropy - most memory efficient.
+
+    CCE achieves dramatic memory savings by never materializing the full logits:
+    - Forward: 24,000 MB -> 1.1 MB
+    - Forward+Backward: 28,000 MB -> 1,164 MB
+
+    Reference: https://github.com/apple/ml-cross-entropy
+    Paper: "Cut Your Losses in Large-Vocabulary Language Models" (ICLR 2025)
+    """
+    if not CCE_AVAILABLE:
+        return fused_linear_cross_entropy_current(
+            hidden_states, lm_head_weight, targets, ignore_index, softcap
+        )
+
+    B_T = hidden_states.size(0) * hidden_states.size(1) if hidden_states.dim() == 3 else hidden_states.size(0)
+    hidden_flat = hidden_states.view(B_T, -1)
+    targets_flat = targets.view(-1)
+
+    # CCE expects: e (embeddings), c (classifier), targets
+    # e @ c.T = logits, but never materialized
+    return cce_linear_cross_entropy(
+        e=hidden_flat,
+        c=lm_head_weight,
+        targets=targets_flat,
+        ignore_index=ignore_index,
+        softcap=softcap,
+        reduction='mean',
+    )
+
+
 def fused_linear_cross_entropy(
     hidden_states: torch.Tensor,
     lm_head_weight: torch.Tensor,
@@ -235,6 +285,10 @@ def fused_linear_cross_entropy(
     softcap: Optional[float] = None,
 ) -> torch.Tensor:
     """Dispatch to appropriate fused linear + cross entropy based on backend."""
+    if KERNEL_BACKEND == "cce" and CCE_AVAILABLE:
+        return fused_linear_cross_entropy_cce(
+            hidden_states, lm_head_weight, targets, ignore_index, softcap
+        )
     if KERNEL_BACKEND in ["liger", "triton"] and LIGER_AVAILABLE:
         return fused_linear_cross_entropy_liger(
             hidden_states, lm_head_weight, targets, ignore_index, softcap
@@ -285,6 +339,10 @@ def print_kernel_info():
     """Print information about available kernels."""
     print(f"Kernel backend: {KERNEL_BACKEND}")
     print(f"Liger-Kernel available: {LIGER_AVAILABLE}")
+    print(f"CCE available: {CCE_AVAILABLE}")
     if LIGER_AVAILABLE:
         import liger_kernel
         print(f"Liger-Kernel version: {liger_kernel.__version__ if hasattr(liger_kernel, '__version__') else 'unknown'}")
+    if CCE_AVAILABLE:
+        import cut_cross_entropy
+        print(f"CCE version: {cut_cross_entropy.__version__ if hasattr(cut_cross_entropy, '__version__') else 'unknown'}")

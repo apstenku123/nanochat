@@ -21,3 +21,5 @@ rustbpe/target/release/.fingerprint/ahash-3ce40e42a3c0b5f2/dep-build-script-buil
 wheels/*
 
 wheels/__MACOSX/release/._torch-2.9.1a0+gitd38164a-cp312-cp312-linux_aarch64.whl
+.cache/*
+.cache/torchinductor/pk/cpkovt5o3kh5zoexsfktjcs76bxeinp4nju5ov2bftbwrnll4dr2.py
