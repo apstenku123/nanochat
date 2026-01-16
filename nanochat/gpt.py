@@ -155,8 +155,12 @@ class GPT(nn.Module):
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
-        # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
-        # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
+        # Pad vocab size to multiple of 64 for tensor core efficiency (significant speedup for lm_head matmul).
+        # Trade-off: During training, the softmax denominator includes padding logits (initialized to ~0),
+        # adding ~(padding_count) to the denominator. Impact is tiny (<0.01% for 47 extra tokens vs 50K vocab)
+        # and consistent across training. Inference correctly slices to vocab_size.
+        # Default vocab_size=50304 is already aligned, so padding only affects custom unaligned vocab sizes.
+        # Set pad_vocab_size_to=1 to disable padding if exact loss values are critical.
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
@@ -372,7 +376,8 @@ class GPT(nn.Module):
 
         if targets is not None:
             # Training: use fused linear + cross entropy (CCE recommended)
-            # CCE avoids materializing the huge logits tensor (B*T*V)
+            # CCE avoids materializing the huge logits tensor (B*T*V), saving ~8GB for large vocabs.
+            # Note: lm_head.weight may have padded_vocab_size rows (see __init__ comment for trade-off).
             loss = kernels.fused_linear_cross_entropy(
                 x.to(torch.bfloat16),
                 self.lm_head.weight.to(torch.bfloat16),
