@@ -172,12 +172,15 @@ def fused_linear_cross_entropy_current(
     targets: torch.Tensor,
     ignore_index: int = -1,
     softcap: Optional[float] = None,
+    reduction: str = 'mean',
 ) -> torch.Tensor:
     """Standard (non-fused) linear + cross entropy.
 
     This materializes the full logits tensor which is huge: (B*T, vocab_size).
     For B=32, T=2048, V=65536, that's 4.3B floats = 17GB in fp32 or 8.5GB in bf16!
     """
+    B, T = hidden_states.size(0), hidden_states.size(1) if hidden_states.dim() == 3 else 1
+
     # Linear projection: (B*T, hidden) @ (hidden, vocab) -> (B*T, vocab)
     logits = F.linear(hidden_states, lm_head_weight)
 
@@ -186,12 +189,18 @@ def fused_linear_cross_entropy_current(
         logits = softcap * torch.tanh(logits / softcap)
 
     # Cross entropy
-    return F.cross_entropy(
+    loss = F.cross_entropy(
         logits.view(-1, logits.size(-1)),
         targets.view(-1),
         ignore_index=ignore_index,
-        reduction='mean'
+        reduction=reduction
     )
+
+    # Reshape for reduction='none' to match expected (B, T) shape
+    if reduction == 'none' and hidden_states.dim() == 3:
+        loss = loss.view(B, T)
+
+    return loss
 
 
 def fused_linear_cross_entropy_liger(
@@ -200,6 +209,7 @@ def fused_linear_cross_entropy_liger(
     targets: torch.Tensor,
     ignore_index: int = -1,
     softcap: Optional[float] = None,
+    reduction: str = 'mean',
 ) -> torch.Tensor:
     """Liger-Kernel fused linear + cross entropy.
 
@@ -210,10 +220,11 @@ def fused_linear_cross_entropy_liger(
     """
     if not LIGER_AVAILABLE:
         return fused_linear_cross_entropy_current(
-            hidden_states, lm_head_weight, targets, ignore_index, softcap
+            hidden_states, lm_head_weight, targets, ignore_index, softcap, reduction
         )
 
-    B_T = hidden_states.size(0) * hidden_states.size(1) if hidden_states.dim() == 3 else hidden_states.size(0)
+    B, T = hidden_states.size(0), hidden_states.size(1) if hidden_states.dim() == 3 else 1
+    B_T = B * T
     hidden_flat = hidden_states.view(B_T, -1)
     targets_flat = targets.view(-1)
 
@@ -231,12 +242,17 @@ def fused_linear_cross_entropy_liger(
         ignore_index,      # ignore_index
         0.0,               # lse_square_scale
         0.0,               # label_smoothing
-        'mean',            # reduction
+        reduction,         # reduction
         softcap,           # softcap
         False,             # return_z_loss
     )
     # Extract just the loss from the tuple
     loss = result[0] if isinstance(result, tuple) else result
+
+    # Reshape for reduction='none' to match expected (B, T) shape
+    if reduction == 'none' and hidden_states.dim() == 3:
+        loss = loss.view(B, T)
+
     return loss
 
 
@@ -246,6 +262,7 @@ def fused_linear_cross_entropy_cce(
     targets: torch.Tensor,
     ignore_index: int = -1,
     softcap: Optional[float] = None,
+    reduction: str = 'mean',
 ) -> torch.Tensor:
     """Apple Cut Cross Entropy - most memory efficient.
 
@@ -258,23 +275,30 @@ def fused_linear_cross_entropy_cce(
     """
     if not CCE_AVAILABLE:
         return fused_linear_cross_entropy_current(
-            hidden_states, lm_head_weight, targets, ignore_index, softcap
+            hidden_states, lm_head_weight, targets, ignore_index, softcap, reduction
         )
 
-    B_T = hidden_states.size(0) * hidden_states.size(1) if hidden_states.dim() == 3 else hidden_states.size(0)
+    B, T = hidden_states.size(0), hidden_states.size(1) if hidden_states.dim() == 3 else 1
+    B_T = B * T
     hidden_flat = hidden_states.view(B_T, -1)
     targets_flat = targets.view(-1)
 
     # CCE expects: e (embeddings), c (classifier), targets
     # e @ c.T = logits, but never materialized
-    return cce_linear_cross_entropy(
+    loss = cce_linear_cross_entropy(
         e=hidden_flat,
         c=lm_head_weight,
         targets=targets_flat,
         ignore_index=ignore_index,
         softcap=softcap,
-        reduction='mean',
+        reduction=reduction,
     )
+
+    # Reshape for reduction='none' to match expected (B, T) shape
+    if reduction == 'none' and hidden_states.dim() == 3:
+        loss = loss.view(B, T)
+
+    return loss
 
 
 def fused_linear_cross_entropy(
@@ -283,18 +307,19 @@ def fused_linear_cross_entropy(
     targets: torch.Tensor,
     ignore_index: int = -1,
     softcap: Optional[float] = None,
+    reduction: str = 'mean',
 ) -> torch.Tensor:
     """Dispatch to appropriate fused linear + cross entropy based on backend."""
     if KERNEL_BACKEND == "cce" and CCE_AVAILABLE:
         return fused_linear_cross_entropy_cce(
-            hidden_states, lm_head_weight, targets, ignore_index, softcap
+            hidden_states, lm_head_weight, targets, ignore_index, softcap, reduction
         )
     if KERNEL_BACKEND in ["liger", "triton"] and LIGER_AVAILABLE:
         return fused_linear_cross_entropy_liger(
-            hidden_states, lm_head_weight, targets, ignore_index, softcap
+            hidden_states, lm_head_weight, targets, ignore_index, softcap, reduction
         )
     return fused_linear_cross_entropy_current(
-        hidden_states, lm_head_weight, targets, ignore_index, softcap
+        hidden_states, lm_head_weight, targets, ignore_index, softcap, reduction
     )
 
 # =============================================================================

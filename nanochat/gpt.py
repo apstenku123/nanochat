@@ -367,14 +367,19 @@ class GPT(nn.Module):
             x = block(x, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
+        # Softcap: smoothly cap the logits to the range [-softcap, softcap]
+        softcap = 15
+
         if targets is not None:
             # Training: use fused linear + cross entropy (CCE recommended)
             # CCE avoids materializing the huge logits tensor (B*T*V)
-            # Note: softcap is handled inside CCE if needed
             loss = kernels.fused_linear_cross_entropy(
                 x.to(torch.bfloat16),
                 self.lm_head.weight.to(torch.bfloat16),
                 targets,
+                ignore_index=-1,
+                softcap=softcap,
+                reduction=loss_reduction,
             )
             return loss
         else:

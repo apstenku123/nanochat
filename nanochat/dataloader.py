@@ -149,7 +149,17 @@ def binary_distributed_data_loader_with_state(B, T, split, device="cuda", resume
     assert len(bin_files) > 0, "No tokenized .bin files found. Run: python -m scripts.pretokenize"
 
     # Split: last file is val, rest is train
-    bin_files = bin_files[:-1] if split == "train" else bin_files[-1:]
+    # Need at least 2 files for train/val split
+    if len(bin_files) == 1:
+        if split == "train":
+            raise ValueError(
+                f"Cannot create train split: only 1 .bin file found, but need at least 2 "
+                f"(last file is used for validation). Either add more data shards or use split='val'."
+            )
+        # For val split with 1 file, use that file
+        # bin_files stays as-is
+    else:
+        bin_files = bin_files[:-1] if split == "train" else bin_files[-1:]
 
     # Load and concatenate all files (memory-mapped, so this is cheap)
     all_data = []
