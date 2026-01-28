@@ -50,6 +50,8 @@ Target: **300-400 billion tokens** total throughput.
 | **Nemotron Code v2** | `nvidia/Nemotron-Pretraining-Code-v2` | Yes (+ code review, transpilation) | 897GB | Highest |
 | **Nemotron CC Code v1** | `nvidia/Nemotron-CC-Code-v1` | Yes | 428B tokens | High (LLM quality-scored) |
 | **The Stack (dedup)** | `bigcode/the-stack-dedup` | Yes (`data/c++`) | ~3TB total | Good (MinHash deduped) |
+| **CommitPack** | `bigcode/commitpack` | Yes (C++ subset) | ~4TB total | Good (git commit+diff pairs) |
+| **CommitPackFT** | `bigcode/commitpackft` | Yes (C++ subset) | ~2GB filtered | High (quality-filtered commits) |
 
 ### Raw Sources (Supplement for Diversity)
 
