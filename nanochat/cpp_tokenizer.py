@@ -31,8 +31,60 @@ class CppTokenizer:
         self._vocab = self._tokenizer.get_vocab()
         self._id_to_token = {v: k for k, v in self._vocab.items()}
 
-    def encode(self, text: str) -> list[int]:
-        return self._tokenizer.encode(text).ids
+    # --- nanochat-compatible API ---
+
+    def get_bos_token_id(self):
+        return self.bos_token_id
+
+    def get_vocab_size(self):
+        return self.vocab_size
+
+    def get_special_tokens(self):
+        # Return all angle-bracket tokens
+        return [t for t in self._vocab if t.startswith("<") and t.endswith(">")]
+
+    def encode_special(self, text):
+        # Support both nanochat-style <|bos|> and our <BOS> format
+        result = self._vocab.get(text, None)
+        if result is None:
+            # Map nanochat special tokens to our format
+            mapping = {
+                "<|bos|>": "<BOS>", "<|eos|>": "<EOS>",
+                "<|pad|>": "<PAD>", "<|endoftext|>": "<BOS>",
+            }
+            mapped = mapping.get(text)
+            if mapped:
+                result = self._vocab.get(mapped, None)
+        return result
+
+    def encode(self, text, prepend=None, append=None, num_threads=8):
+        """Encode text or list of texts. Compatible with nanochat API."""
+        if prepend is not None:
+            prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend)
+        if append is not None:
+            append_id = append if isinstance(append, int) else self.encode_special(append)
+
+        if isinstance(text, str):
+            ids = self._tokenizer.encode(text).ids
+            if prepend is not None:
+                ids.insert(0, prepend_id)
+            if append is not None:
+                ids.append(append_id)
+            return ids
+        elif isinstance(text, list):
+            results = [enc.ids for enc in self._tokenizer.encode_batch(text)]
+            if prepend is not None:
+                for row in results:
+                    row.insert(0, prepend_id)
+            if append is not None:
+                for row in results:
+                    row.append(append_id)
+            return results
+        else:
+            raise ValueError(f"Invalid input type: {type(text)}")
+
+    def __call__(self, *args, **kwargs):
+        return self.encode(*args, **kwargs)
 
     def encode_batch(self, texts: list[str]) -> list[list[int]]:
         return [enc.ids for enc in self._tokenizer.encode_batch(texts)]

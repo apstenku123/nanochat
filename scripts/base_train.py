@@ -204,6 +204,7 @@ if args.depth != 12:
 model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern)
 model_config = GPTConfig(**model_config_kwargs)
 model = GPT(model_config)
+model.to(device)  # Move model to GPU before init_weights (rotary embeddings need correct device)
 model.init_weights()
 
 # When using TE precision (NVFP4/FP8), convert model to bfloat16 for proper mixed precision

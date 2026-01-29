@@ -391,7 +391,12 @@ def get_tokenizer():
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    # return HuggingFaceTokenizer.from_directory(tokenizer_dir)
+    # Use CppTokenizer if tokenizer.json exists (C++ hybrid tokenizer)
+    cpp_tokenizer_path = os.path.join(tokenizer_dir, "tokenizer.json")
+    if os.path.exists(cpp_tokenizer_path) and os.environ.get("NANOCHAT_CPP_TOKENIZER", "0") == "1":
+        from nanochat.cpp_tokenizer import CppTokenizer
+        return CppTokenizer(tokenizer_dir)
+    # Default: RustBPE tokenizer (original nanochat)
     return RustBPETokenizer.from_directory(tokenizer_dir)
 
 def get_token_bytes(device="cpu"):

@@ -36,6 +36,29 @@ from flash_attn import flash_attn_func, flash_attn_with_kvcache
 # =============================================================================
 from nanochat import kernels
 
+# =============================================================================
+# Precision plan (BF16 default; TE/NVFP4/FP8 stubs for compatibility)
+# =============================================================================
+from contextlib import nullcontext
+from typing import Any, Optional
+
+@dataclass
+class PrecisionPlan:
+    name: str
+    recipe: Optional[Any]
+    use_te: bool
+
+def select_precision(target: str = "auto", disable_rht: bool = True, disable_sr: bool = True) -> PrecisionPlan:
+    """Select precision plan. Without TE, always returns BF16."""
+    return PrecisionPlan("PyTorch BF16", None, False)
+
+def make_autocast_ctx(plan: PrecisionPlan, device_type: str = "cuda"):
+    """Create autocast context factory."""
+    if device_type == "cuda":
+        return lambda: torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+    return nullcontext
+
+
 @dataclass
 class GPTConfig:
     sequence_len: int = 1024
