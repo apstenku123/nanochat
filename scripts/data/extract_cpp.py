@@ -13,11 +13,13 @@ from pathlib import Path
 
 CPP_EXTENSIONS = {'.cpp', '.cc', '.cxx', '.c', '.h', '.hpp', '.hxx', '.cu', '.cuh'}
 
-# Skip these directories (vendored deps, tests with generated data, build artifacts)
+# Skip these directories (build artifacts, not source code)
+# NOTE: We intentionally include third_party/vendor/external because they contain
+# real C++ source code useful for tokenizer training.
 SKIP_DIRS = {
-    '.git', 'build', 'cmake-build', 'third_party', 'third-party',
-    'node_modules', '.deps', 'vendor', 'external',
-    'test/data', 'testdata', 'benchmarks/data',
+    '.git', 'build', 'cmake-build',
+    'node_modules', '.deps',
+    'testdata', 'benchmarks/data',
 }
 
 # Auto-generated file markers
@@ -32,19 +34,24 @@ def is_generated(content: str, max_check: int = 500) -> bool:
     return any(m.upper() in header for m in GENERATED_MARKERS)
 
 def normalize_cpp(code: str) -> str:
-    """Normalize C++ code: strip indentation, compress blank lines, preserve comments."""
+    """Normalize C++ code: preserve indentation, compress blank lines, strip trailing whitespace.
+
+    We keep indentation because it carries structural information and contributes
+    meaningful tokens for a code model.  Tabs are converted to 4 spaces for
+    consistency.  Consecutive blank lines are collapsed to one.
+    """
     lines = code.split('\n')
     result = []
     prev_blank = False
     for line in lines:
-        stripped = line.strip()
-        if not stripped:
+        line = line.replace('\t', '    ').rstrip()
+        if not line:
             if not prev_blank:
                 result.append('')
                 prev_blank = True
             continue
         prev_blank = False
-        result.append(stripped)
+        result.append(line)
     return '\n'.join(result)
 
 def strip_license_header(code: str) -> str:
@@ -80,11 +87,11 @@ def quality_filter(content: str) -> bool:
     # Size checks
     if len(content) < 100:
         return False
-    if len(content) > 1_000_000:
+    if len(content) > 2_000_000:
         return False
     # Line length check
     lines = content.split('\n')
-    if any(len(l) > 1000 for l in lines[:100]):
+    if any(len(l) > 2000 for l in lines[:100]):
         return False
     # Unique lines ratio
     if len(lines) > 10:

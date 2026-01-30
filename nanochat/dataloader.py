@@ -7,8 +7,9 @@ import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info, get_base_dir
 from nanochat.dataset import list_parquet_files
+from nanochat.fim import apply_fim_batch
 
-def tokenizing_distributed_data_loader_with_state(tokenizer, B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, device="cuda", resume_state_dict=None):
+def tokenizing_distributed_data_loader_with_state(tokenizer, B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, device="cuda", resume_state_dict=None, fim_rate=0.0, spm_rate=0.5):
     """
     Stream pretraining text from parquet files, tokenize, yield training batches.
 
@@ -71,6 +72,12 @@ def tokenizing_distributed_data_loader_with_state(tokenizer, B, T, split, tokeni
         while len(token_buffer) < needed_tokens:
             doc_batch, (pq_idx, rg_idx) = next(batches)
             token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+            # Apply FIM augmentation (per-document, after tokenization)
+            if fim_rate > 0 and split == "train":
+                # FIM is applied to content tokens (skip the prepended BOS)
+                content_lists = [toks[1:] for toks in token_lists]  # strip BOS
+                content_lists = apply_fim_batch(content_lists, fim_rate=fim_rate, spm_rate=spm_rate)
+                token_lists = [[bos_token] + toks for toks in content_lists]  # re-add BOS
             for tokens in token_lists:
                 token_buffer.extend(tokens)
         # Move tokens from the deque into the scratch buffer
