@@ -111,7 +111,7 @@ parser.add_argument("--precision", type=str, default="auto", help="precision: au
 parser.add_argument("--nvfp4_disable_rht", type=bool, default=True, help="disable Random Hadamard Transform (required for SM121/GB10)")
 parser.add_argument("--nvfp4_disable_sr", type=bool, default=True, help="disable Stochastic Rounding (required for SM121/GB10)")
 # Kernel backend
-parser.add_argument("--kernel", type=str, default="current", choices=["current", "liger", "triton"], help="kernel backend: current (PyTorch), liger (Liger-Kernel), triton (Unsloth-style)")
+parser.add_argument("--kernel", type=str, default="current", choices=["current", "liger", "cce", "triton"], help="kernel backend: current (PyTorch), liger (Liger-Kernel), cce (Apple Cut Cross Entropy), triton (Unsloth-style)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 
