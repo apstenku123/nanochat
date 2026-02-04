@@ -104,6 +104,8 @@ parser.add_argument("--save_every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--tokenizer_threads", type=int, default=4, help="number of threads for tokenization")
 parser.add_argument("--tokenizer_batch_size", type=int, default=128, help="batch size for tokenization")
 parser.add_argument("--fim_rate", type=float, default=0.0, help="Fill-in-the-Middle rate (0.0=disabled, 0.5=50%% of docs get FIM). Requires NANOCHAT_CPP_TOKENIZER=1")
+parser.add_argument("--structured_fim_rate", type=float, default=0.0, help="Structured FIM rate for docstring->code completion (0.0=disabled)")
+parser.add_argument("--structured_fim_path", type=str, default="data/docstring_pairs_full.jsonl", help="Path to structured FIM pairs dataset")
 # Output
 parser.add_argument("--model_tag", type=str, default=None, help="override model tag for checkpoint directory name")
 # Precision (NVFP4/FP8/BF16)
@@ -276,9 +278,16 @@ if resuming:
 tokens_dir = os.path.join(base_dir, "tokenized_data")
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 fim_rate = args.fim_rate
-if fim_rate > 0:
-    print0(f"FIM enabled: fim_rate={fim_rate}")
-train_loader = tokenizing_distributed_data_loader_with_state(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, fim_rate=fim_rate)
+structured_fim_rate = args.structured_fim_rate
+structured_fim_path = os.path.join(os.path.dirname(__file__), '..', args.structured_fim_path)
+if fim_rate > 0 or structured_fim_rate > 0:
+    print0(f"FIM enabled: fim_rate={fim_rate}, structured_fim_rate={structured_fim_rate}")
+train_loader = tokenizing_distributed_data_loader_with_state(
+    tokenizer, args.device_batch_size, args.max_seq_len, split="train",
+    device=device, resume_state_dict=dataloader_resume_state_dict,
+    fim_rate=fim_rate, structured_fim_rate=structured_fim_rate,
+    structured_fim_path=structured_fim_path if structured_fim_rate > 0 else None
+)
 build_val_loader = lambda: tokenizing_distributed_data_loader(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 

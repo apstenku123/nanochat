@@ -9,9 +9,16 @@ FIM token IDs (from our C++ tokenizer):
   <FIM_MIDDLE> = 5
   <FIM_SUFFIX> = 6
   <EOS>        = 3  (used as EOT sentinel)
+
+Two FIM modes:
+1. Random FIM: Random splits (original) - good for general code infilling
+2. Structured FIM: Docstring→body splits - good for comment→code completion
 """
 
+import os
+import json
 import random
+from typing import Optional
 
 
 # Default token IDs matching our C++ tokenizer (scripts/tok_train_cpp.py)
@@ -103,6 +110,190 @@ def apply_fim_batch(
         apply_fim(
             toks,
             fim_rate=fim_rate,
+            spm_rate=spm_rate,
+            fim_prefix_id=fim_prefix_id,
+            fim_middle_id=fim_middle_id,
+            fim_suffix_id=fim_suffix_id,
+            eot_id=eot_id,
+            rng=rng,
+        )
+        for toks in token_lists
+    ]
+
+
+# -----------------------------------------------------------------------------
+# Structured FIM: Docstring → Function Body completion
+# -----------------------------------------------------------------------------
+
+class StructuredFIMDataset:
+    """
+    Provides structured FIM examples from pre-extracted docstring pairs.
+
+    Format: <FIM_PREFIX> docstring + signature { <FIM_SUFFIX> } <FIM_MIDDLE> body <EOT>
+
+    This teaches the model to complete function bodies given docstrings.
+    """
+
+    def __init__(self, pairs_path: str, tokenizer, max_examples: int = -1):
+        """
+        Args:
+            pairs_path: Path to JSONL file with docstring pairs
+            tokenizer: Tokenizer instance (must have encode method)
+            max_examples: Max examples to load (-1 = all)
+        """
+        self.pairs = []
+        self.tokenizer = tokenizer
+
+        if not os.path.exists(pairs_path):
+            print(f"Warning: Structured FIM dataset not found: {pairs_path}")
+            return
+
+        with open(pairs_path, 'r') as f:
+            for i, line in enumerate(f):
+                if max_examples > 0 and i >= max_examples:
+                    break
+                if line.strip():
+                    self.pairs.append(json.loads(line))
+
+        print(f"Loaded {len(self.pairs):,} structured FIM examples from {pairs_path}")
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def get_random_example(self, rng: random.Random = None) -> Optional[list[int]]:
+        """
+        Get a random structured FIM example as token IDs.
+
+        Returns:
+            Token list in FIM format, or None if no examples available.
+        """
+        if not self.pairs:
+            return None
+
+        if rng is None:
+            rng = random
+
+        pair = rng.choice(self.pairs)
+        return self.pair_to_tokens(pair)
+
+    def pair_to_tokens(
+        self,
+        pair: dict,
+        fim_prefix_id: int = FIM_PREFIX_ID,
+        fim_middle_id: int = FIM_MIDDLE_ID,
+        fim_suffix_id: int = FIM_SUFFIX_ID,
+        eot_id: int = EOT_ID,
+    ) -> list[int]:
+        """
+        Convert a docstring pair to FIM token sequence.
+
+        Format: <FIM_PREFIX> /* docstring */ signature { <FIM_SUFFIX> } <FIM_MIDDLE> body <EOT>
+        """
+        docstring = pair.get('docstring', '')
+        signature = pair.get('signature', '')
+        body = pair.get('body', '')
+
+        # Build prefix: /* docstring */ signature {
+        prefix_text = f"/*\n{docstring}\n*/\n{signature} {{"
+
+        # Build suffix: just the closing brace
+        suffix_text = "\n}"
+
+        # Tokenize
+        prefix_tokens = self.tokenizer.encode(prefix_text)
+        suffix_tokens = self.tokenizer.encode(suffix_text)
+        body_tokens = self.tokenizer.encode("\n" + body + "\n")
+
+        # PSM format: <FIM_PREFIX> prefix <FIM_SUFFIX> suffix <FIM_MIDDLE> middle <EOT>
+        return (
+            [fim_prefix_id] +
+            prefix_tokens +
+            [fim_suffix_id] +
+            suffix_tokens +
+            [fim_middle_id] +
+            body_tokens +
+            [eot_id]
+        )
+
+
+def apply_fim_mixed(
+    token_ids: list[int],
+    structured_dataset: Optional[StructuredFIMDataset],
+    fim_rate: float = 0.4,
+    structured_rate: float = 0.2,
+    spm_rate: float = 0.5,
+    fim_prefix_id: int = FIM_PREFIX_ID,
+    fim_middle_id: int = FIM_MIDDLE_ID,
+    fim_suffix_id: int = FIM_SUFFIX_ID,
+    eot_id: int = EOT_ID,
+    rng: random.Random = None,
+) -> list[int]:
+    """
+    Apply mixed FIM: either random FIM, structured FIM, or no FIM.
+
+    Probabilities:
+    - structured_rate: Use structured FIM (docstring→body)
+    - fim_rate: Use random FIM
+    - (1 - structured_rate - fim_rate): No FIM (standard next-token)
+
+    Args:
+        token_ids: Original token sequence
+        structured_dataset: StructuredFIMDataset instance (can be None)
+        fim_rate: Probability of random FIM
+        structured_rate: Probability of structured FIM
+        Other args: same as apply_fim
+
+    Returns:
+        Token list (possibly transformed)
+    """
+    if rng is None:
+        rng = random
+
+    roll = rng.random()
+
+    # Try structured FIM first
+    if roll < structured_rate and structured_dataset is not None:
+        example = structured_dataset.get_random_example(rng)
+        if example is not None:
+            return example
+        # Fall through to random FIM if no structured examples
+
+    # Random FIM
+    if roll < structured_rate + fim_rate:
+        return apply_fim(
+            token_ids,
+            fim_rate=1.0,  # Always apply since we already rolled
+            spm_rate=spm_rate,
+            fim_prefix_id=fim_prefix_id,
+            fim_middle_id=fim_middle_id,
+            fim_suffix_id=fim_suffix_id,
+            eot_id=eot_id,
+            rng=rng,
+        )
+
+    # No FIM
+    return token_ids
+
+
+def apply_fim_mixed_batch(
+    token_lists: list[list[int]],
+    structured_dataset: Optional[StructuredFIMDataset],
+    fim_rate: float = 0.4,
+    structured_rate: float = 0.2,
+    spm_rate: float = 0.5,
+    fim_prefix_id: int = FIM_PREFIX_ID,
+    fim_middle_id: int = FIM_MIDDLE_ID,
+    fim_suffix_id: int = FIM_SUFFIX_ID,
+    eot_id: int = EOT_ID,
+    rng: random.Random = None,
+) -> list[list[int]]:
+    """Apply mixed FIM to a batch of token sequences."""
+    return [
+        apply_fim_mixed(
+            toks,
+            structured_dataset,
+            fim_rate=fim_rate,
+            structured_rate=structured_rate,
             spm_rate=spm_rate,
             fim_prefix_id=fim_prefix_id,
             fim_middle_id=fim_middle_id,

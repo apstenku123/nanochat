@@ -7,9 +7,22 @@ import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info, get_base_dir
 from nanochat.dataset import list_parquet_files
-from nanochat.fim import apply_fim_batch
+from nanochat.fim import apply_fim_batch, apply_fim_mixed_batch, StructuredFIMDataset
 
-def tokenizing_distributed_data_loader_with_state(tokenizer, B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, device="cuda", resume_state_dict=None, fim_rate=0.0, spm_rate=0.5):
+# Global structured FIM dataset (loaded once)
+_structured_fim_dataset = None
+
+def get_structured_fim_dataset(tokenizer, pairs_path: str = None):
+    """Get or create the structured FIM dataset singleton."""
+    global _structured_fim_dataset
+    if _structured_fim_dataset is None and pairs_path is not None:
+        import os
+        if os.path.exists(pairs_path):
+            _structured_fim_dataset = StructuredFIMDataset(pairs_path, tokenizer)
+    return _structured_fim_dataset
+
+
+def tokenizing_distributed_data_loader_with_state(tokenizer, B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, device="cuda", resume_state_dict=None, fim_rate=0.0, spm_rate=0.5, structured_fim_rate=0.0, structured_fim_path=None):
     """
     Stream pretraining text from parquet files, tokenize, yield training batches.
 
@@ -73,10 +86,24 @@ def tokenizing_distributed_data_loader_with_state(tokenizer, B, T, split, tokeni
             doc_batch, (pq_idx, rg_idx) = next(batches)
             token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
             # Apply FIM augmentation (per-document, after tokenization)
-            if fim_rate > 0 and split == "train":
+            if (fim_rate > 0 or structured_fim_rate > 0) and split == "train":
                 # FIM is applied to content tokens (skip the prepended BOS)
                 content_lists = [toks[1:] for toks in token_lists]  # strip BOS
-                content_lists = apply_fim_batch(content_lists, fim_rate=fim_rate, spm_rate=spm_rate)
+
+                if structured_fim_rate > 0:
+                    # Mixed FIM: random + structured
+                    structured_dataset = get_structured_fim_dataset(tokenizer, structured_fim_path)
+                    content_lists = apply_fim_mixed_batch(
+                        content_lists,
+                        structured_dataset,
+                        fim_rate=fim_rate,
+                        structured_rate=structured_fim_rate,
+                        spm_rate=spm_rate
+                    )
+                else:
+                    # Random FIM only
+                    content_lists = apply_fim_batch(content_lists, fim_rate=fim_rate, spm_rate=spm_rate)
+
                 token_lists = [[bos_token] + toks for toks in content_lists]  # re-add BOS
             for tokens in token_lists:
                 token_buffer.extend(tokens)

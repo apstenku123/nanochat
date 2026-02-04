@@ -1,0 +1,44 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gspo-sandbox-deny-all
+  namespace: gspo-sandbox
+  labels:
+    app.kubernetes.io/name: gspo-sandbox
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: gspo-sandbox
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress or egress rules = deny all traffic
+  ingress: []
+  egress: []
+---
+# Allow DNS resolution only for the job controller (not sandbox pods)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gspo-controller-allow-dns
+  namespace: gspo-sandbox
+spec:
+  podSelector:
+    matchLabels:
+      app: gspo-controller
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

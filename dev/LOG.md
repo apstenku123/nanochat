@@ -9,11 +9,11 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 Validated the `\p{N}{1,2}` pattern in `SPLIT_PATTERN` (tokenizer.py line 30), which I only guessed earlier and had a TODO for to validate. GPT-4 uses `\p{N}{1,3}` to group number sequences of up to 3 digits into tokens, but we suspected smaller vocab sizes benefit from grouping fewer digits per token.
 
 **Results (d12, vocab=32K):**
-| Pattern | val_bpb |
-|---------|---------|
-| `\p{N}{1,1}` | 0.969 |
+| Pattern      | val_bpb   |
+| ------------ | --------- |
+| `\p{N}{1,1}` | 0.969     |
 | `\p{N}{1,2}` | **0.965** |
-| `\p{N}{1,3}` | 0.972 |
+| `\p{N}{1,3}` | 0.972     |
 
 **Conclusion:** `{1,2}` is optimal for vocab size 32K. Grouping 3 digits wastes tokens on rare 3-digit combinations; grouping 1 digit is too fine-grained and bloats token sequences. Keeping `{1,2}` as default.
 
@@ -40,10 +40,10 @@ Attempted to use FP8 (8-bit floating point) for the lm_head layer to speed up th
 
 ### Results (d12)
 
-| Metric | BF16 Baseline | FP8 lm_head |
-|--------|---------------|-------------|
-| GPU Memory | 34 GB | 36 GB |
-| tok/sec | baseline | ~1% faster |
+| Metric     | BF16 Baseline | FP8 lm_head |
+| ---------- | ------------- | ----------- |
+| GPU Memory | 34 GB         | 36 GB       |
+| tok/sec    | baseline      | ~1% faster  |
 
 ### The Memory Mystery
 
@@ -95,12 +95,12 @@ Ported multi-token prediction from modded-nanogpt. Instead of predicting just th
 
 ### Results (d12)
 
-| Metric | Baseline | MTP |
-|--------|----------|-----|
-| GPU Memory | 34 GB | 47 GB |
-| MFU | 41% | 40% |
-| val/bpb (per step) | baseline | same/slightly worse |
-| val/bpb (wall clock) | baseline | noticeably worse |
+| Metric               | Baseline | MTP                 |
+| -------------------- | -------- | ------------------- |
+| GPU Memory           | 34 GB    | 47 GB               |
+| MFU                  | 41%      | 40%                 |
+| val/bpb (per step)   | baseline | same/slightly worse |
+| val/bpb (wall clock) | baseline | noticeably worse    |
 
 **Conclusion:** Negative result for nanochat. The extra memory and compute overhead from predicting multiple tokens doesn't pay off, in fact the results get worse. The auxiliary loss signal may help in other settings (larger models, different architectures?), but for our setup it's pure overhead at the moment.
 
@@ -189,8 +189,8 @@ Implementation: `resid_params` gets `scalar_lr * 0.01`, `x0_params` gets full `s
 
 Swept `--scalar_lr` (controlling x0_lambdas) at multiple depths:
 
-| Depth | Baseline (disabled) | Best scalar_lr | Best val_bpb | Δ bpb |
-|-------|---------------------|----------------|--------------|-------|
+| Depth | Baseline (disabled) | Best scalar_lr | Best val_bpb | Δ bpb   |
+| ----- | ------------------- | -------------- | ------------ | ------- |
 | d8    | 1.0885              | 0.20           | 1.0782       | -0.0103 |
 | d12   | 0.9770              | 0.60           | 0.9693       | -0.0077 |
 | d16   | 0.9059              | 0.20           | 0.9002       | -0.0057 |
@@ -246,7 +246,7 @@ Swept weight decay values at d8, d12, d16, d20 to find optimal values and scalin
 
 **Optimal Values Found:**
 | Depth | Width (channels) | Optimal WD |
-|-------|------------------|------------|
+| ----- | ---------------- | ---------- |
 | d8    | 512              | ~0.40      |
 | d12   | 768              | ~0.22      |
 | d16   | 1024             | ~0.10      |
