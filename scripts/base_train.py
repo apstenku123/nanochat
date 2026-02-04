@@ -35,7 +35,7 @@ os.environ["TORCHINDUCTOR_CACHE_DIR"] = CACHE_DIR
 import gc
 import argparse
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 
 import wandb
 import torch
@@ -113,6 +113,9 @@ parser.add_argument("--model_tag", type=str, default=None, help="override model 
 parser.add_argument("--precision", type=str, default="auto", help="precision: auto|nvfp4|fp8|bf16")
 parser.add_argument("--nvfp4_disable_rht", type=bool, default=True, help="disable Random Hadamard Transform (required for SM121/GB10)")
 parser.add_argument("--nvfp4_disable_sr", type=bool, default=True, help="disable Stochastic Rounding (required for SM121/GB10)")
+# FP8 training with torchao (separate from TE-based --precision fp8)
+parser.add_argument("--fp8", action="store_true", help="enable FP8 training with torchao (requires H100+ GPU)")
+parser.add_argument("--fp8_recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster) or rowwise (more accurate)")
 # Kernel backend
 parser.add_argument("--kernel", type=str, default="current", choices=["current", "liger", "cce", "triton"], help="kernel backend: current (PyTorch), liger (Liger-Kernel), cce (Apple Cut Cross Entropy), triton (Unsloth-style)")
 args = parser.parse_args()
@@ -226,6 +229,77 @@ if resuming:
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+
+# -----------------------------------------------------------------------------
+# FP8 training initialization with torchao (must be done before torch.compile)
+
+if args.fp8:
+    if device_type != "cuda":
+        print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
+    else:
+        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+        import torch.nn as nn
+
+        # Filter: only convert layers with dimensions divisible by 16 (FP8 hardware requirement)
+        def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
+            if not isinstance(mod, nn.Linear):
+                return False
+            # FP8 requires both in_features and out_features divisible by 16
+            if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
+                return False
+            return True
+
+        fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
+        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
+        num_fp8_layers = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
+        num_skipped = sum(1 for m in model.modules() if isinstance(m, nn.Linear)) - num_fp8_layers
+        print0(f"FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8_layers} layers, skipped {num_skipped} (dims not divisible by 16)")
+
+# Context manager to temporarily disable FP8 for BF16 evaluation
+@contextmanager
+def disable_fp8(model):
+    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation."""
+    import torch.nn as nn
+
+    # Find all Float8Linear modules and their locations
+    fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
+    for name, module in model.named_modules():
+        if 'Float8' in type(module).__name__:
+            if '.' in name:
+                parent_name, attr_name = name.rsplit('.', 1)
+                parent = model.get_submodule(parent_name)
+            else:
+                parent = model
+                attr_name = name
+            fp8_locations.append((parent, attr_name, module))
+
+    if not fp8_locations:
+        yield  # No FP8 modules, nothing to do
+        return
+
+    # Swap Float8Linear -> nn.Linear (shares the same weight tensor, no copy)
+    for parent, attr_name, fp8_module in fp8_locations:
+        linear = nn.Linear(
+            fp8_module.in_features,
+            fp8_module.out_features,
+            bias=fp8_module.bias is not None,
+            device=fp8_module.weight.device,
+            dtype=fp8_module.weight.dtype,
+        )
+        linear.weight = fp8_module.weight  # share, don't copy
+        if fp8_module.bias is not None:
+            linear.bias = fp8_module.bias
+        setattr(parent, attr_name, linear)
+
+    try:
+        yield
+    finally:
+        # Restore Float8Linear modules
+        for parent, attr_name, fp8_module in fp8_locations:
+            setattr(parent, attr_name, fp8_module)
+
+# -----------------------------------------------------------------------------
+# Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
@@ -345,7 +419,7 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with autocast_ctx():
+        with disable_fp8(model), autocast_ctx():
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
@@ -360,10 +434,11 @@ while True:
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
+    # Disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
-        with autocast_ctx():
+        with disable_fp8(orig_model), autocast_ctx():
             results = evaluate_model(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
@@ -390,7 +465,7 @@ while True:
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
-            with autocast_ctx():
+            with disable_fp8(orig_model), autocast_ctx():
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
