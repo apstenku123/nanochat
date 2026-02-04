@@ -1,0 +1,137 @@
+# GSPO Sandbox Job Template
+# This is a template - actual jobs are created dynamically by the GSPO client
+#
+# Usage:
+#   1. Create ConfigMap with code content
+#   2. Apply this job template with unique name
+#   3. Wait for completion
+#   4. Read logs for result
+#   5. Delete job and configmap
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gspo-exec-PLACEHOLDER
+  namespace: gspo-sandbox
+  labels:
+    app: gspo-sandbox
+    component: executor
+spec:
+  # Don't retry on failure - we want to capture the failure
+  backoffLimit: 0
+  # Auto-cleanup after 5 minutes
+  ttlSecondsAfterFinished: 300
+  # Job timeout - kill if running too long
+  activeDeadlineSeconds: 60
+  template:
+    metadata:
+      labels:
+        app: gspo-sandbox
+        component: executor
+    spec:
+      serviceAccountName: gspo-sandbox-runner
+      restartPolicy: Never
+      # Security context for the pod
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      # Node selection - prefer preemptible/spot nodes for cost savings
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+      tolerations:
+        - key: "cloud.google.com/gke-spot"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      # Anti-affinity to spread jobs across nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: gspo-sandbox
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: sandbox
+          image: gcr.io/PROJECT_ID/gspo-sandbox:latest
+          imagePullPolicy: Always
+          # Resource limits - strict for security
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "500m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+          # Security context for the container
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          # Environment variables
+          env:
+            - name: COMPILER
+              value: "g++"
+            - name: CPP_STANDARD
+              value: "20"
+            - name: TIMEOUT_SECONDS
+              value: "10"
+            - name: OPTIMIZATION_LEVEL
+              value: "-O2"
+            # Code content from ConfigMap
+            - name: CODE_CONTENT
+              valueFrom:
+                configMapKeyRef:
+                  name: gspo-code-PLACEHOLDER
+                  key: code.cpp
+            # Optional: Test content for verification
+            - name: TEST_CONTENT
+              valueFrom:
+                configMapKeyRef:
+                  name: gspo-code-PLACEHOLDER
+                  key: test.cpp
+                  optional: true
+          # Volume mounts
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: sandbox-work
+              mountPath: /sandbox
+      # Volumes
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: "100Mi"
+        - name: sandbox-work
+          emptyDir:
+            sizeLimit: "50Mi"
+
+---
+# ConfigMap template for code content
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gspo-code-PLACEHOLDER
+  namespace: gspo-sandbox
+  labels:
+    app: gspo-sandbox
+    component: code
+data:
+  code.cpp: |
+    // Code content goes here
+    #include <iostream>
+    int main() {
+        std::cout << "Hello, GSPO!" << std::endl;
+        return 0;
+    }
+  # Optional: Test file for GTest
+  test.cpp: |
+    // Test content goes here (optional)
