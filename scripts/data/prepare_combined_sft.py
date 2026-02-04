@@ -241,6 +241,7 @@ def load_fim_pairs(path: str, max_examples: int = 50000) -> Iterator[dict]:
 
             # FIM format: model fills in the body
             # Reference goes in comment before the code
+            # NOTE: Using tokenizer's FIM tokens: <FIM_PREFIX>, <FIM_MIDDLE>, <FIM_SUFFIX>
             if reference:
                 ref_comment = f"// {reference[:150].replace(chr(10), ' ')}\n"
             else:
@@ -250,7 +251,7 @@ def load_fim_pairs(path: str, max_examples: int = 50000) -> Iterator[dict]:
             suffix = "\n}"
             middle = f"\n{body}"
 
-            fim_text = f"<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>{middle}"
+            fim_text = f"<FIM_PREFIX>{prefix}<FIM_SUFFIX>{suffix}<FIM_MIDDLE>{middle}"
 
             yield {
                 "text": fim_text,

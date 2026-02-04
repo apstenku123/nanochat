@@ -112,8 +112,8 @@ def create_fim_prompts(base_prompts: list[GSPOPrompt]) -> list[GSPOPrompt]:
     """
     Create FIM-style prompts from completion prompts.
 
-    Uses standard FIM tokens:
-        <|fim_prefix|>// docstring + signature{<|fim_suffix|>}<|fim_middle|>
+    Uses our tokenizer's FIM tokens (tok_train_cpp.py):
+        <FIM_PREFIX>// docstring + signature{<FIM_SUFFIX>}<FIM_MIDDLE>
 
     The model fills in the function body between { and }.
     This is pure C++ - the docstring is already a C++ block comment.
@@ -132,7 +132,7 @@ def create_fim_prompts(base_prompts: list[GSPOPrompt]) -> list[GSPOPrompt]:
         prefix = p.prompt.rstrip()
         suffix = "\n}\n"
 
-        fim_prompt = f"<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>"
+        fim_prompt = f"<FIM_PREFIX>{prefix}<FIM_SUFFIX>{suffix}<FIM_MIDDLE>"
 
         fim_prompts.append(GSPOPrompt(
             prompt_id=f"{p.prompt_id}_fim",
