@@ -25,11 +25,11 @@ from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
 
 # =============================================================================
-# Flash Attention 3 - Local Build for GB10/SM121
+# Flash Attention with automatic FA3/SDPA fallback
 # =============================================================================
-# DO NOT use `from kernels import get_kernel` - HuggingFace Hub lacks SM121/aarch64 builds
-# Our local FA3 build is at: /home/dave/PyTorch_cuda_13_1_main_4fd1b9b7/third_party/flash-attention/
-from flash_attn import flash_attn_func, flash_attn_with_kvcache
+# Uses local FA3 build for SM90 (Hopper) and SM121 (GB10/DGX Spark)
+# Falls back to PyTorch SDPA for other GPUs (Ada SM89, Blackwell SM100, etc.)
+from nanochat.flash_attention import flash_attn_func, flash_attn_with_kvcache
 
 # =============================================================================
 # Kernel backend for loss computation (CCE recommended for best performance)
@@ -436,7 +436,7 @@ class GPT(nn.Module):
         for _ in range(max_tokens):
             logits = self.forward(ids) # (B, T, vocab_size)
             logits = logits[:, -1, :] # (B, vocab_size)
-            if top_k is not None:
+            if top_k is not None and top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             if temperature > 0:
