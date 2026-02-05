@@ -46,6 +46,7 @@ except Exception:
 
 from nanochat.gpt import GPT, GPTConfig, select_precision, make_autocast_ctx
 from nanochat.sft_dataset import SFTDataset, sft_collate_fn
+from nanochat.tool_sft_dataset import ToolCallSFTDataset, tool_sft_collate_fn
 from nanochat.common import compute_init, compute_cleanup, print0, autodetect_device_type, get_base_dir
 from nanochat import kernels
 from nanochat.tokenizer import get_tokenizer
@@ -57,7 +58,7 @@ parser = argparse.ArgumentParser(description="SFT training for C++ code generati
 # Data
 parser.add_argument("--data", type=str, required=True, help="Path to JSONL SFT dataset")
 parser.add_argument("--tokenizer", type=str, default="cpp", choices=["cpp", "default"], help="Tokenizer to use")
-parser.add_argument("--max_seq_len", type=int, default=1024, help="Max sequence length")
+parser.add_argument("--max_seq_len", type=int, default=16384, help="Max sequence length")
 # Model
 parser.add_argument("--checkpoint_path", type=str, default="", help="Path to pretrained checkpoint directory (empty = train from scratch)")
 parser.add_argument("--checkpoint_step", type=int, default=-1, help="Checkpoint step to load (-1 = latest)")
@@ -78,6 +79,8 @@ parser.add_argument("--log_every", type=int, default=10, help="Log every N steps
 parser.add_argument("--device_type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--kernel", type=str, default="current", choices=["current", "liger", "cce", "triton"])
 parser.add_argument("--compile", action="store_true", help="Use torch.compile")
+parser.add_argument("--dataset_type", type=str, default="auto", choices=["auto", "instruction", "tool"],
+                    help="Dataset type: 'instruction' for {instruction,response}, 'tool' for {text,source}, 'auto' detects from data")
 args = parser.parse_args()
 
 # Set kernel backend
@@ -105,14 +108,32 @@ print0(f"Vocab size: {vocab_size:,}")
 
 # Dataset
 print0(f"Loading SFT dataset from {args.data}")
-dataset = SFTDataset(args.data, tokenizer_name=args.tokenizer, max_len=args.max_seq_len)
+
+# Auto-detect dataset type from first line
+dataset_type = args.dataset_type
+if dataset_type == "auto":
+    import json as _json
+    with open(args.data) as _f:
+        first_line = _json.loads(_f.readline())
+    if "text" in first_line and "source" in first_line:
+        dataset_type = "tool"
+    else:
+        dataset_type = "instruction"
+    print0(f"Auto-detected dataset type: {dataset_type}")
+
+if dataset_type == "tool":
+    dataset = ToolCallSFTDataset(args.data, tokenizer_name=args.tokenizer, max_len=args.max_seq_len)
+    collate_fn = tool_sft_collate_fn
+else:
+    dataset = SFTDataset(args.data, tokenizer_name=args.tokenizer, max_len=args.max_seq_len)
+    collate_fn = sft_collate_fn
 print0(f"SFT dataset size: {len(dataset)} examples")
 
 dataloader = DataLoader(
     dataset,
     batch_size=args.batch_size,
     shuffle=True,
-    collate_fn=sft_collate_fn,
+    collate_fn=collate_fn,
     drop_last=True,
     num_workers=0,
 )

@@ -51,6 +51,13 @@ class CppTokenizer:
             mapping = {
                 "<|bos|>": "<BOS>", "<|eos|>": "<EOS>",
                 "<|pad|>": "<PAD>", "<|endoftext|>": "<BOS>",
+                # Tool-calling tokens (nanochat-style aliases)
+                "<|code_start|>": "<CODE_START>",
+                "<|code_end|>": "<CODE_END>",
+                "<|thought_start|>": "<THOUGHT_START>",
+                "<|thought_end|>": "<THOUGHT_END>",
+                "<|query_tool|>": "<QUERY_TOOL>",
+                "<|tool_result|>": "<TOOL_RESULT>",
             }
             mapped = mapping.get(text)
             if mapped:
@@ -170,3 +177,28 @@ class CppTokenizer:
     @property
     def pad_token_id(self) -> int:
         return self._vocab.get("<PAD>", 0)
+
+    # Tool-calling special token IDs
+    @property
+    def code_start_id(self) -> int:
+        return self._vocab.get("<CODE_START>", 7)
+
+    @property
+    def code_end_id(self) -> int:
+        return self._vocab.get("<CODE_END>", 8)
+
+    @property
+    def thought_start_id(self) -> int:
+        return self._vocab.get("<THOUGHT_START>", 9)
+
+    @property
+    def thought_end_id(self) -> int:
+        return self._vocab.get("<THOUGHT_END>", 10)
+
+    @property
+    def query_tool_id(self) -> int:
+        return self._vocab.get("<QUERY_TOOL>", 11)
+
+    @property
+    def tool_result_id(self) -> int:
+        return self._vocab.get("<TOOL_RESULT>", 19)
