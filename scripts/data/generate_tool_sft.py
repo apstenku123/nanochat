@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Generate tool-call SFT data from existing datasets.
+Generate tool-call SFT data from existing datasets (~1.8M examples).
 
 Produces training examples where the model thinks in C++ comments,
 makes tool calls as C++ function expressions, receives results,
 and writes final code — all in pure C++ token space.
 
-Five strategies:
-A) Docstring → search + code  (from docstring_pairs_clean.jsonl)
-B) Diff → compile + fix       (from diff_sft.jsonl)
-C) HumanEval → ask + solve    (from gspo_prompts.jsonl)
-D) No-tool direct code        (plain completion/repair without tools)
-E) Code execution via run()   (model writes C++ to compute answers)
+Uses all 1.8M cleaned docstring pairs as the primary data source.
+
+Five strategies (target totals ~1.8M):
+A) Docstring → search + code  ~1,200,000  (from docstring_pairs_clean.jsonl)
+B) Diff → compile + fix       ~19,000     (from diff_sft.jsonl, limited by data)
+C) HumanEval → ask + solve    ~2,000      (from gspo_prompts.jsonl, limited by data)
+D) No-tool direct code        ~465,000    (400k docstring + 15k diff + 50k FIM)
+E) Code execution via run()   ~100,000    (model writes C++ to compute answers)
 
 Output format (JSONL):
 {
@@ -89,12 +91,17 @@ def strip_markdown_fences(text: str) -> str:
 # Strategy A: Docstring → Search + Code
 # ---------------------------------------------------------------------------
 
-def load_docstring_index(path: str, max_records: int = 200000) -> list[dict]:
-    """Load docstring pairs into memory for cross-referencing."""
+def load_docstring_index(path: str, max_records: int = 0) -> list[dict]:
+    """Load docstring pairs into memory for cross-referencing.
+
+    Args:
+        path: Path to JSONL file with docstring pairs.
+        max_records: Maximum records to load. 0 means load all.
+    """
     records = []
     with open(path) as f:
         for line in f:
-            if len(records) >= max_records:
+            if max_records > 0 and len(records) >= max_records:
                 break
             line = line.strip()
             if not line:
@@ -121,7 +128,7 @@ def build_path_index(records: list[dict]) -> dict[str, list[int]]:
 def generate_docstring_search_examples(
     records: list[dict],
     path_index: dict[str, list[int]],
-    max_examples: int = 100000,
+    max_examples: int = 1200000,
     rng: random.Random = None,
 ) -> Iterator[dict]:
     """Strategy A: Wrap docstring→code in search tool narrative."""
@@ -533,7 +540,7 @@ _RUN_TEMPLATES[4]["result"] = lambda p: str(_fib(p["n"]))
 
 
 def generate_run_tool_examples(
-    max_examples: int = 10000,
+    max_examples: int = 100000,
     rng: random.Random = None,
 ) -> Iterator[dict]:
     """Strategy E: Model writes C++ code and runs it via run() tool.
@@ -585,9 +592,9 @@ def generate_run_tool_examples(
 def generate_no_tool_examples(
     docstring_records: list[dict],
     diff_path: str,
-    max_docstring: int = 30000,
+    max_docstring: int = 400000,
     max_diff: int = 15000,
-    max_fim: int = 5000,
+    max_fim: int = 50000,
     rng: random.Random = None,
 ) -> Iterator[dict]:
     """Strategy D: Plain code completion/repair without tool calls."""
@@ -714,13 +721,13 @@ def main():
     parser.add_argument("--output", type=str,
                         default="data/tool_call_sft.jsonl")
     # Strategy limits
-    parser.add_argument("--max-docstring-search", type=int, default=100000)
+    parser.add_argument("--max-docstring-search", type=int, default=1200000)
     parser.add_argument("--max-diff-compile", type=int, default=50000)
     parser.add_argument("--max-humaneval-ask", type=int, default=2000)
-    parser.add_argument("--max-no-tool-docstring", type=int, default=30000)
+    parser.add_argument("--max-no-tool-docstring", type=int, default=400000)
     parser.add_argument("--max-no-tool-diff", type=int, default=15000)
-    parser.add_argument("--max-no-tool-fim", type=int, default=5000)
-    parser.add_argument("--max-run-code", type=int, default=10000)
+    parser.add_argument("--max-no-tool-fim", type=int, default=50000)
+    parser.add_argument("--max-run-code", type=int, default=100000)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -728,7 +735,7 @@ def main():
 
     # Load docstring records into memory (for cross-referencing)
     logger.info("Loading docstring pairs...")
-    doc_records = load_docstring_index(args.docstring_pairs, max_records=300000)
+    doc_records = load_docstring_index(args.docstring_pairs)
     logger.info(f"  Loaded {len(doc_records):,} docstring records")
     path_index = build_path_index(doc_records)
     logger.info(f"  Built path index with {len(path_index)} directory groups")
