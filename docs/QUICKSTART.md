@@ -49,19 +49,16 @@ Once connected to a TPU VM:
 python3 -m venv ~/.venv
 source ~/.venv/bin/activate
 
-# Install PyTorch with XLA support for TPU
-pip install torch torch_xla[tpu] -f https://storage.googleapis.com/libtpu-releases/index.html
+# Install PyTorch + XLA + libtpu (v5e/v6e compatible)
+pip install 'torch~=2.8.0' 'torch_xla[tpu]~=2.8.0' \
+  -f https://storage.googleapis.com/libtpu-releases/index.html \
+  -f https://storage.googleapis.com/libtpu-wheels/index.html
 
 # Verify TPU is detected
-python -c "import torch_xla.core.xla_model as xm; print(f'TPU: {xm.xla_device()}')"
+python -c "import torch_xla.core.xla_model as xm, torch_xla.runtime as xr; print(f'TPU: {xm.xla_device()}, world_size={xr.world_size()}')"
 ```
 
-### For v6e TPUs (Trillium)
-
-```bash
-# v6e requires the latest libtpu
-pip install torch torch_xla[tpu] -f https://storage.googleapis.com/libtpu-releases/index.html --upgrade
-```
+This wheel combo supports both v5e and v6e TPU VMs.
 
 ## Clone and Setup nanochat
 
@@ -87,11 +84,12 @@ pip install -e .
 
 import torch
 import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
+import torch_xla.runtime as xr
 
 # Get TPU device
+xr.use_spmd()
 device = xm.xla_device()
-print(f"Running on: {device}")
+print(f"Running on: {device} (world_size={xr.world_size()})")
 
 # Your model
 from nanochat.gpt import GPT, GPTConfig
@@ -130,10 +128,11 @@ print("Training complete!")
 
 ```bash
 # Single TPU core
-python train.py
+PJRT_DEVICE=TPU python train.py
 
-# Multi-core TPU (distributed)
-python -m torch_xla.distributed.xla_multiprocessing train.py
+# TPU slices (multi-host): run the same command on all workers
+gcloud compute tpus tpu-vm ssh <TPU_NAME> --worker=all --zone=<ZONE> \
+  --command="cd ~/nanochat && PJRT_DEVICE=TPU python train.py"
 ```
 
 ## File Transfer
@@ -175,7 +174,8 @@ gsutil cp -r gs://nanochat-data/train.bin ~/data/
 ```bash
 # Add to ~/.bashrc on TPU VM
 export XLA_USE_BF16=1  # Use bfloat16 for better performance
-export TPU_NUM_DEVICES=4  # For v6e-4
+export PJRT_DEVICE=TPU
+export XLA_USE_SPMD=1
 
 # For debugging
 export XLA_FLAGS="--xla_dump_to=/tmp/xla_dump"

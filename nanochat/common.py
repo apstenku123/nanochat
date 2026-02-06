@@ -94,9 +94,35 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
 
     return file_path
 
+def _is_tpu_requested() -> bool:
+    return os.environ.get("PJRT_DEVICE", "").upper() == "TPU"
+
+
+def _get_xla_dist_info():
+    """Best-effort rank/world-size info for TPU PJRT runtimes."""
+    try:
+        import torch_xla.runtime as xr
+        world_size = int(xr.world_size())
+        rank = int(xr.global_ordinal())
+        local_rank = int(xr.local_ordinal()) if hasattr(xr, "local_ordinal") else rank
+        return rank, local_rank, max(world_size, 1)
+    except Exception:
+        pass
+
+    # Backward compatibility with older torch_xla APIs.
+    try:
+        import torch_xla.core.xla_model as xm
+        world_size = int(xm.xrt_world_size())
+        rank = int(xm.get_ordinal())
+        local_rank = int(xm.get_local_ordinal()) if hasattr(xm, "get_local_ordinal") else rank
+        return rank, local_rank, max(world_size, 1)
+    except Exception:
+        return 0, 0, 1
+
+
 def print0(s="",**kwargs):
-    ddp_rank = int(os.environ.get('RANK', 0))
-    if ddp_rank == 0:
+    _, rank, _, _ = get_dist_info()
+    if rank == 0:
         print(s, **kwargs)
 
 def print_banner():
@@ -128,6 +154,17 @@ def is_ddp_initialized() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 def get_dist_info():
+    if is_ddp_initialized():
+        ddp_rank = dist.get_rank()
+        ddp_local_rank = int(os.environ.get("LOCAL_RANK", ddp_rank))
+        ddp_world_size = dist.get_world_size()
+        return True, ddp_rank, ddp_local_rank, ddp_world_size
+
+    if _is_tpu_requested():
+        # TPU world size/rank is managed by PJRT runtime, not torch.distributed.
+        ddp_rank, ddp_local_rank, ddp_world_size = _get_xla_dist_info()
+        return False, ddp_rank, ddp_local_rank, ddp_world_size
+
     if is_ddp_requested():
         # We rely on torchrun's env to decide if we SHOULD init.
         # (Initialization itself happens in compute init.)
@@ -140,6 +177,16 @@ def get_dist_info():
         return False, 0, 0, 1
 
 def autodetect_device_type():
+    # Check for TPU first (via PJRT_DEVICE env var or torch_xla availability)
+    if os.environ.get("PJRT_DEVICE") == "TPU":
+        try:
+            import torch_xla.core.xla_model as xm
+            device_type = "xla"
+            print0(f"Autodetected device type: {device_type} (TPU via PJRT_DEVICE)")
+            return device_type
+        except ImportError:
+            print0("Warning: PJRT_DEVICE=TPU but torch_xla not available, falling back...")
+
     # prefer to use CUDA if available, otherwise use MPS, otherwise fallback on CPU
     if torch.cuda.is_available():
         device_type = "cuda"
@@ -150,14 +197,56 @@ def autodetect_device_type():
     print0(f"Autodetected device type: {device_type}")
     return device_type
 
-def compute_init(device_type="cuda"): # cuda|cpu|mps
+
+def get_tpu_accelerator_type() -> str:
+    """Return TPU accelerator type (e.g. v5litepod-8, v6e-4) when available."""
+    for key in ("TPU_ACCELERATOR_TYPE", "ACCELERATOR_TYPE"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+
+    metadata_url = "http://metadata.google.internal/computeMetadata/v1/instance/attributes/accelerator-type"
+    req = urllib.request.Request(metadata_url, headers={"Metadata-Flavor": "Google"})
+    try:
+        with urllib.request.urlopen(req, timeout=0.2) as response:
+            value = response.read().decode("utf-8").strip()
+            if value:
+                os.environ["TPU_ACCELERATOR_TYPE"] = value
+                return value
+    except Exception:
+        pass
+    return ""
+
+
+def xla_all_reduce_gradients(model, world_size: int):
+    """
+    Average gradients across TPU workers for non-DDP XLA training loops.
+    No-op when world_size <= 1 or torch_xla is unavailable.
+    """
+    if world_size <= 1:
+        return
+    try:
+        import torch_xla.core.xla_model as xm
+    except ImportError:
+        return
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    if grads:
+        xm.all_reduce(xm.REDUCE_SUM, grads, scale=1.0 / world_size)
+
+
+def compute_init(device_type="cuda"): # cuda|cpu|mps|xla
     """Basic initialization that we keep doing over and over, so make common."""
 
-    assert device_type in ["cuda", "mps", "cpu"], "Invalid device type atm"
+    assert device_type in ["cuda", "mps", "cpu", "xla"], "Invalid device type atm"
     if device_type == "cuda":
         assert torch.cuda.is_available(), "Your PyTorch installation is not configured for CUDA but device_type is 'cuda'"
     if device_type == "mps":
         assert torch.backends.mps.is_available(), "Your PyTorch installation is not configured for MPS but device_type is 'mps'"
+    if device_type == "xla":
+        try:
+            import torch_xla.core.xla_model as xm
+        except ImportError:
+            raise RuntimeError("device_type is 'xla' but torch_xla is not installed")
 
     # Reproducibility
     # Note that we set the global seeds here, but most of the code uses explicit rng objects.
@@ -173,19 +262,32 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
         torch.backends.fp32_precision = "tf32"  # uses tf32 instead of fp32 for matmuls
 
     # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
-    is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-    if is_ddp_requested and device_type == "cuda":
+    ddp_requested = is_ddp_requested()
+    if ddp_requested and device_type == "cuda":
+        ddp_rank = int(os.environ["RANK"])
+        ddp_local_rank = int(os.environ["LOCAL_RANK"])
         device = torch.device("cuda", ddp_local_rank)
         torch.cuda.set_device(device)  # make "cuda" default to this device
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
+    elif device_type == "xla":
+        import torch_xla.core.xla_model as xm
+        device = xm.xla_device()
+        # Newer torch_xla prefers runtime.use_spmd() over env-only configuration.
+        if os.environ.get("XLA_USE_SPMD") == "1":
+            try:
+                import torch_xla.runtime as xr
+                xr.use_spmd()
+            except Exception:
+                pass
     else:
         device = torch.device(device_type) # mps|cpu
 
+    is_distributed, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     if ddp_rank == 0:
         logger.info(f"Distributed world size: {ddp_world_size}")
 
-    return is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size, device
+    return is_distributed, ddp_rank, ddp_local_rank, ddp_world_size, device
 
 def compute_cleanup():
     """Companion function to compute_init, to clean things up before script exit"""

@@ -39,7 +39,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-torch._dynamo.config.capture_scalar_outputs = True
+if os.environ.get("PJRT_DEVICE") == "TPU":
+    torch._dynamo.config.suppress_errors = True
+    torch._dynamo.config.disable = True
+else:
+    torch._dynamo.config.capture_scalar_outputs = True
 
 try:
     import torch._inductor.utils as inductor_utils
@@ -50,7 +54,14 @@ except Exception:
 from nanochat.gpt import GPT, GPTConfig, select_precision, make_autocast_ctx
 from nanochat.sft_dataset import SFTDataset, sft_collate_fn
 from nanochat.tool_sft_dataset import ToolCallSFTDataset, tool_sft_collate_fn
-from nanochat.common import compute_init, compute_cleanup, print0, autodetect_device_type, get_base_dir
+from nanochat.common import (
+    compute_init,
+    compute_cleanup,
+    print0,
+    autodetect_device_type,
+    get_base_dir,
+    xla_all_reduce_gradients,
+)
 from nanochat import kernels
 from nanochat.tokenizer import get_tokenizer
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_last_step
@@ -97,10 +108,18 @@ master_process = ddp_rank == 0
 if device_type == "cuda":
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision('high')
+xm = None
+if device_type == "xla":
+    import torch_xla.core.xla_model as xm
 
 precision_plan = select_precision()
 autocast_ctx = make_autocast_ctx(precision_plan, device_type)
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
+if device_type == "cuda":
+    synchronize = torch.cuda.synchronize
+elif device_type == "xla":
+    synchronize = xm.mark_step
+else:
+    synchronize = lambda: None
 
 # Tokenizer
 if args.tokenizer == "cpp":
@@ -140,7 +159,8 @@ else:
 print0(f"SFT dataset size: {len(dataset)} examples")
 
 sampler = None
-if ddp:
+use_data_parallel = ddp_world_size > 1
+if use_data_parallel:
     sampler = DistributedSampler(
         dataset,
         num_replicas=ddp_world_size,
@@ -203,9 +223,10 @@ num_params = sum(p.numel() for p in model.parameters())
 print0(f"Parameters: {num_params:,}")
 
 orig_model = model
-if args.compile and ddp:
-    print0("WARNING: --compile is disabled under DDP in scripts.sft_train")
-if args.compile and not ddp:
+if args.compile and (ddp or device_type == "xla"):
+    reason = "DDP" if ddp else "XLA/TPU"
+    print0(f"WARNING: --compile is disabled under {reason} in scripts.sft_train")
+if args.compile and not ddp and device_type != "xla":
     model = torch.compile(model, dynamic=False)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank] if device_type == "cuda" else None, broadcast_buffers=False)
@@ -234,6 +255,14 @@ total_steps = args.epochs * num_steps_per_epoch
 warmup_steps = int(args.warmup_ratio * total_steps)
 print0(f"Training for {args.epochs} epochs, {num_steps_per_epoch} steps/epoch, {total_steps} total steps")
 print0(f"Warmup steps: {warmup_steps}")
+
+def all_reduce_sums(loss_sum, token_sum):
+    if ddp:
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_sum, op=dist.ReduceOp.SUM)
+    elif device_type == "xla" and ddp_world_size > 1:
+        xm.all_reduce(xm.REDUCE_SUM, [loss_sum, token_sum])
+    return loss_sum, token_sum
 
 global_step = 0
 model.train()
@@ -269,9 +298,12 @@ for epoch in range(args.epochs):
 
         # Backward
         loss.backward()
+        if device_type == "xla" and ddp_world_size > 1:
+            xla_all_reduce_gradients(model, ddp_world_size)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        synchronize()
 
         # Bookkeeping
         epoch_loss += loss_sum.item()
@@ -280,10 +312,8 @@ for epoch in range(args.epochs):
 
         if args.log_every > 0 and global_step % args.log_every == 0:
             loss_sum = torch.tensor(epoch_loss, device=device)
-            token_sum = torch.tensor(epoch_tokens, device=device, dtype=torch.long)
-            if ddp:
-                dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
-                dist.all_reduce(token_sum, op=dist.ReduceOp.SUM)
+            token_sum = torch.tensor(float(epoch_tokens), device=device)
+            loss_sum, token_sum = all_reduce_sums(loss_sum, token_sum)
             avg_loss = loss_sum.item() / max(token_sum.item(), 1)
             print0(f"  step {global_step:05d}/{total_steps} | epoch {epoch+1}/{args.epochs} | loss: {loss.item():.4f} | avg: {avg_loss:.4f} | lr: {lr:.2e}")
 
@@ -297,12 +327,10 @@ for epoch in range(args.epochs):
 
     dt = time.time() - t_epoch
     loss_sum = torch.tensor(epoch_loss, device=device)
-    token_sum = torch.tensor(epoch_tokens, device=device, dtype=torch.long)
-    if ddp:
-        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(token_sum, op=dist.ReduceOp.SUM)
+    token_sum = torch.tensor(float(epoch_tokens), device=device)
+    loss_sum, token_sum = all_reduce_sums(loss_sum, token_sum)
     avg_loss = loss_sum.item() / max(token_sum.item(), 1)
-    total_tokens = token_sum.item()
+    total_tokens = int(token_sum.item())
     print0(f"Epoch {epoch+1}/{args.epochs} done in {dt:.1f}s | avg loss: {avg_loss:.4f} | tokens: {total_tokens:,}")
 
 # Save final checkpoint

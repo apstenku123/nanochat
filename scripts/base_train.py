@@ -40,9 +40,15 @@ from contextlib import nullcontext, contextmanager
 import wandb
 import torch
 
-# Fix Liger-Kernel graph breaks: LigerFusedLinearCrossEntropy calls .item() internally
-# which causes torch.compile graph breaks. This config enables capturing scalar outputs.
-torch._dynamo.config.capture_scalar_outputs = True
+# Disable torch.compile entirely for XLA/TPU - the inductor backend doesn't support XLA devices
+# Must be done before any torch.compile calls or dynamo configurations
+if os.environ.get("PJRT_DEVICE") == "TPU":
+    torch._dynamo.config.suppress_errors = True
+    torch._dynamo.config.disable = True
+else:
+    # Fix Liger-Kernel graph breaks: LigerFusedLinearCrossEntropy calls .item() internally
+    # which causes torch.compile graph breaks. This config enables capturing scalar outputs.
+    torch._dynamo.config.capture_scalar_outputs = True
 
 # Patch is_big_gpu to return True for GB10 (48 SMs < 68 SM threshold)
 # This eliminates the "Not enough SMs to use max_autotune_gemm mode" warning
@@ -54,9 +60,19 @@ except Exception:
 
 from nanochat.gpt import GPT, GPTConfig, select_precision, make_autocast_ctx
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
+from nanochat.common import (
+    compute_init,
+    compute_cleanup,
+    print0,
+    DummyWandb,
+    print_banner,
+    get_base_dir,
+    autodetect_device_type,
+    get_tpu_accelerator_type,
+    xla_all_reduce_gradients,
+)
 from nanochat import kernels
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
+from nanochat.tokenizer import get_tokenizer, get_token_bytes, verify_cpp_tokenizer
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
@@ -74,7 +90,7 @@ parser.add_argument("--device_type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect_ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head_dim", type=int, default=128, help="target head dimension for attention")
-parser.add_argument("--max_seq_len", type=int, default=2048, help="max context length")
+parser.add_argument("--max_seq_len", type=int, default=2048, help="max context length (supports up to 16384 for long context)")
 parser.add_argument("--window_pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num_iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -118,8 +134,17 @@ parser.add_argument("--fp8", action="store_true", help="enable FP8 training with
 parser.add_argument("--fp8_recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster) or rowwise (more accurate)")
 # Kernel backend
 parser.add_argument("--kernel", type=str, default="current", choices=["current", "liger", "cce", "triton"], help="kernel backend: current (PyTorch), liger (Liger-Kernel), cce (Apple Cut Cross Entropy), triton (Unsloth-style)")
+# torch.compile
+parser.add_argument("--no_compile", action="store_true", help="disable torch.compile (use for NVIDIA containers with triton issues)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+
+# If --no_compile is set, also disable compile in Muon optimizer via env var
+# This must be done before importing muon.py
+if args.no_compile:
+    os.environ["NANOCHAT_NO_COMPILE"] = "1"
+    torch._dynamo.config.suppress_errors = True
+    torch._dynamo.config.disable = True
 
 # Set kernel backend
 kernels.set_kernel_backend(args.kernel)
@@ -147,8 +172,17 @@ if "NVFP4" in precision_plan.name and args.device_batch_size < 2:
     print0("Automatically increasing device_batch_size to 2")
     args.device_batch_size = 2
 
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+# Set synchronize and memory functions based on device type
+if device_type == "cuda":
+    synchronize = torch.cuda.synchronize
+    get_max_memory = torch.cuda.max_memory_allocated
+elif device_type == "xla":
+    import torch_xla.core.xla_model as xm
+    synchronize = xm.mark_step
+    get_max_memory = lambda: 0  # XLA doesn't expose memory stats the same way
+else:
+    synchronize = lambda: None
+    get_max_memory = lambda: 0
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
@@ -159,6 +193,11 @@ tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
+
+# Verify C++ tokenizer is active (pre-scan check)
+is_cpp_tokenizer = verify_cpp_tokenizer(tokenizer)
+if is_cpp_tokenizer:
+    print0("C++ tokenizer verified: keywords are single tokens")
 
 # Model kwargs are derived from the desired depth of the model
 num_layers = args.depth
@@ -302,7 +341,16 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if device_type == "xla":
+    # Skip torch.compile for TPU - XLA JIT compiler handles optimization
+    # torch.compile with openxla backend can cause OOM during compilation
+    print0("Using eager mode for TPU (XLA JIT handles optimization)")
+    # model stays uncompiled, XLA will trace and compile lazily
+elif args.no_compile:
+    print0("Using eager mode (--no_compile flag set)")
+    # model stays uncompiled
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 num_params = sum(p.numel() for p in model.parameters())
 num_scaling_params = orig_model.num_scaling_params()
 print0(f"Number of parameters: {num_params:,} (scaling: {num_scaling_params:,})")
@@ -366,6 +414,33 @@ train_loader = tokenizing_distributed_data_loader_with_state(
 build_val_loader = lambda: tokenizing_distributed_data_loader(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
+# Pre-scan check: warn if data appears to be non-C++ (no #include, no semicolons)
+def check_cpp_data(x_batch, tokenizer, num_samples=4):
+    """Check if the first batch contains C++ code markers."""
+    cpp_markers = 0
+    total_checked = min(num_samples, x_batch.size(0))
+    for i in range(total_checked):
+        # Decode a sample from the batch
+        sample_ids = x_batch[i].tolist()
+        sample_text = tokenizer.decode(sample_ids[:512])  # Check first 512 tokens
+        # Look for C++ markers
+        if '#include' in sample_text or '::' in sample_text:
+            cpp_markers += 1
+        elif sample_text.count(';') >= 3:  # At least 3 semicolons suggests C/C++
+            cpp_markers += 1
+    return cpp_markers, total_checked
+
+if is_cpp_tokenizer:
+    cpp_markers, total_checked = check_cpp_data(x, tokenizer)
+    if cpp_markers == 0:
+        print0("=" * 60)
+        print0("WARNING: Data does not appear to contain C++ code!")
+        print0(f"Checked {total_checked} samples: 0 contained #include, ::, or multiple semicolons")
+        print0("If training on non-C++ data, set NANOCHAT_CPP_TOKENIZER=0")
+        print0("=" * 60)
+    else:
+        print0(f"Data check: {cpp_markers}/{total_checked} samples contain C++ markers")
+
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
 
@@ -420,7 +495,7 @@ while True:
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model), autocast_ctx():
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, synchronize=synchronize)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -509,12 +584,16 @@ while True:
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
+        if device_type == "xla":
+            synchronize()  # XLA: break graph at each micro-step to avoid huge HLO compilation
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizers
     lrm = get_lr_multiplier(step)
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * lrm
+    if device_type == "xla" and ddp_world_size > 1:
+        xla_all_reduce_gradients(model, ddp_world_size)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(step)
     for group in muon_optimizer.param_groups:
@@ -539,14 +618,30 @@ while True:
     # H100 SXM BF16: 989 TFLOPS sparse, ~495 TFLOPS dense
     # GB10 NVFP4: 1000 TFLOPS sparse, ~500 TFLOPS dense; BF16: ~62 TFLOPS
     # We use dense numbers since nanochat doesn't use 2:4 structured sparsity
-    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
-    if "GB10" in gpu_name:
-        # GB10: use NVFP4 peak if using TE precision, else BF16
-        promised_flops = 500e12 if precision_plan.use_te else 62e12
+    if device_type == "xla":
+        # Detect TPU type from metadata when available.
+        tpu_type = get_tpu_accelerator_type().lower()
+        if "v5" in tpu_type:
+            gpu_name = "TPU v5e"
+            promised_flops = 197e12
+        elif "v6" in tpu_type:
+            gpu_name = "TPU v6e"
+            promised_flops = 918e12
+        else:
+            gpu_name = "TPU"
+            promised_flops = 197e12
+    elif torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        if "GB10" in gpu_name:
+            # GB10: use NVFP4 peak if using TE precision, else BF16
+            promised_flops = 500e12 if precision_plan.use_te else 62e12
+        else:
+            # Default to H100 dense BF16
+            promised_flops = 495e12
     else:
-        # Default to H100 dense BF16
-        promised_flops = 495e12
-    promised_flops_total = promised_flops * ddp_world_size
+        gpu_name = "CPU"
+        promised_flops = 1e12  # Placeholder for CPU
+    promised_flops_total = promised_flops * max(ddp_world_size, 1)
     mfu = 100 * flops_per_sec / promised_flops_total # in %
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps

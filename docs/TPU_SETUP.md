@@ -85,10 +85,11 @@ gcloud services enable tpu.googleapis.com --project=alpine-aspect-459819-m4
 
 ```bash
 # Create v6e-4 with spot pricing
+# IMPORTANT: v6e requires the v2-alpha-tpuv6e runtime, not tpu-ubuntu2204-base
 gcloud compute tpus tpu-vm create <name> \
   --zone=us-east5-b \
   --accelerator-type=v6e-4 \
-  --version=tpu-ubuntu2204-base \
+  --version=v2-alpha-tpuv6e \
   --spot \
   --project=alpine-aspect-459819-m4
 ```
@@ -100,10 +101,12 @@ gcloud compute tpus tpu-vm create <name> \
 gcloud compute tpus tpu-vm create <name> \
   --zone=us-west4-a \
   --accelerator-type=v5litepod-8 \
-  --version=tpu-ubuntu2204-base \
+  --version=v2-alpha-tpuv5-lite \
   --spot \
   --project=alpine-aspect-459819-m4
 ```
+
+> Runtime note: use `v2-alpha-tpuv5-lite` for v5e and `v2-alpha-tpuv6e` for v6e.
 
 ### Available Accelerator Types
 
@@ -179,3 +182,8 @@ gcloud compute tpus tpu-vm ssh nanochat-v6e --zone=us-east5-b --ssh-key-file=~/.
 3. **Monitor costs** - Set up billing alerts in Cloud Console
 4. **Use spot pricing** - 60-70% cheaper than on-demand
 5. **Choose the right zone** - Availability varies by zone and time
+
+## PyTorch/XLA API Notes
+
+- Prefer `torch_xla.runtime.world_size()` and `torch_xla.runtime.global_ordinal()` over deprecated `xm.xrt_world_size()`/`xm.get_ordinal()`.
+- Prefer calling `torch_xla.runtime.use_spmd()` in code for SPMD mode (the `XLA_USE_SPMD` env var still works for compatibility).
