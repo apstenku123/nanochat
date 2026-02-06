@@ -49,8 +49,9 @@ Once connected to a TPU VM:
 python3 -m venv ~/.venv
 source ~/.venv/bin/activate
 
-# Install PyTorch + XLA + libtpu (v5e/v6e compatible)
-pip install 'torch~=2.8.0' 'torch_xla[tpu]~=2.8.0' \
+# Install latest stable matched PyTorch/XLA for TPU
+# Keep torch and torch_xla on the same minor (currently 2.9.x)
+pip install 'torch~=2.9.0' 'torch_xla[tpu]~=2.9.0' \
   -f https://storage.googleapis.com/libtpu-releases/index.html \
   -f https://storage.googleapis.com/libtpu-wheels/index.html
 
@@ -58,7 +59,7 @@ pip install 'torch~=2.8.0' 'torch_xla[tpu]~=2.8.0' \
 python -c "import torch_xla.core.xla_model as xm, torch_xla.runtime as xr; print(f'TPU: {xm.xla_device()}, world_size={xr.world_size()}')"
 ```
 
-This wheel combo supports both v5e and v6e TPU VMs.
+This matched 2.9.x combo supports both v5e and v6e TPU VMs.
 
 ## Clone and Setup nanochat
 
