@@ -59,8 +59,10 @@ def get_backend_info():
 _override_impl = None
 
 
-def _use_fa3():
-    """Determine whether to use FA3 based on availability and override."""
+def _use_fa3(tensor_device=None):
+    """Determine whether to use FA3 based on availability, override, and input device."""
+    if tensor_device is not None and tensor_device.type != "cuda":
+        return False
     if _override_impl == 'fa3':
         assert HAS_FA3, f"Cannot override to FA3: not available ({_backend_info})"
         return True
@@ -72,6 +74,23 @@ def _use_fa3():
 # =============================================================================
 # SDPA helpers
 # =============================================================================
+# Check if enable_gqa is supported (PyTorch 2.5+)
+def _sdpa_supports_gqa():
+    try:
+        # Try calling with enable_gqa to see if it's supported
+        # Use tiny tensors to minimize overhead
+        q = torch.zeros(1, 1, 1, 1, device='cpu')
+        F.scaled_dot_product_attention(q, q, q, enable_gqa=False)
+        return True
+    except TypeError:
+        return False
+    except Exception:
+        # Any other error means we can't tell, assume not supported
+        return False
+
+_HAS_SDPA_GQA = _sdpa_supports_gqa()
+
+
 def _sdpa_attention(q, k, v, window_size, enable_gqa):
     """
     SDPA attention with sliding window support.
@@ -81,9 +100,14 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     Tk = k.size(2)
     window = window_size[0]
 
+    # Build kwargs dict - enable_gqa only supported in PyTorch 2.5+
+    extra_kwargs = {}
+    if _HAS_SDPA_GQA:
+        extra_kwargs['enable_gqa'] = enable_gqa
+
     # Full context, same length
     if (window < 0 or window >= Tq) and Tq == Tk:
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True, **extra_kwargs)
 
     # Single token generation
     if Tq == 1:
@@ -92,7 +116,7 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
             start = max(0, Tk - (window + 1))
             k = k[:, :, start:, :]
             v = v[:, :, start:, :]
-        return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+        return F.scaled_dot_product_attention(q, k, v, is_causal=False, **extra_kwargs)
 
     # Need explicit mask for sliding window/chunk inference
     device = q.device
@@ -105,7 +129,7 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     if window >= 0 and window < Tk:
         mask = mask & ((row_idx - col_idx) <= window)
 
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, **extra_kwargs)
 
 
 # =============================================================================
@@ -123,7 +147,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if _use_fa3():
+    if _use_fa3(q.device):
         fa3_func, _ = _fa3_funcs
         return fa3_func(q, k, v, causal=causal, window_size=window_size)
 
@@ -154,7 +178,7 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     Returns:
         Output tensor of shape (B, T_new, H, D)
     """
-    if _use_fa3():
+    if _use_fa3(q.device):
         _, fa3_kvcache = _fa3_funcs
         return fa3_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,

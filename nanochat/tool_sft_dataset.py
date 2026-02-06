@@ -19,24 +19,61 @@ from torch.utils.data import Dataset
 from nanochat.tokenizer import get_tokenizer
 
 
-# Special token IDs (C++ tokenizer)
-BOS_ID = 2
-EOS_ID = 3
-CODE_START_ID = 7
-CODE_END_ID = 8
-THOUGHT_START_ID = 9
-THOUGHT_END_ID = 10
-QUERY_TOOL_ID = 11
-TOOL_RESULT_ID = 19
-FIM_PREFIX_ID = 4
-FIM_MIDDLE_ID = 5
-FIM_SUFFIX_ID = 6
+# Default token IDs for C++ tokenizer. Used as fallback if lookup fails.
+DEFAULT_SPECIAL_IDS = {
+    "bos": 2,
+    "eos": 3,
+    "code_start": 7,
+    "code_end": 8,
+    "thought_start": 9,
+    "thought_end": 10,
+    "query_tool": 11,
+    "tool_result": 19,
+    "fim_prefix": 4,
+    "fim_middle": 5,
+    "fim_suffix": 6,
+}
 
-# Tokens that signal the start of model-generated content
-RESPONSE_START_TOKENS = {THOUGHT_START_ID, CODE_START_ID, QUERY_TOOL_ID, FIM_PREFIX_ID}
+# Backwards-compatible constant exports (used by tests and older callers).
+BOS_ID = DEFAULT_SPECIAL_IDS["bos"]
+EOS_ID = DEFAULT_SPECIAL_IDS["eos"]
+CODE_START_ID = DEFAULT_SPECIAL_IDS["code_start"]
+CODE_END_ID = DEFAULT_SPECIAL_IDS["code_end"]
+THOUGHT_START_ID = DEFAULT_SPECIAL_IDS["thought_start"]
+THOUGHT_END_ID = DEFAULT_SPECIAL_IDS["thought_end"]
+QUERY_TOOL_ID = DEFAULT_SPECIAL_IDS["query_tool"]
+TOOL_RESULT_ID = DEFAULT_SPECIAL_IDS["tool_result"]
+FIM_PREFIX_ID = DEFAULT_SPECIAL_IDS["fim_prefix"]
+FIM_MIDDLE_ID = DEFAULT_SPECIAL_IDS["fim_middle"]
+FIM_SUFFIX_ID = DEFAULT_SPECIAL_IDS["fim_suffix"]
 
 
-def compute_loss_mask(token_ids: list[int]) -> list[int]:
+def _resolve_special_ids(tokenizer) -> dict:
+    """Resolve special token IDs from tokenizer with fallback defaults."""
+    def get_id(token: str, default: int | None = None) -> int | None:
+        tid = tokenizer.encode_special(token)
+        return default if tid is None else tid
+
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is None:
+        eos_id = get_id("<EOS>", DEFAULT_SPECIAL_IDS["eos"])
+
+    return {
+        "bos": tokenizer.get_bos_token_id(),
+        "eos": eos_id,
+        "code_start": get_id("<CODE_START>", DEFAULT_SPECIAL_IDS["code_start"]),
+        "code_end": get_id("<CODE_END>", DEFAULT_SPECIAL_IDS["code_end"]),
+        "thought_start": get_id("<THOUGHT_START>", DEFAULT_SPECIAL_IDS["thought_start"]),
+        "thought_end": get_id("<THOUGHT_END>", DEFAULT_SPECIAL_IDS["thought_end"]),
+        "query_tool": get_id("<QUERY_TOOL>", DEFAULT_SPECIAL_IDS["query_tool"]),
+        "tool_result": get_id("<TOOL_RESULT>", DEFAULT_SPECIAL_IDS["tool_result"]),
+        "fim_prefix": get_id("<FIM_PREFIX>", DEFAULT_SPECIAL_IDS["fim_prefix"]),
+        "fim_middle": get_id("<FIM_MIDDLE>", DEFAULT_SPECIAL_IDS["fim_middle"]),
+        "fim_suffix": get_id("<FIM_SUFFIX>", DEFAULT_SPECIAL_IDS["fim_suffix"]),
+    }
+
+
+def compute_loss_mask(token_ids: list[int], special_ids: dict | None = None) -> list[int]:
     """Compute loss mask from token IDs.
 
     Rules:
@@ -50,27 +87,43 @@ def compute_loss_mask(token_ids: list[int]) -> list[int]:
 
     Returns list of 0/1 same length as token_ids.
     """
+    ids = DEFAULT_SPECIAL_IDS if special_ids is None else special_ids
+
+    bos_id = ids.get("bos")
+    eos_id = ids.get("eos")
+    code_start_id = ids.get("code_start")
+    code_end_id = ids.get("code_end")
+    thought_start_id = ids.get("thought_start")
+    query_tool_id = ids.get("query_tool")
+    tool_result_id = ids.get("tool_result")
+    fim_prefix_id = ids.get("fim_prefix")
+    fim_middle_id = ids.get("fim_middle")
+
+    response_start_tokens = {
+        tid for tid in (thought_start_id, code_start_id, query_tool_id, fim_prefix_id) if tid is not None
+    }
+
     n = len(token_ids)
     mask = [0] * n
 
     # Find first response token (where model output begins)
     response_start = n  # default: nothing is response
     for i, tid in enumerate(token_ids):
-        if tid in RESPONSE_START_TOKENS:
+        if tid in response_start_tokens:
             response_start = i
             break
 
     # Special case: FIM sequences — everything after <FIM_MIDDLE> is trained
-    has_fim = FIM_PREFIX_ID in token_ids
+    has_fim = fim_prefix_id is not None and fim_middle_id is not None and fim_prefix_id in token_ids
     if has_fim:
         # For FIM: train on middle content (the infill)
         in_middle = False
         for i, tid in enumerate(token_ids):
-            if tid == FIM_MIDDLE_ID:
+            if tid == fim_middle_id:
                 in_middle = True
                 mask[i] = 1  # train on the FIM_MIDDLE token itself
                 continue
-            if in_middle and tid not in (BOS_ID, EOS_ID):
+            if in_middle and tid != bos_id and tid != eos_id:
                 mask[i] = 1
         return mask
 
@@ -81,18 +134,18 @@ def compute_loss_mask(token_ids: list[int]) -> list[int]:
         tid = token_ids[i]
 
         # Skip BOS/EOS
-        if tid in (BOS_ID, EOS_ID):
+        if tid == bos_id or tid == eos_id:
             mask[i] = 0
             continue
 
         # Track tool result blocks (mask=0)
-        if tid == TOOL_RESULT_ID:
+        if tool_result_id is not None and tid == tool_result_id:
             in_tool_result = True
             mask[i] = 0
             continue
 
         if in_tool_result:
-            if tid == CODE_END_ID:
+            if code_end_id is not None and tid == code_end_id:
                 in_tool_result = False
                 mask[i] = 0  # the CODE_END closing a tool result is also masked
             else:
@@ -125,6 +178,7 @@ class ToolCallSFTDataset(Dataset):
         if tokenizer_name == "cpp":
             os.environ["NANOCHAT_CPP_TOKENIZER"] = "1"
         self.tokenizer = get_tokenizer()
+        self.special_ids = _resolve_special_ids(self.tokenizer)
 
         # Load and tokenize all examples
         self.examples = []
@@ -164,7 +218,7 @@ class ToolCallSFTDataset(Dataset):
         all_ids = all_ids[:self.max_len + 1]
 
         # Compute loss mask on the full sequence
-        full_mask = compute_loss_mask(all_ids)
+        full_mask = compute_loss_mask(all_ids, self.special_ids)
 
         # Standard LM: input = all_ids[:-1], target = all_ids[1:]
         input_ids = all_ids[:-1]

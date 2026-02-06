@@ -146,6 +146,13 @@ class ToolRuntime:
 
         return args
 
+    def _is_within_codebase(self, candidate_path: str) -> bool:
+        """Return True if candidate_path resolves under codebase_dir."""
+        try:
+            return os.path.commonpath([self.codebase_dir, candidate_path]) == self.codebase_dir
+        except ValueError:
+            return False
+
     # --- Tool implementations ---
 
     def tool_search(self, query: str, max_results: int = 5) -> str:
@@ -197,7 +204,7 @@ class ToolRuntime:
 
         # Security: don't allow reading outside codebase
         full_path = os.path.abspath(full_path)
-        if not full_path.startswith(self.codebase_dir):
+        if not self._is_within_codebase(full_path):
             return f"// error: path outside codebase: {path}"
 
         if not os.path.exists(full_path):
@@ -261,6 +268,8 @@ class ToolRuntime:
         if "main" not in code:
             code = f'#include <iostream>\n#include <string>\n#include <algorithm>\nusing namespace std;\nint main() {{\n{code}\n    return 0;\n}}'
 
+        src_path = None
+        out_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".cpp", mode="w", delete=False) as src:
                 src.write(code)
@@ -305,7 +314,7 @@ class ToolRuntime:
             # Cleanup on any path
             for p in [src_path, out_path]:
                 try:
-                    if os.path.exists(p):
+                    if p is not None and os.path.exists(p):
                         os.unlink(p)
                 except Exception:
                     pass

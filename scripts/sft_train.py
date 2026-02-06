@@ -34,7 +34,10 @@ import argparse
 import time
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 torch._dynamo.config.capture_scalar_outputs = True
 
@@ -114,7 +117,14 @@ dataset_type = args.dataset_type
 if dataset_type == "auto":
     import json as _json
     with open(args.data) as _f:
-        first_line = _json.loads(_f.readline())
+        first_line = None
+        for _line in _f:
+            _line = _line.strip()
+            if _line:
+                first_line = _json.loads(_line)
+                break
+    if first_line is None:
+        raise ValueError(f"Dataset file is empty: {args.data}")
     if "text" in first_line and "source" in first_line:
         dataset_type = "tool"
     else:
@@ -129,10 +139,21 @@ else:
     collate_fn = sft_collate_fn
 print0(f"SFT dataset size: {len(dataset)} examples")
 
+sampler = None
+if ddp:
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=ddp_world_size,
+        rank=ddp_rank,
+        shuffle=True,
+        drop_last=True,
+    )
+
 dataloader = DataLoader(
     dataset,
     batch_size=args.batch_size,
-    shuffle=True,
+    shuffle=sampler is None,
+    sampler=sampler,
     collate_fn=collate_fn,
     drop_last=True,
     num_workers=0,
@@ -182,8 +203,13 @@ num_params = sum(p.numel() for p in model.parameters())
 print0(f"Parameters: {num_params:,}")
 
 orig_model = model
-if args.compile:
+if args.compile and ddp:
+    print0("WARNING: --compile is disabled under DDP in scripts.sft_train")
+if args.compile and not ddp:
     model = torch.compile(model, dynamic=False)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank] if device_type == "cuda" else None, broadcast_buffers=False)
+    orig_model = model.module
 
 # Optimizer (simple AdamW for SFT, no Muon)
 optimizer = torch.optim.AdamW(
@@ -213,6 +239,9 @@ global_step = 0
 model.train()
 
 for epoch in range(args.epochs):
+    if sampler is not None:
+        sampler.set_epoch(epoch)
+
     epoch_loss = 0.0
     epoch_tokens = 0
     t_epoch = time.time()
@@ -220,6 +249,9 @@ for epoch in range(args.epochs):
     for batch_idx, (input_ids, targets) in enumerate(dataloader):
         input_ids = input_ids.to(device)
         targets = targets.to(device)
+        train_tokens = (targets != -1).sum().item()
+        if train_tokens == 0:
+            continue
 
         # LR schedule: linear warmup then cosine decay
         if global_step < warmup_steps:
@@ -232,7 +264,8 @@ for epoch in range(args.epochs):
 
         # Forward
         with autocast_ctx():
-            loss = model(input_ids, targets)
+            loss_sum = model(input_ids, targets, loss_reduction="sum")
+            loss = loss_sum / train_tokens
 
         # Backward
         loss.backward()
@@ -241,13 +274,17 @@ for epoch in range(args.epochs):
         optimizer.zero_grad(set_to_none=True)
 
         # Bookkeeping
-        train_tokens = (targets != -1).sum().item()
-        epoch_loss += loss.item() * train_tokens
+        epoch_loss += loss_sum.item()
         epoch_tokens += train_tokens
         global_step += 1
 
         if args.log_every > 0 and global_step % args.log_every == 0:
-            avg_loss = epoch_loss / max(epoch_tokens, 1)
+            loss_sum = torch.tensor(epoch_loss, device=device)
+            token_sum = torch.tensor(epoch_tokens, device=device, dtype=torch.long)
+            if ddp:
+                dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(token_sum, op=dist.ReduceOp.SUM)
+            avg_loss = loss_sum.item() / max(token_sum.item(), 1)
             print0(f"  step {global_step:05d}/{total_steps} | epoch {epoch+1}/{args.epochs} | loss: {loss.item():.4f} | avg: {avg_loss:.4f} | lr: {lr:.2e}")
 
         if args.save_every > 0 and global_step % args.save_every == 0:
@@ -259,8 +296,14 @@ for epoch in range(args.epochs):
             )
 
     dt = time.time() - t_epoch
-    avg_loss = epoch_loss / max(epoch_tokens, 1)
-    print0(f"Epoch {epoch+1}/{args.epochs} done in {dt:.1f}s | avg loss: {avg_loss:.4f} | tokens: {epoch_tokens:,}")
+    loss_sum = torch.tensor(epoch_loss, device=device)
+    token_sum = torch.tensor(epoch_tokens, device=device, dtype=torch.long)
+    if ddp:
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_sum, op=dist.ReduceOp.SUM)
+    avg_loss = loss_sum.item() / max(token_sum.item(), 1)
+    total_tokens = token_sum.item()
+    print0(f"Epoch {epoch+1}/{args.epochs} done in {dt:.1f}s | avg loss: {avg_loss:.4f} | tokens: {total_tokens:,}")
 
 # Save final checkpoint
 save_checkpoint(

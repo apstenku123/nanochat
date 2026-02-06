@@ -179,7 +179,11 @@ class Engine:
         rng.manual_seed(seed)
 
         # Get the special tokens we need to coordinate the tool use state machine
-        get_special = lambda s: self.tokenizer.encode_special(s)
+        def get_special(s):
+            try:
+                return self.tokenizer.encode_special(s)
+            except Exception:
+                return None
         python_start = get_special("<|python_start|>")
         python_end = get_special("<|python_end|>")
         output_start = get_special("<|output_start|>")
@@ -276,7 +280,7 @@ class Engine:
                     if state.tool_expr_tokens and self.tool_runtime is not None:
                         expr = self.tokenizer.decode(state.tool_expr_tokens)
                         result = self.tool_runtime.execute(expr)
-                        if result is not None:
+                        if result is not None and tool_result is not None and code_end is not None:
                             result_tokens = self.tokenizer.encode(str(result))
                             state.forced_tokens.append(tool_result)
                             state.forced_tokens.extend(result_tokens)
@@ -297,17 +301,18 @@ class Engine:
         """
         Non-streaming batch generation that just returns the final token sequences.
         Returns a list of token sequences (list of lists of ints).
-        Terminal tokens (assistant_end, bos) are not included in the results.
+        Terminal tokens (assistant_end, bos, eos) are not included in the results.
         """
         assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
         bos = self.tokenizer.get_bos_token_id()
+        eos = self.tokenizer.encode_special("<EOS>")
         results = [tokens.copy() for _ in range(num_samples)]
         masks = [[0] * len(tokens) for _ in range(num_samples)]
         completed = [False] * num_samples
         for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
             for i, (token, mask) in enumerate(zip(token_column, token_masks)):
                 if not completed[i]:
-                    if token == assistant_end or token == bos:
+                    if token == assistant_end or token == bos or (eos is not None and token == eos):
                         completed[i] = True
                     else:
                         results[i].append(token)
