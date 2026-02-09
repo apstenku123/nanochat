@@ -218,6 +218,20 @@ def get_tpu_accelerator_type() -> str:
     return ""
 
 
+def get_tpu_num_chips() -> int:
+    """Detect number of TPU chips on this host from accelerator type string.
+
+    Parses e.g. 'v5litepod-8' -> 8, 'v6e-4' -> 4.  Falls back to 1.
+    """
+    accel = get_tpu_accelerator_type()
+    if accel:
+        try:
+            return int(accel.rsplit('-', 1)[-1])
+        except (ValueError, IndexError):
+            pass
+    return 1
+
+
 def xla_all_reduce_gradients(model, world_size: int):
     """
     Average gradients across TPU workers for non-DDP XLA training loops.

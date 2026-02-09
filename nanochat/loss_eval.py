@@ -2,6 +2,7 @@
 A number of functions that help with evaluating a base model.
 """
 import math
+import os
 import torch
 import torch.distributed as dist
 
@@ -55,10 +56,19 @@ def evaluate_bpb(model, batches, steps, token_bytes, synchronize=None):
         if synchronize is not None:
             synchronize()
     # sum reduce across all ranks
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    if world_size > 1:
+    if dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
+    elif os.environ.get("PJRT_DEVICE", "").upper() == "TPU":
+        # XLA multi-chip: torch.distributed is not initialized, use XLA collectives
+        try:
+            import torch_xla.runtime as xr
+            import torch_xla.core.xla_model as xm
+            if int(xr.world_size()) > 1:
+                xm.all_reduce(xm.REDUCE_SUM, [total_nats])
+                xm.all_reduce(xm.REDUCE_SUM, [total_bytes])
+        except Exception:
+            pass
     # move both to cpu, calculate bpb and return
     total_nats = total_nats.item()
     total_bytes = total_bytes.item()
