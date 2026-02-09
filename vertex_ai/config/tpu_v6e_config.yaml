@@ -1,0 +1,61 @@
+# Vertex AI Custom Job Configuration for TPU v6e Training
+# Usage: gcloud ai custom-jobs create --region=us-central1 --config=tpu_v6e_config.yaml
+#
+# TPU v6e offers higher performance than v5e with:
+# - Improved memory bandwidth
+# - Better bf16 performance
+# - Enhanced SPMD support
+# Note: TensorFlow is NOT supported on v6e, PyTorch/JAX only
+
+workerPoolSpecs:
+  - machineSpec:
+      # TPU v6e machine types:
+      # - ct6e-standard-1t: 1 TPU chip (1x1 topology)
+      # - ct6e-standard-4t: 4 TPU chips (2x2 topology)
+      # - ct6e-standard-8t: 8 TPU chips (2x4 topology)
+      machineType: ct6e-standard-4t
+      tpuTopology: "2x2"
+
+    # Vertex AI requires exactly 1 replica for TPU workloads
+    replicaCount: 1
+
+    containerSpec:
+      # Custom training container with PyTorch XLA
+      imageUri: us-central1-docker.pkg.dev/alpine-aspect-459819-m4/nanochat/tpu-trainer:latest
+
+      # Training arguments
+      args:
+        - "--gcs_bucket=gs://nanochat-training-data-2026"
+        - "--model_depth=20"
+        - "--batch_size=32"
+        - "--max_seq_len=2048"
+        - "--num_iterations=10000"
+        - "--checkpoint_dir=gs://nanochat-training-data-2026/checkpoints/tpu_v6e"
+        - "--eval_every=500"
+        - "--save_every=1000"
+
+      # Environment variables for PyTorch XLA
+      env:
+        - name: PJRT_DEVICE
+          value: "TPU"
+        - name: XLA_USE_SPMD
+          value: "1"
+        - name: TPU_CHIPS
+          value: "4"
+        - name: TPU_TOPOLOGY
+          value: "2x2"
+        # TPU v6e optimizations
+        - name: XLA_FLAGS
+          value: "--xla_tpu_enable_data_parallel_all_reduce_opt=true --xla_tpu_data_parallel_opt_different_sized_ops=true --xla_tpu_enable_async_collective_fusion=true"
+        # GCS configuration
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "alpine-aspect-459819-m4"
+
+# Job scheduling options
+scheduling:
+  # Use preemptible/spot instances for cost savings (optional)
+  # Uncomment for ~70% cost reduction (job may be preempted)
+  # strategy: SPOT
+
+# Service account (uses default Compute Engine SA if not specified)
+# serviceAccount: your-service-account@alpine-aspect-459819-m4.iam.gserviceaccount.com

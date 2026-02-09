@@ -1,0 +1,55 @@
+# Vertex AI Custom Job Configuration for TPU v5e Training
+# Usage: gcloud ai custom-jobs create --region=us-central1 --config=tpu_v5e_config.yaml
+
+workerPoolSpecs:
+  - machineSpec:
+      # TPU v5e machine types:
+      # - ct5lp-hightpu-1t: 1 TPU chip (1x1 topology)
+      # - ct5lp-hightpu-4t: 4 TPU chips (2x2 topology)
+      # - ct5lp-hightpu-8t: 8 TPU chips (2x4 topology)
+      machineType: ct5lp-hightpu-4t
+      tpuTopology: "2x2"
+
+    # Vertex AI requires exactly 1 replica for TPU workloads
+    replicaCount: 1
+
+    containerSpec:
+      # Custom training container with PyTorch XLA
+      imageUri: us-central1-docker.pkg.dev/alpine-aspect-459819-m4/nanochat/tpu-trainer:latest
+
+      # Training arguments
+      args:
+        - "--gcs_bucket=gs://nanochat-training-data-2026"
+        - "--model_depth=16"
+        - "--batch_size=8"
+        - "--max_seq_len=1024"
+        - "--num_iterations=1000"
+        - "--checkpoint_dir=gs://nanochat-training-data-2026/checkpoints/tpu_v5e_run1"
+        - "--eval_every=100"
+        - "--save_every=500"
+
+      # Environment variables for PyTorch XLA
+      env:
+        - name: PJRT_DEVICE
+          value: "TPU"
+        - name: XLA_USE_SPMD
+          value: "1"
+        - name: TPU_CHIPS
+          value: "4"
+        - name: TPU_TOPOLOGY
+          value: "2x2"
+        # Disable host offloading for better performance
+        - name: XLA_FLAGS
+          value: "--xla_tpu_enable_data_parallel_all_reduce_opt=true --xla_tpu_data_parallel_opt_different_sized_ops=true"
+        # GCS configuration
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "alpine-aspect-459819-m4"
+
+# Job scheduling options
+scheduling:
+  # Use preemptible/spot instances for cost savings (optional)
+  # Uncomment for ~70% cost reduction (job may be preempted)
+  # strategy: SPOT
+
+# Service account (uses default Compute Engine SA if not specified)
+# serviceAccount: your-service-account@alpine-aspect-459819-m4.iam.gserviceaccount.com

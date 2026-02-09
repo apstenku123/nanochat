@@ -45,6 +45,8 @@ import torch
 if os.environ.get("PJRT_DEVICE") == "TPU":
     torch._dynamo.config.suppress_errors = True
     torch._dynamo.config.disable = True
+    # Note: --xla_tpu_disable_full_embedding_pipelining=true was tested
+    # but is NOT supported by libtpu 0.0.21 (v2-alpha-tpuv6e runtime)
 else:
     # Fix Liger-Kernel graph breaks: LigerFusedLinearCrossEntropy calls .item() internally
     # which causes torch.compile graph breaks. This config enables capturing scalar outputs.
@@ -136,6 +138,8 @@ parser.add_argument("--fp8_recipe", type=str, default="tensorwise", choices=["ro
 parser.add_argument("--kernel", type=str, default="current", choices=["current", "liger", "cce", "triton"], help="kernel backend: current (PyTorch), liger (Liger-Kernel), cce (Apple Cut Cross Entropy), triton (Unsloth-style)")
 # torch.compile
 parser.add_argument("--no_compile", action="store_true", help="disable torch.compile (use for NVIDIA containers with triton issues)")
+# XLA/TPU optimizations
+parser.add_argument("--use_scan", action="store_true", help="use torch_xla scan_layers to reduce XLA compilation time (TPU only)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 
@@ -336,6 +340,23 @@ def disable_fp8(model):
         # Restore Float8Linear modules
         for parent, attr_name, fp8_module in fp8_locations:
             setattr(parent, attr_name, fp8_module)
+
+# -----------------------------------------------------------------------------
+# XLA scan_layers optimization: compile 1 transformer block and reuse for all layers
+# This reduces XLA compilation from ~60min to ~20min for 16-layer models by avoiding
+# a 3.5M instruction HLO graph.
+if args.use_scan and device_type == "xla":
+    try:
+        # torch_xla >= 2.10: scan_layers wraps nn.ModuleList directly
+        from torch_xla.experimental.scan import scan_layers
+        model.transformer.h = scan_layers(model.transformer.h)
+        print0(f"Enabled XLA scan_layers for faster compilation ({num_layers} layers -> 1 compiled block)")
+    except (ImportError, AttributeError):
+        # torch_xla 2.9.x: scan_layers not available, lower-level scan() exists
+        # but requires manual wrapper. Skip for now.
+        print0("Warning: --use_scan requires torch_xla >= 2.10 (scan_layers not found in this version), ignoring")
+elif args.use_scan:
+    print0("Warning: --use_scan is only effective on XLA/TPU devices, ignoring")
 
 # -----------------------------------------------------------------------------
 # Compile the model
@@ -601,6 +622,8 @@ while True:
         group["weight_decay"] = muon_weight_decay
     for opt in optimizers:
         opt.step()
+    if device_type == "xla":
+        synchronize()  # XLA: break graph between optimizer step and zero_grad to limit HLO size
     model.zero_grad(set_to_none=True)
     synchronize()
     t1 = time.time()

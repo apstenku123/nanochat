@@ -1,0 +1,69 @@
+# Dockerfile for PyTorch GPU Training on Vertex AI
+# Supports NVIDIA T4, A100, H100 GPUs
+#
+# Build (from project root):
+#   docker build -t us-central1-docker.pkg.dev/alpine-aspect-459819-m4/nanochat/gpu-trainer:latest -f vertex_ai/docker/Dockerfile.gpu .
+#
+# Push:
+#   docker push us-central1-docker.pkg.dev/alpine-aspect-459819-m4/nanochat/gpu-trainer:latest
+
+# Use NVIDIA PyTorch image with CUDA 12.4
+FROM nvcr.io/nvidia/pytorch:24.09-py3
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install gsutil and other system dependencies
+RUN apt-get update && apt-get install -y \
+    apt-transport-https \
+    ca-certificates \
+    gnupg \
+    curl \
+    && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee /etc/apt/sources.list.d/google-cloud-sdk.list \
+    && apt-get update && apt-get install -y google-cloud-cli \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install additional Python dependencies for nanochat
+RUN pip3 install --no-cache-dir \
+    pyarrow>=14.0.0 \
+    tokenizers>=0.15.0 \
+    wandb>=0.16.0 \
+    tqdm>=4.66.0 \
+    google-cloud-storage>=2.14.0 \
+    gcsfs>=2024.1.0 \
+    datasets>=2.16.0 \
+    transformers>=4.36.0 \
+    psutil>=5.9.0 \
+    tabulate>=0.9.0 \
+    scipy>=1.11.0 \
+    regex>=2023.12.0 \
+    tiktoken>=0.5.0 \
+    rustbpe>=0.1.0 \
+    liger-kernel>=0.5.2 \
+    cut-cross-entropy>=25.1.0
+
+# Install flash-attn separately (may fail on some platforms)
+RUN pip3 install flash-attn>=2.7.0 --no-build-isolation || echo "Flash attention install failed, continuing..."
+
+# Create working directory
+WORKDIR /app
+
+# Copy full nanochat package
+COPY nanochat/ /app/nanochat/
+COPY scripts/ /app/scripts/
+
+# Copy entrypoint script that downloads tokenizer from GCS
+COPY vertex_ai/docker/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Set Python path and base dir for tokenizer
+ENV PYTHONPATH=/app
+ENV NANOCHAT_BASE_DIR=/app/data
+
+# Create data directory for tokenizer
+RUN mkdir -p /app/data/tokenizer
+
+# Default entry point downloads tokenizer then runs training
+ENTRYPOINT ["/app/entrypoint.sh"]

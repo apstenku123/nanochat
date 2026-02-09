@@ -387,16 +387,68 @@ class RustBPETokenizer:
 # -----------------------------------------------------------------------------
 # nanochat-specific convenience functions
 
+# C++ keywords that should be single tokens with the C++ tokenizer
+_CPP_KEYWORDS = ["class", "struct", "namespace", "template", "virtual", "override",
+                 "public", "private", "protected", "const", "static", "inline",
+                 "void", "int", "bool", "char", "float", "double", "auto", "return"]
+
+
+def verify_cpp_tokenizer(tokenizer, sample_code=None):
+    """
+    Verify that the C++ tokenizer is correctly tokenizing C++ keywords as single tokens.
+
+    Call this at training start to confirm the tokenizer is appropriate for your data.
+    Returns True if C++ keywords are single tokens, False otherwise.
+    Prints a warning if the C++ tokenizer appears to be splitting keywords.
+    """
+    if sample_code is None:
+        # Use a representative C++ snippet
+        sample_code = "class MyClass { public: virtual void process() const override; };"
+
+    tokens = tokenizer.encode(sample_code)
+
+    # Check if common C++ keywords are single tokens
+    keywords_found = 0
+    keywords_single = 0
+
+    for keyword in _CPP_KEYWORDS[:10]:  # Check first 10 keywords
+        keyword_tokens = tokenizer.encode(keyword)
+        if len(keyword_tokens) == 1:
+            keywords_single += 1
+        keywords_found += 1
+
+    is_cpp_optimized = keywords_single >= 8  # At least 80% should be single tokens
+
+    if not is_cpp_optimized:
+        print(f"WARNING: C++ tokenizer check: only {keywords_single}/{keywords_found} C++ keywords "
+              f"are single tokens. This tokenizer may not be optimal for C++ code.")
+        print("NOTE: NANOCHAT_CPP_TOKENIZER=1 is now the default.")
+        print("      Set NANOCHAT_CPP_TOKENIZER=0 to use RustBPE tokenizer for non-C++ training.")
+
+    return is_cpp_optimized
+
+
 def get_tokenizer():
+    """
+    Get the default nanochat tokenizer.
+
+    C++ tokenizer (tokenizer.json) is now the DEFAULT for C++ code training.
+    Set NANOCHAT_CPP_TOKENIZER=0 to disable and use RustBPE tokenizer instead.
+    """
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    # Use CppTokenizer if tokenizer.json exists (C++ hybrid tokenizer)
+
+    # C++ tokenizer is now the DEFAULT
+    # Set NANOCHAT_CPP_TOKENIZER=0 to disable
+    use_cpp = os.environ.get("NANOCHAT_CPP_TOKENIZER", "1") != "0"
+
     cpp_tokenizer_path = os.path.join(tokenizer_dir, "tokenizer.json")
-    if os.path.exists(cpp_tokenizer_path) and os.environ.get("NANOCHAT_CPP_TOKENIZER", "0") == "1":
+    if use_cpp and os.path.exists(cpp_tokenizer_path):
         from nanochat.cpp_tokenizer import CppTokenizer
         return CppTokenizer(tokenizer_dir)
-    # Default: RustBPE tokenizer (original nanochat)
+
+    # Fallback to RustBPE tokenizer
     return RustBPETokenizer.from_directory(tokenizer_dir)
 
 def get_token_bytes(device="cpu"):
@@ -407,5 +459,15 @@ def get_token_bytes(device="cpu"):
     token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
     assert os.path.exists(token_bytes_path), f"Token bytes not found at {token_bytes_path}? It gets written by tok_train.py"
     with open(token_bytes_path, "rb") as f:
-        token_bytes = torch.load(f, map_location=device)
+        # Load to CPU first, then move to target device
+        # (XLA devices don't support direct torch.load map_location)
+        token_bytes = torch.load(f, map_location="cpu")
+    # Handle 2D token_bytes (raw byte values) vs 1D (byte counts)
+    # Some tokenizer builds save raw bytes as (vocab_size, max_bytes) uint8
+    # while loss_eval expects 1D byte counts (vocab_size,)
+    if token_bytes.dim() == 2:
+        # Convert 2D raw bytes to 1D byte counts: count non-zero entries per row
+        token_bytes = (token_bytes > 0).sum(dim=1).to(torch.int32)
+    if str(device) != "cpu":
+        token_bytes = token_bytes.to(device)
     return token_bytes

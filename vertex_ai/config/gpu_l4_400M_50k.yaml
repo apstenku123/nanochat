@@ -1,0 +1,59 @@
+# Vertex AI Custom Job Configuration for GPU L4 Training
+# 400M Model, 50,000 iterations with FIM 0.4 and CCE kernel
+#
+# CRITICAL: num_iterations=50000 (FIFTY THOUSAND, NOT 5000!)
+#
+# Using L4 GPU (24GB) - more available than A100
+# Usage: gcloud ai custom-jobs create --region=us-central1 --display-name="nanochat-d16-400M-vertex-50k-l4" --config=vertex_ai/config/gpu_l4_400M_50k.yaml
+# Cost estimate: ~$30-50 for L4 24GB at ~$1/hour over 30-50 hours
+
+workerPoolSpecs:
+  - machineSpec:
+      # L4 24GB - more available than A100
+      machineType: g2-standard-8
+      acceleratorType: NVIDIA_L4
+      acceleratorCount: 1
+
+    replicaCount: 1
+
+    diskSpec:
+      bootDiskType: pd-ssd
+      bootDiskSizeGb: 200
+
+    containerSpec:
+      # Use our custom GPU trainer image
+      imageUri: us-central1-docker.pkg.dev/alpine-aspect-459819-m4/nanochat/gpu-trainer:latest
+
+      # CRITICAL TRAINING ARGUMENTS - DO NOT MODIFY WITHOUT APPROVAL
+      args:
+        - "--depth=16"                    # 400M model (16 * 64 aspect_ratio = 1024 model_dim)
+        - "--num_iterations=50000"        # FIFTY THOUSAND steps - NOT 5000!
+        - "--fim_rate=0.4"               # 40% Fill-in-the-Middle
+        - "--structured_fim_rate=0.2"    # 20% structured FIM (docstrings/signatures)
+        - "--kernel=cce"                  # Apple Cut Cross Entropy
+        - "--run=d16_400M_vertex_50k_l4"  # wandb run name
+        - "--device_batch_size=8"         # Smaller batch for L4 without torch.compile
+        - "--total_batch_size=524288"     # 512K tokens per optimization step
+        - "--max_seq_len=2048"            # 2K context window
+        - "--eval_every=1000"             # Evaluate every 1K steps
+        - "--core_metric_every=5000"      # CORE eval every 5K steps
+        - "--warmup_ratio=0.0"
+        - "--warmdown_ratio=0.4"
+        - "--no_compile"                  # Disable torch.compile (NVIDIA container triton issue)
+
+      # Environment variables
+      env:
+        - name: HF_TOKEN
+          value: "${HF_TOKEN}"
+        - name: WANDB_API_KEY
+          value: "${WANDB_API_KEY}"
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "alpine-aspect-459819-m4"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "expandable_segments:True"
+        - name: WANDB_PROJECT
+          value: "nanochat"
+        - name: NANOCHAT_BASE_DIR
+          value: "/app/data"
+        - name: NANOCHAT_CPP_TOKENIZER
+          value: "1"

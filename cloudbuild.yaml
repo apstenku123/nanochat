@@ -1,0 +1,6 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'us-central1-docker.pkg.dev/alpine-aspect-459819-m4/nanochat/tpu-trainer:latest', '-f', 'vertex_ai/docker/Dockerfile.tpu', '.']
+images:
+  - 'us-central1-docker.pkg.dev/alpine-aspect-459819-m4/nanochat/tpu-trainer:latest'
+timeout: '1800s'

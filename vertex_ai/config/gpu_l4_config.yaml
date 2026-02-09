@@ -1,0 +1,91 @@
+# Vertex AI Custom Job Configuration for GPU L4 Training
+# Usage: gcloud ai custom-jobs create --region=us-central1 --config=gpu_l4_config.yaml
+# Fallback option when TPU quota is unavailable
+
+workerPoolSpecs:
+  - machineSpec:
+      # L4 GPU - cost effective for training
+      machineType: g2-standard-8
+      acceleratorType: NVIDIA_L4
+      acceleratorCount: 1
+
+    replicaCount: 1
+
+    containerSpec:
+      # Use NVIDIA PyTorch container for GPU training
+      imageUri: us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-1:latest
+
+      # Training command
+      command:
+        - python3
+        - -c
+        - |
+          import os
+          import sys
+          sys.path.insert(0, '/app')
+
+          # Install dependencies
+          os.system('pip install pyarrow tokenizers gcsfs google-cloud-storage --quiet')
+
+          # Download training script from GCS
+          from google.cloud import storage
+          client = storage.Client()
+          bucket = client.bucket('nanochat-training-data-2026')
+
+          # Simple training loop
+          import torch
+          import torch.nn as nn
+          import torch.nn.functional as F
+
+          print("GPU Training started")
+          print(f"CUDA available: {torch.cuda.is_available()}")
+          if torch.cuda.is_available():
+              print(f"Device: {torch.cuda.get_device_name(0)}")
+
+          # Simple model for testing
+          class SimpleGPT(nn.Module):
+              def __init__(self, vocab_size=32768, n_embd=512, n_head=8, n_layer=6):
+                  super().__init__()
+                  self.wte = nn.Embedding(vocab_size, n_embd)
+                  self.blocks = nn.ModuleList([
+                      nn.TransformerEncoderLayer(d_model=n_embd, nhead=n_head, batch_first=True)
+                      for _ in range(n_layer)
+                  ])
+                  self.lm_head = nn.Linear(n_embd, vocab_size)
+
+              def forward(self, x, targets=None):
+                  x = self.wte(x)
+                  for block in self.blocks:
+                      x = block(x)
+                  logits = self.lm_head(x)
+                  if targets is not None:
+                      return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+                  return logits
+
+          device = 'cuda' if torch.cuda.is_available() else 'cpu'
+          model = SimpleGPT().to(device)
+          optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+          # Training loop with random data
+          import time
+          start = time.time()
+          for step in range(100):
+              x = torch.randint(0, 32768, (4, 512), device=device)
+              y = torch.randint(0, 32768, (4, 512), device=device)
+
+              loss = model(x, y)
+              loss.backward()
+              optimizer.step()
+              optimizer.zero_grad()
+
+              if step % 10 == 0:
+                  print(f"Step {step}: Loss={loss.item():.4f}")
+
+          elapsed = time.time() - start
+          print(f"Training complete in {elapsed:.1f}s")
+          print(f"Avg step time: {elapsed/100:.3f}s")
+
+      # Environment variables
+      env:
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "alpine-aspect-459819-m4"

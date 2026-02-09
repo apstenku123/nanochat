@@ -1,0 +1,91 @@
+# Vertex AI Custom Job Configuration for GPU T4 Training (Backup option)
+# 400M Model, 50,000 iterations with FIM 0.4 and CCE kernel
+#
+# CRITICAL: num_iterations=50000 (FIFTY THOUSAND, NOT 5000!)
+# Note: T4 will be slower than A100 but more available
+#
+# Usage: gcloud ai custom-jobs create --region=us-central1 --display-name=nanochat-400M-50k-t4 --config=gpu_t4_400M_50k.yaml
+
+workerPoolSpecs:
+  - machineSpec:
+      machineType: n1-standard-8
+      acceleratorType: NVIDIA_TESLA_T4
+      acceleratorCount: 1
+
+    replicaCount: 1
+
+    diskSpec:
+      bootDiskType: pd-ssd
+      bootDiskSizeGb: 500
+
+    containerSpec:
+      imageUri: us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-2.py310:latest
+
+      command:
+        - /bin/bash
+        - -c
+
+      args:
+        - |
+          set -e
+          echo "=============================================="
+          echo "nanochat 400M Training on Vertex AI (T4 GPU)"
+          echo "=============================================="
+          echo "CRITICAL PARAMETERS:"
+          echo "  depth=16"
+          echo "  num_iterations=50000 (FIFTY THOUSAND - NOT 5000!)"
+          echo "  fim_rate=0.4"
+          echo "  kernel=cce"
+          echo "  run=d16_400M_vertex_50k_t4"
+          echo "=============================================="
+          
+          nvidia-smi
+          
+          echo "=== Installing dependencies ==="
+          pip install --upgrade pip
+          pip install wandb tokenizers datasets transformers gcsfs google-cloud-storage psutil tabulate pyarrow scipy regex tiktoken tqdm
+          pip install liger-kernel cut-cross-entropy
+          pip install flash-attn --no-build-isolation 2>/dev/null || echo "Flash attention not available"
+          
+          mkdir -p /app/nanochat /app/scripts /app/data/base_data
+          
+          echo "=== Downloading code from GCS ==="
+          gsutil -m cp -r gs://nanochat-training-data-2026/code/nanochat/* /app/nanochat/
+          gsutil -m cp -r gs://nanochat-training-data-2026/code/scripts/* /app/scripts/
+          
+          echo "=== Downloading training data ==="
+          gsutil -m cp gs://nanochat-training-data-2026/parquet/base_data_v3/*.parquet /app/data/base_data/
+          echo "Downloaded $(ls /app/data/base_data/*.parquet | wc -l) parquet files"
+          
+          cd /app
+          export PYTHONPATH=/app
+          export NANOCHAT_BASE_DIR=/app/data
+          
+          echo "=== Starting training ==="
+          python -m scripts.base_train \
+              --depth=16 \
+              --num_iterations=50000 \
+              --fim_rate=0.4 \
+              --kernel=cce \
+              --run=d16_400M_vertex_50k_t4 \
+              --device_batch_size=16 \
+              --total_batch_size=262144 \
+              --max_seq_len=2048 \
+              --eval_every=1000 \
+              --core_metric_every=5000
+
+      env:
+        - name: HF_TOKEN
+          value: "${HF_TOKEN}"
+        - name: WANDB_API_KEY
+          value: "${WANDB_API_KEY}"
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "alpine-aspect-459819-m4"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "expandable_segments:True"
+        - name: WANDB_PROJECT
+          value: "nanochat"
+        - name: WANDB_ENTITY
+          value: "cppcode"
+        - name: NANOCHAT_BASE_DIR
+          value: "/app/data"

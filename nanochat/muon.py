@@ -2,6 +2,7 @@
 Muon optimizer adapted (simplified) from modded-nanogpt.
 https://github.com/KellerJordan/modded-nanogpt
 """
+import os
 import torch
 from torch import Tensor
 import torch.distributed as dist
@@ -16,8 +17,17 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+# Skip torch.compile on XLA/TPU - XLA JIT handles optimization
+# torch.compile with inductor backend doesn't support XLA devices
+# Also skip if NANOCHAT_NO_COMPILE is set (e.g., for NVIDIA containers with triton issues)
+_use_compile = (
+    os.environ.get("PJRT_DEVICE") != "TPU" and
+    os.environ.get("NANOCHAT_NO_COMPILE") != "1"
+)
+_maybe_compile = torch.compile if _use_compile else lambda fn: fn
 
-@torch.compile
+
+@_maybe_compile
 def zeropower_via_polar_express(G: Tensor, steps: int = 5) -> Tensor:
     """
     Polar Express Sign Method for orthogonalization.
@@ -45,7 +55,7 @@ def zeropower_via_polar_express(G: Tensor, steps: int = 5) -> Tensor:
     return X
 
 
-@torch.compile
+@_maybe_compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -75,7 +85,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     return X
 
 
-@torch.compile
+@_maybe_compile
 def apply_variance_reduction(v: Tensor, second_momentum_buffer: Tensor, beta2: float) -> Tensor:
     """
     NorMuon-style variance reduction, similar to Adafactor's low-rank variance estimator.

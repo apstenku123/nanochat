@@ -1,0 +1,37 @@
+# Vertex AI Custom Job Configuration for TPU v5e Training (1 chip)
+# Usage: gcloud ai custom-jobs create --region=us-central1 --config=tpu_v5e_1chip.yaml
+
+workerPoolSpecs:
+  - machineSpec:
+      # TPU v5e machine type with 1 chip (1x1 topology)
+      machineType: ct5lp-hightpu-1t
+      tpuTopology: "1x1"
+
+    # Vertex AI requires exactly 1 replica for TPU workloads
+    replicaCount: 1
+
+    containerSpec:
+      # Custom training container with PyTorch XLA
+      imageUri: us-central1-docker.pkg.dev/alpine-aspect-459819-m4/nanochat/tpu-trainer:latest
+
+      # Training arguments (smaller config for 1 TPU chip)
+      args:
+        - "--gcs_bucket=gs://nanochat-training-data-2026"
+        - "--model_depth=12"
+        - "--batch_size=4"
+        - "--max_seq_len=512"
+        - "--num_iterations=500"
+        - "--checkpoint_dir=gs://nanochat-training-data-2026/checkpoints/tpu_v5e_1chip_run1"
+        - "--eval_every=100"
+        - "--save_every=250"
+
+      # Environment variables for PyTorch XLA
+      env:
+        - name: PJRT_DEVICE
+          value: "TPU"
+        - name: TPU_CHIPS
+          value: "1"
+        - name: TPU_TOPOLOGY
+          value: "1x1"
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "alpine-aspect-459819-m4"

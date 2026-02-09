@@ -361,7 +361,10 @@ class GPT(nn.Module):
             dict(params=x0_params, lr=scalar_lr),
         ]
         adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0) # NOTE: weight decay is hardcoded to 0.0 for AdamW, only used in Muon
-        AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
+        # fused=True not supported on XLA/TPU devices
+        device_type = str(next(self.parameters()).device).split(':')[0]
+        use_fused = device_type != 'xla'  # fused only works on CUDA, CPU, MPS
+        AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=use_fused)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
         # Create the Muon optimizer for the linear layers
         muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)

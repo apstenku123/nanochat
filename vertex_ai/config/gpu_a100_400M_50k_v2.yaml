@@ -1,0 +1,125 @@
+# Vertex AI Custom Job Configuration for GPU A100 Training
+# 400M Model, 50,000 iterations with FIM 0.4 and CCE kernel
+#
+# CRITICAL: num_iterations=50000 (FIFTY THOUSAND, NOT 5000!)
+#
+# Usage: gcloud ai custom-jobs create --region=us-central1 --config=vertex_ai/config/gpu_a100_400M_50k_v2.yaml
+
+displayName: nanochat-d16-400M-vertex-50k
+
+workerPoolSpecs:
+  - machineSpec:
+      # A100 40GB - best price/performance for 400M model
+      machineType: a2-highgpu-1g
+      acceleratorType: NVIDIA_TESLA_A100
+      acceleratorCount: 1
+
+    replicaCount: 1
+
+    diskSpec:
+      bootDiskType: pd-ssd
+      bootDiskSizeGb: 500
+
+    containerSpec:
+      # Use NVIDIA's pre-built PyTorch container
+      imageUri: us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4:latest
+
+      # Run setup and training inline
+      command:
+        - /bin/bash
+        - -c
+
+      args:
+        - |
+          set -e
+          echo "=============================================="
+          echo "nanochat 400M Training on Vertex AI"
+          echo "=============================================="
+          echo "CRITICAL PARAMETERS:"
+          echo "  depth=16"
+          echo "  num_iterations=50000 (FIFTY THOUSAND - NOT 5000!)"
+          echo "  fim_rate=0.4"
+          echo "  kernel=cce"
+          echo "  run=d16_400M_vertex_50k"
+          echo "=============================================="
+          
+          echo ""
+          echo "=== GPU Info ==="
+          nvidia-smi
+          
+          echo ""
+          echo "=== Installing dependencies ==="
+          pip install --upgrade pip
+          pip install wandb tokenizers datasets transformers gcsfs google-cloud-storage psutil tabulate pyarrow scipy regex tiktoken tqdm
+          pip install liger-kernel cut-cross-entropy
+          # Try flash-attn, but continue if it fails (not strictly required with CCE)
+          pip install flash-attn --no-build-isolation 2>/dev/null || echo "Flash attention not available, continuing..."
+          
+          echo ""
+          echo "=== Creating directories ==="
+          mkdir -p /app/nanochat
+          mkdir -p /app/scripts
+          mkdir -p /app/data/base_data
+          
+          echo ""
+          echo "=== Downloading training code from GCS ==="
+          gsutil -m cp -r gs://nanochat-training-data-2026/code/nanochat/* /app/nanochat/
+          gsutil -m cp -r gs://nanochat-training-data-2026/code/scripts/* /app/scripts/
+          
+          echo ""
+          echo "=== Downloading training data from GCS ==="
+          echo "This may take several minutes..."
+          gsutil -m cp gs://nanochat-training-data-2026/parquet/base_data_v3/*.parquet /app/data/base_data/
+          ls -la /app/data/base_data/ | head -20
+          echo "Total parquet files: $(ls /app/data/base_data/*.parquet | wc -l)"
+          
+          cd /app
+          export PYTHONPATH=/app
+          export NANOCHAT_BASE_DIR=/app
+          
+          # Verify the code is in place
+          echo ""
+          echo "=== Verifying setup ==="
+          ls -la /app/nanochat/
+          ls -la /app/scripts/
+          python -c "import nanochat; print('nanochat module loaded')"
+          
+          echo ""
+          echo "=============================================="
+          echo "=== Starting training with CORRECT parameters ==="
+          echo "  depth=16"
+          echo "  num_iterations=50000 (FIFTY THOUSAND)"
+          echo "  fim_rate=0.4"  
+          echo "  kernel=cce"
+          echo "=============================================="
+          
+          python -m scripts.base_train \
+              --depth=16 \
+              --num_iterations=50000 \
+              --fim_rate=0.4 \
+              --kernel=cce \
+              --run=d16_400M_vertex_50k \
+              --device_batch_size=32 \
+              --total_batch_size=524288 \
+              --max_seq_len=2048 \
+              --eval_every=1000 \
+              --core_metric_every=5000 \
+              --warmup_ratio=0.0 \
+              --warmdown_ratio=0.4
+
+      # Environment variables
+      env:
+        - name: HF_TOKEN
+          value: "${HF_TOKEN}"
+        - name: WANDB_API_KEY
+          value: "${WANDB_API_KEY}"
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "alpine-aspect-459819-m4"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "expandable_segments:True"
+        - name: WANDB_PROJECT
+          value: "nanochat"
+        - name: WANDB_ENTITY
+          value: "cppcode"
+        - name: NANOCHAT_BASE_DIR
+          value: "/app"

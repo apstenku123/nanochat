@@ -8,22 +8,22 @@
 
 ## Principle: Use Existing Libraries, Don't Reinvent
 
-| Task | Library / Dataset | Build Custom? |
-|------|------------------|---------------|
-| Pipeline framework | [DataTrove](https://github.com/huggingface/datatrove) (HuggingFace) | No |
-| Code quality filters | [bigcode-dataset](https://github.com/bigcode-project/bigcode-dataset) | No |
-| Near-deduplication | [datasketch](https://github.com/ekzhu/datasketch) + BigCode MinHash script | No |
-| PII removal | [bigcode/pii-lib](https://github.com/bigcode-project/pii-lib) + [StarPII](https://huggingface.co/bigcode/starpii) | No |
-| Secret detection | [Yelp/detect-secrets](https://github.com/Yelp/detect-secrets) | No |
-| License detection | ScanCode Toolkit | No |
-| Tokenizer training | [HuggingFace tokenizers](https://github.com/huggingface/tokenizers) | No |
-| Pre-processed C++ data | `nvidia/Nemotron-Pretraining-Code-v1+v2` | No |
-| C++ open-source code | `bigcode/the-stack-dedup` (data/c++) | No |
-| C++ pre-tokenization regex | Custom (~50 lines) | Yes |
-| Indentation stripping | Custom (~30 lines) | Yes |
-| FIM data transform | Custom (~20 lines) | Yes |
-| Binary .bin/.idx packaging | Custom (match nanochat format) | Yes |
-| Compilation rate evaluator | Custom | Yes |
+| Task                       | Library / Dataset                                                                                                 | Build Custom? |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------- |
+| Pipeline framework         | [DataTrove](https://github.com/huggingface/datatrove) (HuggingFace)                                               | No            |
+| Code quality filters       | [bigcode-dataset](https://github.com/bigcode-project/bigcode-dataset)                                             | No            |
+| Near-deduplication         | [datasketch](https://github.com/ekzhu/datasketch) + BigCode MinHash script                                        | No            |
+| PII removal                | [bigcode/pii-lib](https://github.com/bigcode-project/pii-lib) + [StarPII](https://huggingface.co/bigcode/starpii) | No            |
+| Secret detection           | [Yelp/detect-secrets](https://github.com/Yelp/detect-secrets)                                                     | No            |
+| License detection          | ScanCode Toolkit                                                                                                  | No            |
+| Tokenizer training         | [HuggingFace tokenizers](https://github.com/huggingface/tokenizers)                                               | No            |
+| Pre-processed C++ data     | `nvidia/Nemotron-Pretraining-Code-v1+v2`                                                                          | No            |
+| C++ open-source code       | `bigcode/the-stack-dedup` (data/c++)                                                                              | No            |
+| C++ pre-tokenization regex | Custom (~50 lines)                                                                                                | Yes           |
+| Indentation stripping      | Custom (~30 lines)                                                                                                | Yes           |
+| FIM data transform         | Custom (~20 lines)                                                                                                | Yes           |
+| Binary .bin/.idx packaging | Custom (match nanochat format)                                                                                    | Yes           |
+| Compilation rate evaluator | Custom                                                                                                            | Yes           |
 
 ---
 
@@ -44,27 +44,27 @@ Target: **300-400 billion tokens** total throughput.
 
 **HuggingFace Token**: Set `HF_TOKEN` env var (see `.env` or ask maintainer)
 
-| Dataset | HF Path | C++ | Size | Quality |
-|---------|---------|-----|------|---------|
-| **Nemotron Code v1** | `nvidia/Nemotron-Pretraining-Code-v1` | Yes | ~747B tokens | Highest (multi-stage filter + synthetic) |
-| **Nemotron Code v2** | `nvidia/Nemotron-Pretraining-Code-v2` | Yes (+ code review, transpilation) | 897GB | Highest |
-| **Nemotron CC Code v1** | `nvidia/Nemotron-CC-Code-v1` | Yes | 428B tokens | High (LLM quality-scored) |
-| **The Stack (dedup)** | `bigcode/the-stack-dedup` | Yes (`data/c++`) | ~3TB total | Good (MinHash deduped) |
-| **CommitPack** | `bigcode/commitpack` | Yes (C++ subset) | ~4TB total | Good (git commit+diff pairs) |
-| **CommitPackFT** | `bigcode/commitpackft` | Yes (C++ subset) | ~2GB filtered | High (quality-filtered commits) |
+| Dataset                 | HF Path                               | C++                                | Size          | Quality                                  |
+| ----------------------- | ------------------------------------- | ---------------------------------- | ------------- | ---------------------------------------- |
+| **Nemotron Code v1**    | `nvidia/Nemotron-Pretraining-Code-v1` | Yes                                | ~747B tokens  | Highest (multi-stage filter + synthetic) |
+| **Nemotron Code v2**    | `nvidia/Nemotron-Pretraining-Code-v2` | Yes (+ code review, transpilation) | 897GB         | Highest                                  |
+| **Nemotron CC Code v1** | `nvidia/Nemotron-CC-Code-v1`          | Yes                                | 428B tokens   | High (LLM quality-scored)                |
+| **The Stack (dedup)**   | `bigcode/the-stack-dedup`             | Yes (`data/c++`)                   | ~3TB total    | Good (MinHash deduped)                   |
+| **CommitPack**          | `bigcode/commitpack`                  | Yes (C++ subset)                   | ~4TB total    | Good (git commit+diff pairs)             |
+| **CommitPackFT**        | `bigcode/commitpackft`                | Yes (C++ subset)                   | ~2GB filtered | High (quality-filtered commits)          |
 
 ### Raw Sources (Supplement for Diversity)
 
-| Source                               | Size (raw)         | Language | Download Method                      |
-| ------------------------------------ | ------------------ | -------- | ------------------------------------ |
+| Source                               | Size (raw)         | Language | Download Method                        |
+| ------------------------------------ | ------------------ | -------- | -------------------------------------- |
 | **Linux Kernel**                     | ~1.2GB per version | C        | `git clone` by tag (v6.0, v6.6, v6.10) |
-| **LLVM/Clang**                       | ~2GB               | C++      | `git clone` by release tag (17-19)   |
-| **GCC**                              | ~1.5GB             | C, C++   | `git clone` (13-14)                  |
-| **Boost**                            | ~800MB per version | C++      | GitHub releases (1.84-1.86)          |
-| **CUDA Toolkit** (samples + headers) | ~500MB             | C, C++   | NVIDIA developer downloads (12.x)|
-| **STL implementations**              | ~200MB             | C++      | libstdc++ (GCC), libc++ (LLVM)  |
-| **Chromium**                         | ~30GB              | C++      | `depot_tools` fetch             |
-| **Qt Framework**                     | ~2GB               | C++      | `git clone`                     |
+| **LLVM/Clang**                       | ~2GB               | C++      | `git clone` by release tag (17-19)     |
+| **GCC**                              | ~1.5GB             | C, C++   | `git clone` (13-14)                    |
+| **Boost**                            | ~800MB per version | C++      | GitHub releases (1.84-1.86)            |
+| **CUDA Toolkit** (samples + headers) | ~500MB             | C, C++   | NVIDIA developer downloads (12.x)      |
+| **STL implementations**              | ~200MB             | C++      | libstdc++ (GCC), libc++ (LLVM)         |
+| **Chromium**                         | ~30GB              | C++      | `depot_tools` fetch                    |
+| **Qt Framework**                     | ~2GB               | C++      | `git clone`                            |
 
 ### Download Scripts
 

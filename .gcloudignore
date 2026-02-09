@@ -1,0 +1,16 @@
+# Ignore data directory (too large and has encoding issues)
+data/
+.git/
+.venv/
+wandb/
+wheels/
+mlwheels.zip
+*.log
+*.tar.gz
+*.zip
+__pycache__/
+*.pyc
+.cache/
+*.pt
+*.pth
+*.bin

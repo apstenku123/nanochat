@@ -138,17 +138,23 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
     assert temperature >= 0.0, "temperature must be non-negative"
     if temperature == 0.0:
         return torch.argmax(logits, dim=-1, keepdim=True)
+    orig_device = logits.device
+    # torch.multinomial + Generator doesn't work on XLA; move to CPU for sampling
+    is_xla = str(orig_device).startswith("xla")
+    if is_xla:
+        logits = logits.cpu()
     if top_k is not None and top_k > 0:
         k = min(top_k, logits.size(-1))
         vals, idx = torch.topk(logits, k, dim=-1)
         vals = vals / temperature
         probs = F.softmax(vals, dim=-1)
         choice = torch.multinomial(probs, num_samples=1, generator=rng)
-        return idx.gather(1, choice)
+        result = idx.gather(1, choice)
     else:
         logits = logits / temperature
         probs = F.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1, generator=rng)
+        result = torch.multinomial(probs, num_samples=1, generator=rng)
+    return result.to(orig_device) if is_xla else result
 
 # -----------------------------------------------------------------------------
 
@@ -175,7 +181,9 @@ class Engine:
         """Same as generate, but does single prefill and then clones the KV cache."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
-        rng = torch.Generator(device=device)
+        # torch.Generator doesn't support XLA devices; use CPU generator instead
+        rng_device = "cpu" if str(device).startswith("xla") else device
+        rng = torch.Generator(device=rng_device)
         rng.manual_seed(seed)
 
         # Get the special tokens we need to coordinate the tool use state machine

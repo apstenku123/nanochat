@@ -6,6 +6,7 @@ import re
 import glob
 import json
 import logging
+import subprocess
 import torch
 
 from nanochat.common import get_base_dir
@@ -36,6 +37,23 @@ def _patch_missing_keys(model_data, model_config):
     if "x0_lambdas" not in model_data:
         model_data["x0_lambdas"] = torch.zeros(n_layer)
 
+def _upload_to_gcs(local_path, gcs_bucket=None):
+    """Upload a file to GCS if bucket is configured via NANOCHAT_GCS_CHECKPOINT_BUCKET env var."""
+    if gcs_bucket is None:
+        gcs_bucket = os.environ.get("NANOCHAT_GCS_CHECKPOINT_BUCKET")
+    if not gcs_bucket:
+        return
+    # Build GCS path mirroring local structure
+    base_dir = get_base_dir()
+    rel_path = os.path.relpath(local_path, base_dir)
+    gcs_path = f"{gcs_bucket.rstrip('/')}/{rel_path}"
+    try:
+        subprocess.run(["gcloud", "storage", "cp", local_path, gcs_path],
+                       capture_output=True, timeout=300)
+        logger.info(f"Uploaded to GCS: {gcs_path}")
+    except Exception as e:
+        logger.warning(f"GCS upload failed for {local_path}: {e}")
+
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -43,17 +61,20 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
         torch.save(model_data, model_path)
         logger.info(f"Saved model parameters to: {model_path}")
+        _upload_to_gcs(model_path)
         # Save the metadata dict as json
         meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
         logger.info(f"Saved metadata to: {meta_path}")
+        _upload_to_gcs(meta_path)
     # Note that optimizer state is sharded across ranks, so each rank must save its own.
     if optimizer_data is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
         torch.save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
+        _upload_to_gcs(optimizer_path)
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
