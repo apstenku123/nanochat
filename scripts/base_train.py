@@ -80,7 +80,6 @@ from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
-print_banner()
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -158,6 +157,7 @@ kernels.set_kernel_backend(args.kernel)
 
 def train():
     """Main training function. Called once per process (per chip on TPU, per GPU on DDP)."""
+    print_banner()
 
     # Compute init
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
