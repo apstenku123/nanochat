@@ -79,7 +79,7 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes, verify_cpp_tokeni
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
-from scripts.base_eval import evaluate_model
+from nanochat.cpp_eval import evaluate_cpp_model
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -156,13 +156,32 @@ kernels.set_kernel_backend(args.kernel)
 
 
 def train():
-    """Main training function. Called once per process (per chip on TPU, per GPU on DDP)."""
+    """Main training function. Single process for all backends (GPU DDP, TPU SPMD, CPU)."""
     print_banner()
 
     # Compute init
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+
+    # ---- SPMD setup for multi-chip TPU data parallelism ----
+    # SPMD uses a single process; XLA distributes data across chips via sharding
+    # annotations. This avoids the ~2s/mark_step overhead of xmp.spawn.
+    spmd_mesh = None
+    if device_type == "xla":
+        import torch_xla.runtime as xr
+        num_devices = xr.global_runtime_device_count()
+        if num_devices > 1:
+            import numpy as np
+            import torch_xla.distributed.spmd as xs
+            from torch_xla.distributed.spmd import Mesh
+
+            device_ids = np.arange(num_devices)
+            spmd_mesh = Mesh(device_ids, (num_devices,), ('data',))
+            # Override world_size: SPMD reports world_size=1 (single process)
+            # but we have num_devices chips for data parallelism
+            ddp_world_size = num_devices
+            print0(f"SPMD data parallelism: {num_devices} TPU devices, mesh=({num_devices},)")
 
     # PyTorch performance optimizations
     if device_type == "cuda":
@@ -431,14 +450,40 @@ def train():
     structured_fim_path = os.path.join(os.path.dirname(__file__), '..', args.structured_fim_path)
     if fim_rate > 0 or structured_fim_rate > 0:
         print0(f"FIM enabled: fim_rate={fim_rate}, structured_fim_rate={structured_fim_rate}")
+
+    # SPMD: single process loads full batches, then shards across devices.
+    # Without SPMD: each process loads per-chip batches (DDP sharding in dataloader).
+    dataloader_B = args.device_batch_size
+    if spmd_mesh is not None:
+        dataloader_B = args.device_batch_size * ddp_world_size
+        print0(f"SPMD dataloader batch size: {dataloader_B} (= {args.device_batch_size} per chip x {ddp_world_size} chips)")
+
     train_loader = tokenizing_distributed_data_loader_with_state(
-        tokenizer, args.device_batch_size, args.max_seq_len, split="train",
+        tokenizer, dataloader_B, args.max_seq_len, split="train",
         device=device, resume_state_dict=dataloader_resume_state_dict,
         fim_rate=fim_rate, structured_fim_rate=structured_fim_rate,
         structured_fim_path=structured_fim_path if structured_fim_rate > 0 else None
     )
-    build_val_loader = lambda: tokenizing_distributed_data_loader(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+    def build_val_loader():
+        loader = tokenizing_distributed_data_loader(tokenizer, dataloader_B, args.max_seq_len, split="val", device=device)
+        if spmd_mesh is None:
+            return loader
+        # Wrap val loader to shard each batch for SPMD
+        def _sharded():
+            for x, y in loader:
+                yield shard_data(x, y)
+        return _sharded()
+
+    # SPMD helper: annotate tensors for data-parallel sharding across TPU chips
+    def shard_data(x, y):
+        """Mark batch dimension as sharded across SPMD mesh devices."""
+        if spmd_mesh is not None:
+            xs.mark_sharding(x, spmd_mesh, ('data', None))
+            xs.mark_sharding(y, spmd_mesh, ('data', None))
+        return x, y
+
     x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+    x, y = shard_data(x, y)
 
     # Pre-scan check: warn if data appears to be non-C++ (no #include, no semicolons)
     def check_cpp_data(x_batch, tokenizer, num_samples=4):
@@ -533,20 +578,22 @@ def train():
             })
             model.train()
 
-        # once in a while: estimate the CORE metric (all ranks participate)
+        # once in a while: evaluate C++ code generation quality (master process only)
         # use the original uncompiled model because the inputs keep changing shape
         # Disable FP8 for evaluation to use BF16 for more consistent/accurate results
         results = {}
-        if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+        if args.core_metric_every > 0 and master_process and (last_step or (step > 0 and step % args.core_metric_every == 0)):
             model.eval()
             with disable_fp8(orig_model), autocast_ctx():
-                results = evaluate_model(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
-            print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+                results = evaluate_cpp_model(orig_model, tokenizer, device)
+            print0(f"Step {step:05d} | C++ compile: {results['cpp_compile_rate']:.1%}, pass: {results['cpp_pass_rate']:.1%}")
             wandb_run.log({
                 "step": step,
                 "total_training_flops": flops_so_far,
-                "core_metric": results["core_metric"],
-                "centered_results": results["centered_results"],
+                "total_training_time": total_training_time,
+                "cpp_metric": results["cpp_metric"],
+                "cpp_compile_rate": results["cpp_compile_rate"],
+                "cpp_pass_rate": results["cpp_pass_rate"],
             })
             model.train()
 
@@ -555,19 +602,17 @@ def train():
         if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
             model.eval()
             prompts = [
-                "The capital of France is",
-                "The chemical symbol of gold is",
-                "If yesterday was Friday, then tomorrow will be",
-                "The opposite of hot is",
-                "The planets of the solar system are:",
-                "My favorite color is",
-                "If 5*x + 3 = 13, then x is",
+                "#include <vector>\n\n// Return the sum of all elements in a vector.\nint sum(const std::vector<int>& v) {",
+                "#include <string>\n\n// Convert a string to uppercase.\nstd::string to_upper(const std::string& s) {",
+                "#include <algorithm>\n#include <vector>\n\n// Remove duplicates from a sorted vector.\nstd::vector<int> remove_duplicates(std::vector<int> v) {",
+                "// Swap two integers without using a temporary variable.\nvoid swap(int& a, int& b) {",
+                "#include <cmath>\n\n// Calculate the distance between two 2D points.\ndouble distance(double x1, double y1, double x2, double y2) {",
             ]
             engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
             for prompt in prompts:
                 tokens = tokenizer(prompt, prepend="<|bos|>")
                 with disable_fp8(orig_model), autocast_ctx():
-                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=128, temperature=0)
                 print0(tokenizer.decode(sample[0]))
             model.train()
 
@@ -604,33 +649,82 @@ def train():
         # evaluate the gradient
         synchronize()
         t0 = time.time()
-        for micro_step in range(grad_accum_steps):
-            with autocast_ctx():
-                loss = model(x, y)
-            train_loss = loss.detach() # for logging
-            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-            loss.backward()
+
+        if spmd_mesh is not None:
+            # SPMD compiled training: compile the entire forward+backward+optimizer
+            # as one XLA graph. This reduces mark_step calls from ~11 to 1,
+            # dramatically cutting IR→HLO lowering overhead on multi-chip TPUs
+            # (e.g. v5e-8: 30K→170K tok/sec, v6e-4: 190K→320K tok/sec).
+            import torch_xla
+
+            # Pre-fetch all micro-batches (data loading must be outside compiled
+            # region to avoid OOM - data creation ops in the graph bloat HLO 4x)
+            all_x = [x]
+            all_y = [y]
+            for _ in range(grad_accum_steps - 1):
+                xi, yi, dataloader_state_dict = next(train_loader)
+                xi, yi = shard_data(xi, yi)
+                all_x.append(xi)
+                all_y.append(yi)
+
+            # Set hyperparameters before tracing (Python-level, not in the graph)
+            lrm = get_lr_multiplier(step)
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["lr"] = group["initial_lr"] * lrm
+            muon_momentum = get_muon_momentum(step)
+            muon_weight_decay = get_weight_decay(step)
+            for group in muon_optimizer.param_groups:
+                group["momentum"] = muon_momentum
+                group["weight_decay"] = muon_weight_decay
+
+            # Compile entire training step as single graph (1 mark_step on exit)
+            with torch_xla.compile():
+                for i in range(grad_accum_steps):
+                    with autocast_ctx():
+                        loss = model(all_x[i], all_y[i])
+                    train_loss = loss.detach()
+                    loss = loss / grad_accum_steps
+                    loss.backward()
+                xla_all_reduce_gradients(model, ddp_world_size)
+                for opt in optimizers:
+                    opt.step()
+                model.zero_grad(set_to_none=True)
+
+            # Prefetch first batch for next training step
+            x, y, dataloader_state_dict = next(train_loader)
+            x, y = shard_data(x, y)
+        else:
+            # Original path: per-micro-step synchronization (GPU/single-chip TPU)
+            for micro_step in range(grad_accum_steps):
+                with autocast_ctx():
+                    loss = model(x, y)
+                train_loss = loss.detach() # for logging
+                loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+                loss.backward()
+                if device_type == "xla":
+                    synchronize()  # XLA: break graph at each micro-step to keep HLO compilation fast
+                x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+                x, y = shard_data(x, y)
+            # step the optimizers
+            lrm = get_lr_multiplier(step)
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["lr"] = group["initial_lr"] * lrm
+            if device_type == "xla" and ddp_world_size > 1:
+                xla_all_reduce_gradients(model, ddp_world_size)
+            muon_momentum = get_muon_momentum(step)
+            muon_weight_decay = get_weight_decay(step)
+            for group in muon_optimizer.param_groups:
+                group["momentum"] = muon_momentum
+                group["weight_decay"] = muon_weight_decay
+            for opt in optimizers:
+                opt.step()
             if device_type == "xla":
-                synchronize()  # XLA: break graph at each micro-step to avoid huge HLO compilation
-            x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-        # step the optimizers
-        lrm = get_lr_multiplier(step)
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * lrm
-        if device_type == "xla" and ddp_world_size > 1:
-            xla_all_reduce_gradients(model, ddp_world_size)
-        muon_momentum = get_muon_momentum(step)
-        muon_weight_decay = get_weight_decay(step)
-        for group in muon_optimizer.param_groups:
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-        for opt in optimizers:
-            opt.step()
-        if device_type == "xla":
-            synchronize()  # XLA: break graph between optimizer step and zero_grad to limit HLO size
-        model.zero_grad(set_to_none=True)
-        synchronize()
+                synchronize()  # XLA: break graph between optimizer step and zero_grad
+            model.zero_grad(set_to_none=True)
+            synchronize()
+
         t1 = time.time()
         dt = t1 - t0
         # -------------------------------------------------------------------------
@@ -748,22 +842,22 @@ def train():
 
 
 # =============================================================================
-# Entry point: multi-chip TPU launch via xmp.spawn, or direct call for GPU/CPU
+# Entry point: SPMD for multi-chip TPU, or direct call for GPU/CPU
 # =============================================================================
 
-def _mp_fn(index):
-    """Entry point for each TPU chip process spawned by xmp.spawn."""
-    train()
-
 def main():
-    # PJRT uses a separate process per TPU chip. xmp.spawn auto-detects the
-    # correct count (and respects TPU_PROCESS_BOUNDS / TPU_VISIBLE_CHIPS).
     if _is_tpu_requested():
-        import torch_xla.distributed.xla_multiprocessing as xmp
-
-        xmp.spawn(_mp_fn, nprocs=None)
-    else:
-        train()
+        from nanochat.common import get_tpu_num_chips
+        num_chips = get_tpu_num_chips()
+        if num_chips > 1:
+            # Enable SPMD BEFORE any XLA runtime init (xm.xla_device(),
+            # xr.global_runtime_device_count(), etc.). SPMD uses a single
+            # process for all TPU chips, eliminating the ~2s/mark_step
+            # overhead of the multi-process xmp.spawn approach.
+            import torch_xla.runtime as xr
+            xr.use_spmd()
+            print(f"SPMD enabled for {num_chips} TPU chips")
+    train()
 
 
 if __name__ == "__main__":

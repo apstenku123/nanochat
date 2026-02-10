@@ -379,3 +379,190 @@ def verify_problems(problems_path: str) -> bool:
             print(f"  OK: {name}")
 
     return all_ok
+
+
+def _truncate_to_function_body(completion: str) -> str:
+    """Truncate generated code to just the function body.
+
+    The prompt ends with an opening '{', so the completion should contain
+    the body and closing '}'. We track brace depth and stop when it returns to 0.
+    Also handles class/struct completions that may have multiple methods.
+    """
+    depth = 1  # The prompt's opening '{' starts us at depth 1
+    result = []
+    i = 0
+    in_string = False
+    string_char = None
+    in_line_comment = False
+    in_block_comment = False
+
+    while i < len(completion):
+        c = completion[i]
+
+        # Track comments
+        if not in_string and not in_block_comment and i + 1 < len(completion):
+            if c == '/' and completion[i + 1] == '/':
+                in_line_comment = True
+            elif c == '/' and completion[i + 1] == '*':
+                in_block_comment = True
+        if in_line_comment and c == '\n':
+            in_line_comment = False
+        if in_block_comment and c == '*' and i + 1 < len(completion) and completion[i + 1] == '/':
+            in_block_comment = False
+            result.append(c)
+            i += 1
+            result.append(completion[i])
+            i += 1
+            continue
+
+        # Track strings
+        if not in_line_comment and not in_block_comment:
+            if c in ('"', "'") and not in_string:
+                in_string = True
+                string_char = c
+            elif c == string_char and in_string:
+                # Check for escape
+                num_backslashes = 0
+                j = len(result) - 1
+                while j >= 0 and result[j] == '\\':
+                    num_backslashes += 1
+                    j -= 1
+                if num_backslashes % 2 == 0:
+                    in_string = False
+
+        # Track braces (only outside strings and comments)
+        if not in_string and not in_line_comment and not in_block_comment:
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    result.append(c)
+                    # Include any trailing newline
+                    if i + 1 < len(completion) and completion[i + 1] == '\n':
+                        result.append('\n')
+                    return ''.join(result)
+
+        result.append(c)
+        i += 1
+
+    return ''.join(result)
+
+
+def evaluate_cpp_model(model, tokenizer, device, problems_path="data/cpp_bench.jsonl",
+                       max_tokens=512, temperature=0.0):
+    """Evaluate a model on C++ coding problems during training.
+
+    Lightweight function designed for periodic evaluation in the training loop.
+    Uses Engine for generation and CppBenchmark.compile_and_run() for testing.
+
+    Args:
+        model: GPT model instance
+        tokenizer: tokenizer instance
+        device: torch device
+        problems_path: path to JSONL file with C++ problems
+        max_tokens: max tokens to generate per problem
+        temperature: sampling temperature (0.0 = greedy)
+
+    Returns:
+        dict with cpp_metric, cpp_compile_rate, cpp_pass_rate, cpp_by_difficulty, cpp_problems
+    """
+    from nanochat.engine import Engine
+    from nanochat.common import print0
+
+    # Load problems
+    if not os.path.exists(problems_path):
+        print0(f"WARNING: C++ benchmark not found at {problems_path}, skipping eval")
+        return {"cpp_metric": 0.0, "cpp_compile_rate": 0.0, "cpp_pass_rate": 0.0}
+
+    with open(problems_path, 'r') as f:
+        problems = [json.loads(line) for line in f if line.strip()]
+
+    print0(f"C++ eval: {len(problems)} problems, max_tokens={max_tokens}, temp={temperature}")
+
+    engine = Engine(model, tokenizer)
+    problem_results = []
+    t0 = time.time()
+
+    for i, problem in enumerate(problems):
+        name = problem['name']
+        prompt = problem['prompt']
+        test_code = problem['test']
+        difficulty = problem.get('difficulty', 'unknown')
+
+        # Tokenize prompt and generate completion
+        tokens = tokenizer(prompt, prepend="<|bos|>")
+        prompt_len = len(tokens)
+
+        try:
+            result_tokens, _ = engine.generate_batch(
+                tokens, num_samples=1, max_tokens=max_tokens, temperature=temperature
+            )
+            # Extract completion (tokens beyond the prompt)
+            completion_tokens = result_tokens[0][prompt_len:]
+            completion = tokenizer.decode(completion_tokens)
+            # Truncate to just the function body to avoid duplicate definitions
+            completion = _truncate_to_function_body(completion)
+        except Exception as e:
+            print0(f"  [{i+1}/{len(problems)}] {name}: generation error: {e}")
+            problem_results.append({
+                "name": name, "difficulty": difficulty,
+                "compiled": False, "passed": False, "error": str(e)
+            })
+            continue
+
+        # Assemble full source and compile+run
+        full_source = prompt + completion + "\n\n" + test_code
+        result = CppBenchmark.compile_and_run(full_source)
+
+        status = "PASS" if result.passed else ("COMPILE_FAIL" if not result.compiled else "RUNTIME_FAIL")
+        print0(f"  [{i+1}/{len(problems)}] {name} ({difficulty}): {status}")
+
+        problem_results.append({
+            "name": name, "difficulty": difficulty,
+            "compiled": result.compiled, "passed": result.passed,
+        })
+
+    elapsed = time.time() - t0
+
+    # Aggregate metrics
+    num_problems = len(problem_results)
+    num_compiled = sum(1 for r in problem_results if r["compiled"])
+    num_passed = sum(1 for r in problem_results if r["passed"])
+    compile_rate = num_compiled / num_problems if num_problems > 0 else 0.0
+    pass_rate = num_passed / num_problems if num_problems > 0 else 0.0
+
+    # Per-difficulty breakdown
+    by_difficulty = {}
+    for r in problem_results:
+        d = r["difficulty"]
+        if d not in by_difficulty:
+            by_difficulty[d] = {"compiled": 0, "passed": 0, "total": 0}
+        by_difficulty[d]["total"] += 1
+        if r["compiled"]:
+            by_difficulty[d]["compiled"] += 1
+        if r["passed"]:
+            by_difficulty[d]["passed"] += 1
+
+    diff_summary = {}
+    for d, vals in by_difficulty.items():
+        diff_summary[d] = {
+            "compile": vals["compiled"] / vals["total"],
+            "pass": vals["passed"] / vals["total"],
+            "n": vals["total"],
+        }
+
+    print0(f"C++ eval done in {elapsed:.1f}s: compile={compile_rate:.1%}, pass={pass_rate:.1%}")
+    for d in ["easy", "medium", "hard"]:
+        if d in diff_summary:
+            s = diff_summary[d]
+            print0(f"  {d}: compile={s['compile']:.1%}, pass={s['pass']:.1%} ({s['n']} problems)")
+
+    return {
+        "cpp_metric": pass_rate,
+        "cpp_compile_rate": compile_rate,
+        "cpp_pass_rate": pass_rate,
+        "cpp_by_difficulty": diff_summary,
+        "cpp_problems": problem_results,
+        "cpp_eval_time": elapsed,
+    }

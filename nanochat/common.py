@@ -287,13 +287,8 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps|xla
     elif device_type == "xla":
         import torch_xla.core.xla_model as xm
         device = xm.xla_device()
-        # Newer torch_xla prefers runtime.use_spmd() over env-only configuration.
-        if os.environ.get("XLA_USE_SPMD") == "1":
-            try:
-                import torch_xla.runtime as xr
-                xr.use_spmd()
-            except Exception:
-                pass
+        # Note: xr.use_spmd() is called in main() before compute_init() when
+        # multi-chip TPU is detected. It must be called before xm.xla_device().
     else:
         device = torch.device(device_type) # mps|cpu
 
