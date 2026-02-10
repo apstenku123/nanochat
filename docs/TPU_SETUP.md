@@ -4,12 +4,13 @@ This document describes our Google Cloud TPU infrastructure for training nanocha
 
 ## Current TPU Instances
 
-We run two TPU VMs with **spot/preemptible pricing** for cost efficiency:
+We run three TPU VMs with **spot/preemptible pricing** for cost efficiency:
 
-| Name               | TPU Type    | Zone              | Chips | HBM/chip | Status  |
-| ------------------ | ----------- | ----------------- | ----- | -------- | ------- |
-| nanochat-tpu       | v5litepod-8 | us-west4-a        | 8     | 16 GB    | Running |
-| nanochat-v6e-small | v6e-4       | asia-northeast1-b | 4     | 32 GB    | Running |
+| Name | TPU Type | Zone | Chips | HBM/chip | Purpose | Status |
+| -------------------- | ----------- | ----------------- | ----- | -------- | -------------------- | ------- |
+| nanochat-tpu | v5litepod-8 | us-west4-a | 8 | 16 GB | Base training 1024 | Running |
+| nanochat-v6e-small | v6e-4 | asia-northeast1-b | 4 | 32 GB | Base training 2048 | Running |
+| nanochat-v6e-longctx | v6e-4 | asia-northeast1-b | 4 | 32 GB | Long-context 16384 | Setup |
 
 ### Project Configuration
 
@@ -17,72 +18,89 @@ We run two TPU VMs with **spot/preemptible pricing** for cost efficiency:
 - **GCS Bucket**: `gs://nanochat-training-data-2026/`
 - **W&B Project**: `misaacson-texas-state-technical-college/nanochat`
 
-## Multi-Chip Training
+## Multi-Chip Training (SPMD)
 
-nanochat uses **all TPU chips** on single-host TPUs via `xmp.spawn()` data parallelism. Each chip runs an independent process with its own model copy; gradients are averaged across chips via `xm.all_reduce`.
+nanochat uses **SPMD (Single Program Multiple Data)** for multi-chip training. A single process runs on the host, and XLA automatically shards tensors across all chips.
 
-- **v5litepod-8**: 8 processes, one per chip (Distributed world size: 8)
-- **v6e-4**: 4 processes, one per chip (Distributed world size: 4)
+### How SPMD Works
 
-This is handled automatically by `scripts/base_train.py` when `PJRT_DEVICE=TPU` is set. The script detects the number of chips from the accelerator type string (e.g. `v5litepod-8` -> 8 chips) and spawns processes accordingly.
+1. `xr.use_spmd()` is called in `main()` BEFORE any XLA runtime init
+2. A mesh is created: `Mesh(device_ids, (num_devices,), ('data',))`
+3. `xs.mark_sharding(tensor, mesh, ('data', None))` shards the batch dimension across chips
+4. Dataloader loads the full global batch (`device_batch_size * num_chips`), SPMD shards it
+5. Explicit `xla_all_reduce_gradients()` is still needed (removing it causes 30+ min compilation)
+6. `torch_xla.compile()` wraps the entire training step for optimal performance
 
-### How It Works
+### Key SPMD Optimization: `torch_xla.compile()`
 
-1. `base_train.py` parses args and sets up kernel config at **module level** (no XLA touching)
-2. At the bottom, `main()` calls `xmp.spawn(_mp_fn, nprocs=None)` which auto-detects all devices
-3. Each spawned process calls `train()` which does `compute_init()`, gets assigned its own XLA device
-4. Dataloader shards data by rank with stride `world_size` (in `dataloader.py`)
-5. Gradients are averaged via `xla_all_reduce_gradients()` (in `common.py`)
-6. Only rank 0 logs to WandB, saves model checkpoints
+The compiled training step includes forward + backward + allreduce + optimizer as ONE XLA graph with ONE `mark_step` call. This reduces mark_step calls from ~11 to 1 per training step.
 
-### Important: XLA Runtime Initialization
-
-`xmp.spawn()` requires that the XLA runtime is **not initialized** before it's called. This means:
-
-- **No `print0()`, `print_banner()`, or `get_dist_info()` at module level** - these call `xr.world_size()` which initializes the runtime
-- **No `xm.xla_device()` at module level** - creates an XLA device
-- **All XLA-touching code must be inside `train()`**
-
-If you see `RuntimeError: Runtime is already initialized. Do not use the XLA device before calling xmp.spawn.`, check that no module-level code is touching XLA.
+**Critical**: Pre-fetch all micro-batches OUTSIDE the compiled region to avoid OOM (data ops in graph = 62GB vs 16GB HBM).
 
 ### Batch Size Math
 
-With multi-chip, gradient accumulation steps decrease proportionally:
+With SPMD, gradient accumulation steps decrease proportionally:
 
 ```
 # v5e with 8 chips:
 grad_accum_steps = 524288 / (8 * 1024 * 8) = 8
 
-# v6e with 4 chips:
+# v6e with 4 chips, seq_len=2048:
 grad_accum_steps = 524288 / (8 * 2048 * 4) = 8
+
+# v6e longctx with 4 chips, seq_len=16384:
+grad_accum_steps = 524288 / (4 * 16384 * 4) = 2
 ```
+
+### Performance Results
+
+| TPU | Config | Throughput | Speedup |
+| ------------- | -------------------- | ---------- | ------- |
+| v6e-4 (SPMD) | 4 chips + compile | ~320K tok/s | ~6.8x single-chip |
+| v5e-8 (SPMD) | 8 chips + compile | ~175K tok/s | ~4.3x single-chip |
+
+## XLA Flash Attention
+
+For long-context training (seq_len >= 4096), we use XLA Flash Attention via Pallas TPU kernels:
+
+```bash
+python -m scripts.base_train --xla_flash_attn --max_seq_len=16384 --window_pattern=L
+```
+
+### Requirements
+
+- **JAX** must be installed (provides Pallas kernels): `pip install jax==0.4.38 jaxlib==0.4.38`
+- **libtpu 0.0.21** (for Python 3.10) or **libtpu 0.0.35** (for Python 3.13)
+- **CRITICAL**: JAX 0.6+ is incompatible with libtpu 0.0.21 (PJRT API version mismatch)
+
+### Window Patterns
+
+- `--window_pattern=L`: All layers use local (sliding window) attention
+- `--window_pattern=GL`: Alternating global/local attention layers
 
 ## Connecting to TPUs
 
-### SSH via gcloud
+### Direct SSH (Recommended)
 
-```bash
-# v5e TPU (us-west4-a)
-gcloud compute tpus tpu-vm ssh nanochat-tpu --zone=us-west4-a
-
-# v6e TPU (asia-northeast1-b)
-gcloud compute tpus tpu-vm ssh nanochat-v6e-small --zone=asia-northeast1-b
-```
-
-### Direct SSH
-
-gcloud SSH wrapper can be flaky (retries with exit code 255). Direct SSH to the external IP is more reliable:
+gcloud SSH wrapper can be flaky (retries with exit code 255). Direct SSH is more reliable:
 
 ```bash
 # Get the external IP
-gcloud compute tpus tpu-vm describe nanochat-tpu --zone=us-west4-a \
+gcloud compute tpus tpu-vm describe <name> --zone=<zone> \
   --format="value(networkEndpoints[0].accessConfig.externalIp)"
 
 # SSH directly
-ssh -o StrictHostKeyChecking=no dave@<IP>
+ssh -i ~/.ssh/google_compute_engine dave@<IP>
 ```
 
-Note: After TPU stop/start or recreation, the host key changes. Remove stale entries:
+### First Connection After Create/Recreate
+
+Must push SSH keys via gcloud first:
+```bash
+gcloud compute tpus tpu-vm ssh <name> --zone=<zone> --command="echo ok"
+```
+
+Note: After TPU stop/start or recreation, the host key changes:
 ```bash
 ssh-keygen -f ~/.ssh/known_hosts -R <old-ip>
 ```
@@ -113,63 +131,115 @@ ssh dave@<IP> "cd /home/dave/nanochat && tar xzf /tmp/nanochat_code.tar.gz"
 ```bash
 ssh dave@<v5e-IP>
 source ~/.tpu_env
-export PJRT_DEVICE=TPU
-export NANOCHAT_BASE_DIR=/home/dave/data
-export WANDB_API_KEY=<key>
-
+source /home/dave/venv/bin/activate  # if using venv
 cd /home/dave/nanochat
-nohup python3 -m scripts.base_train \
-    --depth=16 \
-    --num_iterations=50000 \
-    --device_batch_size=8 \
-    --max_seq_len=1024 \
-    --kernel=current \
-    --no_compile \
-    --run=d16_400M_tpu_v5e_65k_v6_8chip \
-    > ~/train_v5e_8chip.log 2>&1 &
+export NANOCHAT_BASE_DIR=/home/dave/data
+export NANOCHAT_GCS_CHECKPOINT_BUCKET=gs://nanochat-training-data-2026/checkpoints/v5e
+export WANDB_API_KEY=<key>
+export XLA_NO_SPECIAL_SCALARS=1
+
+nohup python3 -u -m scripts.base_train \
+    --depth=16 --num_iterations=50000 \
+    --device_batch_size=8 --max_seq_len=1024 \
+    --kernel=current --no_compile \
+    --run=d16_400M_tpu_v5e_65k_spmd_8chip_cppeval \
+    --core_metric_every=5000 --save_every=5000 --sample_every=5000 \
+    > ~/train_v5e_cppeval.log 2>&1 &
 ```
 
 ### v6e (4 chips, seq_len=2048)
 
 ```bash
 ssh dave@<v6e-IP>
-source /home/dave/venv/bin/activate  # v6e needs venv
+source /home/dave/venv/bin/activate
 source ~/.tpu_env
-export PJRT_DEVICE=TPU
-export WANDB_API_KEY=<key>
-
 cd /home/dave/nanochat
-nohup python3 -m scripts.base_train \
-    --depth=16 \
-    --num_iterations=50000 \
-    --device_batch_size=8 \
-    --max_seq_len=2048 \
-    --kernel=current \
-    --no_compile \
-    --run=d16_400M_v6e4_65k_v9_4chip \
-    > ~/train_v6e_4chip.log 2>&1 &
+export NANOCHAT_BASE_DIR=/home/dave/data
+export NANOCHAT_GCS_CHECKPOINT_BUCKET=gs://nanochat-training-data-2026/checkpoints/v6e
+export WANDB_API_KEY=<key>
+export XLA_NO_SPECIAL_SCALARS=1
+
+nohup python3 -u -m scripts.base_train \
+    --depth=16 --num_iterations=50000 \
+    --device_batch_size=8 --max_seq_len=2048 \
+    --kernel=current --no_compile \
+    --run=d16_400M_v6e4_65k_spmd_4chip_cppeval \
+    --core_metric_every=5000 --save_every=5000 --sample_every=5000 \
+    > ~/train_v6e_cppeval.log 2>&1 &
+```
+
+### v6e Long-Context (4 chips, seq_len=16384, XLA Flash Attention)
+
+```bash
+ssh dave@<v6e-longctx-IP>
+source /home/dave/venv/bin/activate
+source ~/.tpu_env
+cd /home/dave/nanochat
+export NANOCHAT_BASE_DIR=/home/dave/data
+export NANOCHAT_GCS_CHECKPOINT_BUCKET=gs://nanochat-training-data-2026/checkpoints/v6e-longctx
+export WANDB_API_KEY=<key>
+export XLA_NO_SPECIAL_SCALARS=1
+
+nohup python3 -u -m scripts.base_train \
+    --depth=16 --num_iterations=50000 \
+    --device_batch_size=4 --max_seq_len=16384 \
+    --kernel=current --no_compile \
+    --xla_flash_attn --window_pattern=L \
+    --data_dir=/home/dave/data/parquet --streaming_data \
+    --run=d16_400M_v6e4_longctx_16k_cppeval \
+    --core_metric_every=5000 --save_every=5000 --sample_every=5000 \
+    > ~/train_longctx.log 2>&1 &
 ```
 
 ### Key Training Flags for TPU
 
-| Flag                    | Value                 | Reason                                                      |
+| Flag | Value | Reason |
 | ----------------------- | --------------------- | ----------------------------------------------------------- |
-| `--kernel=current`      | PyTorch native        | CCE requires CUDA/Triton (not available on TPU)             |
-| `--no_compile`          | Disable torch.compile | torch.compile doesn't work on TPU/XLA                       |
-| `--device_batch_size=8` | Per-chip batch        | v5e: 16GB HBM, v6e: 32GB HBM (don't use 16/32 on v6e - OOM) |
-| `--max_seq_len=1024`    | v5e                   | Shorter sequences for 16GB chips                            |
-| `--max_seq_len=2048`    | v6e                   | Longer sequences for 32GB chips                             |
+| `--kernel=current` | PyTorch native | CCE requires CUDA/Triton (not available on TPU) |
+| `--no_compile` | Disable torch.compile | torch.compile doesn't work on TPU/XLA |
+| `--device_batch_size=8` | Per-chip batch | v5e: 16GB, v6e: 32GB (don't use 16/32 on v6e - OOM) |
+| `--device_batch_size=4` | Long-context batch | 16384 seq_len needs smaller batches |
+| `--max_seq_len=1024` | v5e | Shorter sequences for 16GB chips |
+| `--max_seq_len=2048` | v6e | Standard sequences for 32GB chips |
+| `--max_seq_len=16384` | v6e long-context | Long sequences with XLA flash attention |
+| `--xla_flash_attn` | Enable flash attn | Uses Pallas TPU kernels (requires JAX) |
+| `--window_pattern=L` | Sliding window | All layers use local attention for 16K context |
+| `--streaming_data` | Dynamic shard load | For streaming data pipeline (see DATA_PIPELINE.md) |
+| `--data_dir=<path>` | Custom data dir | Override default parquet path |
+| `XLA_NO_SPECIAL_SCALARS=1` | Env var | Prevents recompilation on every LR change |
+
+## GCS Checkpoint Storage
+
+Checkpoints auto-upload to GCS when `NANOCHAT_GCS_CHECKPOINT_BUCKET` is set:
+
+```
+gs://nanochat-training-data-2026/checkpoints/v5e/
+gs://nanochat-training-data-2026/checkpoints/v6e/
+gs://nanochat-training-data-2026/checkpoints/v6e-longctx/
+```
+
+**Critical for spot instances**: TPU VMs can be preempted at any time, GCS checkpoints survive.
+
+## C++ Code Evaluation
+
+Training includes periodic C++ code evaluation (replaces NLP CORE metric):
+
+- 17 problems from `data/cpp_bench.jsonl` (7 easy, 6 medium, 4 hard)
+- Metrics: `cpp_compile_rate`, `cpp_pass_rate` (logged to W&B)
+- Takes ~3 min per eval (vs 6+ hours for NLP CORE metric)
+- Triggered every `--core_metric_every` steps
 
 ## Cost Estimates
 
 Using **spot/preemptible pricing**:
 
-| TPU Type    | On-Demand ($/hr) | Spot ($/hr) | Our Config         |
-| ----------- | ---------------- | ----------- | ------------------ |
-| v6e-4       | ~$5.10           | **~$1.70**  | nanochat-v6e-small |
-| v5litepod-8 | ~$6.12           | **~$2.04**  | nanochat-tpu       |
+| TPU Type | On-Demand ($/hr) | Spot ($/hr) | Instance |
+| ----------- | ---------------- | ----------- | -------------------- |
+| v6e-4 | ~$5.10 | **~$1.70** | nanochat-v6e-small |
+| v6e-4 | ~$5.10 | **~$1.70** | nanochat-v6e-longctx |
+| v5litepod-8 | ~$6.12 | **~$2.04** | nanochat-tpu |
 
-**Combined hourly cost**: ~$3.74/hr (spot pricing)
+**Combined hourly cost (3 TPUs)**: ~$5.44/hr (spot pricing)
 
 > Spot instances can be preempted with 30 seconds notice. Save checkpoints frequently!
 
@@ -177,15 +247,13 @@ Using **spot/preemptible pricing**:
 
 ### v6e (Trillium) - 32 GB HBM/chip
 - Latest generation TPU (2024)
-- Higher memory bandwidth, supports seq_len=2048
+- Higher memory bandwidth, supports seq_len=2048 or 16384 (with flash attn)
 - **v6e-4 is the max single-host size** (4 chips)
 
 ### v5e (v5litepod) - 16 GB HBM/chip
 - Previous generation, still excellent
 - Limited to seq_len=1024 (memory)
 - **v5litepod-8 is the max single-host size** (8 chips)
-
-> Sizes above v5litepod-8 and v6e-4 are **multi-host** (e.g. v5litepod-16 = 2 hosts x 8 chips), which requires a different training setup not currently supported.
 
 ## Creating New TPU VMs
 
@@ -218,26 +286,152 @@ gcloud compute tpus tpu-vm create <name> \
   --project=alpine-aspect-459819-m4
 ```
 
-### v6e Post-Creation Setup
+### Available Zones
 
-The v6e runtime doesn't include Python venv by default:
+| Type | Zones |
+| ---- | -------------------------------------------- |
+| v6e | asia-northeast1-b, us-east5-b, us-central2-b |
+| v5e | us-west4-a, us-central1-a, europe-west4-a |
+
+## Python & Package Setup
+
+### Platform Requirements
+
+The TPU runtime ships with Python 3.10. For latest libtpu (0.0.35+), upgrade to Python 3.13:
+
+| Package | Python 3.10 (current) | Python 3.13 (recommended) |
+| ---------- | --------------------- | ------------------------- |
+| torch | 2.9.1 | 2.9.1 |
+| torch_xla | 2.9.0 | 2.9.0 |
+| libtpu | 0.0.21 (max for 3.10) | **0.0.35** (latest) |
+| jax | 0.4.38 | latest compatible |
+| jaxlib | 0.4.38 | latest compatible |
+| pyarrow | 23.0.0 | 23.0.0 |
+| wandb | 0.24.2 | 0.24.2 |
+| numpy | 2.2.6 | 2.2.6 |
+
+### Python 3.13 Upgrade (Recommended for v6e)
+
+```bash
+# Install Python 3.13 via deadsnakes PPA
+sudo add-apt-repository ppa:deadsnakes/ppa
+sudo apt update
+sudo apt install python3.13 python3.13-venv python3.13-dev
+
+# Create new venv
+python3.13 -m venv ~/venv313
+source ~/venv313/bin/activate
+
+# Install packages (latest versions)
+pip install torch==2.9.1 torch_xla==2.9.0 libtpu==0.0.35
+pip install jax jaxlib  # latest compatible
+pip install wandb pyarrow filelock psutil regex tabulate tiktoken tokenizers
+pip install rustbpe  # for tokenizer
+```
+
+### Python 3.10 Setup (Legacy / v5e)
 
 ```bash
 sudo apt-get install python3.10-venv
 python3 -m venv ~/venv
 source ~/venv/bin/activate
+
 pip install torch~=2.9.0 torch_xla[tpu]~=2.9.0 \
   -f https://storage.googleapis.com/libtpu-releases/index.html \
   -f https://storage.googleapis.com/libtpu-wheels/index.html
-pip install wandb filelock pyarrow
+pip install wandb filelock pyarrow psutil regex tabulate tiktoken tokenizers rustbpe
+pip install jax==0.4.38 jaxlib==0.4.38  # for XLA flash attention
+pip install libtpu==0.0.21  # must pin after jax install
 ```
 
-### Available Zones
+### GPU Setup (Vertex AI / A100)
 
-| Type | Zones                                        |
-| ---- | -------------------------------------------- |
-| v6e  | asia-northeast1-b, us-east5-b, us-central2-b |
-| v5e  | us-west4-a, us-central1-a, europe-west4-a    |
+```bash
+# Docker image for GPU training
+us-central1-docker.pkg.dev/alpine-aspect-459819-m4/nanochat/gpu-trainer:latest
+
+# CRITICAL: Build Docker with --platform linux/amd64 (local machine may be arm64)
+docker buildx create --name multiarch --driver docker-container --use
+docker buildx build --platform linux/amd64 -t <tag> --push .
+
+# A100 80GB: device_batch_size=32, kernel=cce
+# A100 40GB: device_batch_size=8, kernel=cce
+# L4: Too slow for training
+```
+
+### Local (GB10/SM121)
+
+```bash
+# Best performance: Original FA3 + CCE
+# See CLAUDE.md for full benchmark results
+python -m scripts.base_train --depth=20 --kernel=cce
+```
+
+## Environment Variables
+
+These must be set on the TPU before training:
+
+| Variable | Value | Purpose |
+| -------------------------------- | --------------------------------- | ----------------------------------------- |
+| `PJRT_DEVICE` | `TPU` | **Required** - enables TPU/XLA backend |
+| `NANOCHAT_BASE_DIR` | `/home/dave/data` | Location of tokenizer and training data |
+| `WANDB_API_KEY` | `<key>` | Weights & Biases logging |
+| `NANOCHAT_GCS_CHECKPOINT_BUCKET` | `gs://...checkpoints/<tpu>/` | Auto-upload checkpoints to GCS |
+| `XLA_NO_SPECIAL_SCALARS` | `1` | Prevents recompilation per LR change |
+
+> After TPU stop/start, env vars and wandb login are lost. Must re-set them.
+
+### ~/.tpu_env Template
+
+```bash
+export PJRT_DEVICE=TPU
+export NANOCHAT_BASE_DIR=/home/dave/data
+export XLA_NO_SPECIAL_SCALARS=1
+```
+
+## Tokenizer Setup
+
+The 65K C++ tokenizer must be available on the TPU:
+
+```bash
+mkdir -p $NANOCHAT_BASE_DIR/tokenizer_65k
+gcloud storage cp -r gs://nanochat-training-data-2026/tokenizer_65k/ \
+  $NANOCHAT_BASE_DIR/tokenizer_65k/
+
+# Create symlink expected by training code
+ln -sfn $NANOCHAT_BASE_DIR/tokenizer_65k $NANOCHAT_BASE_DIR/tokenizer
+```
+
+### Tokenizer Versions
+
+- **32K tokenizer** (`~/.cache/nanochat/tokenizer/`): Original, 32768 vocab. Local use only.
+- **65K tokenizer** (`gs://nanochat-training-data-2026/tokenizer_65k/`): 65536 vocab, expanded C++ vocabulary.
+  - 20800 fixed tokens + 44736 BPE tokens
+  - 17825 real library tokens (STL, stdlib, Boost, ACE, Qt, POSIX, CUDA, etc.)
+
+## Training Data
+
+### Standard Training Data (base_data_v3)
+
+105 parquet shards for base training:
+
+```bash
+mkdir -p $NANOCHAT_BASE_DIR/parquet/base_data_v3/
+gcloud storage cp -r gs://nanochat-training-data-2026/parquet/base_data_v3/ \
+  $NANOCHAT_BASE_DIR/parquet/base_data_v3/
+```
+
+### Long-Context Data (cpp_chunked_16k)
+
+Function-boundary-based C++ chunks with max 16384 tokens:
+
+```bash
+mkdir -p $NANOCHAT_BASE_DIR/parquet
+gcloud storage cp -r gs://nanochat-training-data-2026/parquet/cpp_chunked_16k/ \
+  $NANOCHAT_BASE_DIR/parquet/
+```
+
+See [DATA_PIPELINE.md](DATA_PIPELINE.md) for how this data is produced.
 
 ## Managing TPUs
 
@@ -259,53 +453,6 @@ gcloud compute tpus tpu-vm start <name> --zone=<zone>
 gcloud compute tpus tpu-vm delete <name> --zone=<zone>
 ```
 
-## Environment Variables
-
-These must be set on the TPU before training:
-
-| Variable            | Value                   | Purpose                                 |
-| ------------------- | ----------------------- | --------------------------------------- |
-| `PJRT_DEVICE`       | `TPU`                   | **Required** - enables TPU/XLA backend  |
-| `NANOCHAT_BASE_DIR` | `/home/dave/data` (v5e) | Location of tokenizer and training data |
-| `WANDB_API_KEY`     | `<key>`                 | Weights & Biases logging                |
-
-> After TPU stop/start, env vars and wandb login are lost. Must re-set them.
-
-### ~/.tpu_env Template
-
-```bash
-export PJRT_DEVICE=TPU
-export NANOCHAT_BASE_DIR=/home/dave/data
-export WANDB_API_KEY=<your-key>
-```
-
-## Tokenizer Setup
-
-The 65K C++ tokenizer must be available on the TPU. Download from GCS:
-
-```bash
-# On the TPU
-gcloud storage cp -r gs://nanochat-training-data-2026/tokenizer_65k/ \
-  $NANOCHAT_BASE_DIR/tokenizer/
-gcloud storage cp gs://nanochat-training-data-2026/tokenizer_65k/token_bytes.pt \
-  $NANOCHAT_BASE_DIR/tokenizer/token_bytes.pt
-```
-
-## Training Data
-
-Parquet training data shards are on GCS:
-
-```bash
-# Download training data (105 shards)
-mkdir -p $NANOCHAT_BASE_DIR/parquet/base_data_v3/
-gcloud storage cp -r gs://nanochat-training-data-2026/parquet/base_data_v3/ \
-  $NANOCHAT_BASE_DIR/parquet/base_data_v3/
-
-# Download validation data
-gcloud storage cp -r gs://nanochat-training-data-2026/parquet/val/ \
-  $NANOCHAT_BASE_DIR/parquet/val/
-```
-
 ## Troubleshooting
 
 ### XLA Compilation Takes Forever
@@ -317,19 +464,30 @@ First-run XLA compilation takes **30-60+ minutes** (v6e can take 3.5M HLO instru
 v5e TPUs sometimes go `UNHEALTHY_TENSORFLOW`. Fix: stop and start the TPU:
 
 ```bash
-gcloud compute tpus tpu-vm stop nanochat-tpu --zone=us-west4-a
-gcloud compute tpus tpu-vm start nanochat-tpu --zone=us-west4-a
+gcloud compute tpus tpu-vm stop <name> --zone=<zone>
+gcloud compute tpus tpu-vm start <name> --zone=<zone>
 ```
 
 If it stays unhealthy, delete and recreate.
 
-### PJRT Crash (Ports Refuse)
+### PJRT Crash / Device or Resource Busy
 
-The v5e PJRT runtime can die silently during XLA compilation (ports 8466/8472 refuse connections). Fix: stop/start the TPU.
+The PJRT runtime can die silently, leaving `/dev/vfio` devices locked. Fix: stop/start the TPU. `kill -9` of XLA processes corrupts PJRT state.
 
 ### v5e Silently Runs on CPU
 
 Without `PJRT_DEVICE=TPU`, the script silently runs on CPU. Always `source ~/.tpu_env` before training.
+
+### Preempted TPU Recovery
+
+Preempted TPUs must be **deleted and recreated** (cannot `start` a preempted VM):
+
+```bash
+gcloud compute tpus tpu-vm delete <name> --zone=<zone> --quiet
+gcloud compute tpus tpu-vm create <name> \
+  --zone=<zone> --accelerator-type=<type> --version=v2-alpha-tpuv6e --spot
+# Then re-run full environment setup
+```
 
 ### Disk Space (v6e)
 
@@ -339,21 +497,20 @@ v6e has a small root disk (~97 GB). Clean `/tmp/nanochat_checkpoints/` periodica
 
 `gsutil` may fail on v6e with OpenSSL errors. Use `gcloud storage cp` instead.
 
+### JAX/libtpu Version Mismatch
+
+```
+RuntimeError: Unexpected PJRT_Plugin_Attributes_Args size: expected 32, got 24
+```
+
+This means JAX and libtpu have incompatible PJRT API versions. Fix:
+- Python 3.10: pin `jax==0.4.38 jaxlib==0.4.38 libtpu==0.0.21`
+- Python 3.13: use latest jax + `libtpu==0.0.35`
+
 ### torch.Generator on XLA
 
 `torch.Generator(device=xla_device)` crashes. Use a CPU generator and move tensors to XLA.
 
-## PyTorch/XLA Software Versions
+### GCS Checkpoint Naming Mismatch
 
-| Component | v5e         | v6e         |
-| --------- | ----------- | ----------- |
-| Python    | 3.10        | 3.10        |
-| torch     | 2.9.1+cu128 | 2.9.1+cu128 |
-| torch_xla | 2.9.0       | 2.9.0       |
-| libtpu    | 0.0.21      | 0.0.21      |
-
-### API Notes
-
-- Use `torch_xla.runtime.world_size()` and `torch_xla.runtime.global_ordinal()` (not deprecated `xm.xrt_world_size()`/`xm.get_ordinal()`)
-- `fused=True` in AdamW breaks on XLA - omit it
-- `LIBTPU_INIT_ARGS=--xla_tpu_disable_full_embedding_pipelining=true` is NOT supported by libtpu 0.0.21
+Old checkpoints used `model_step_25000.pt`, new code expects `model_025000.pt`. Cannot resume across formats.
