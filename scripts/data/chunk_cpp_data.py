@@ -138,14 +138,16 @@ def group_chunks(chunks: list[Chunk], max_tokens: int, rng: random.Random) -> li
 
 
 def process_jsonl(input_path: str, max_tokens: int, rng: random.Random,
-                  seen_hashes: set, stats: Counter, max_records: int = 0) -> list[str]:
+                  seen_hashes: set, stats: Counter, out_file,
+                  max_records: int = 0) -> int:
     """Process a single JSONL file, chunking each record.
 
-    Returns list of document strings.
+    Streams documents directly to out_file (JSONL) to avoid memory accumulation.
+    Returns number of new documents written.
     """
-    documents = []
     t0 = time.time()
     count = 0
+    new_docs = 0
 
     with open(input_path) as f:
         for line in f:
@@ -183,14 +185,15 @@ def process_jsonl(input_path: str, max_tokens: int, rng: random.Random,
             docs = group_chunks(chunks, max_tokens, rng)
 
             for doc in docs:
-                # Dedup by content hash
-                h = hashlib.md5(doc.encode()).hexdigest()
+                # Dedup by content hash (binary digest saves memory vs hex)
+                h = hashlib.md5(doc.encode()).digest()
                 if h in seen_hashes:
                     stats['dedup'] += 1
                     continue
                 seen_hashes.add(h)
 
-                documents.append(doc)
+                out_file.write(json.dumps({"text": doc}) + '\n')
+                new_docs += 1
                 stats['docs_out'] += 1
 
             stats['files_in'] += 1
@@ -199,45 +202,81 @@ def process_jsonl(input_path: str, max_tokens: int, rng: random.Random,
                 elapsed = time.time() - t0
                 rate = count / elapsed
                 print(f"  {input_path}: {count:,} files → {stats['docs_out']:,} docs ({rate:.0f} files/sec)")
+                out_file.flush()
 
     elapsed = time.time() - t0
-    print(f"  {input_path}: {count:,} files → {len(documents):,} new docs in {elapsed:.0f}s")
-    return documents
+    print(f"  {input_path}: {count:,} files → {new_docs:,} new docs in {elapsed:.0f}s")
+    return new_docs
 
 
 def write_parquet(jsonl_path: str, parquet_dir: str, rows_per_file: int = 50000):
-    """Convert JSONL to parquet shards with train/val split."""
+    """Convert JSONL to parquet shards with train/val split.
+
+    Streams from JSONL to avoid loading everything into memory.
+    Shuffles within each shard; shard assignment is hash-based for
+    deterministic distribution without a full in-memory shuffle.
+    """
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     print(f"Converting to parquet: {parquet_dir}")
-    texts = []
+    os.makedirs(parquet_dir, exist_ok=True)
+
+    # First pass: count total docs
+    total = 0
     with open(jsonl_path) as f:
         for line in f:
             if line.strip():
-                texts.append(json.loads(line)['text'])
+                total += 1
+    print(f"  Total documents: {total:,}")
 
-    print(f"  Total documents: {len(texts):,}")
-    random.seed(42)
-    random.shuffle(texts)
+    val_count = max(1, int(total * 0.01))
+    val_threshold = total - val_count  # docs after this index go to val
 
-    val_count = max(1, int(len(texts) * 0.01))
-    train_texts = texts[:-val_count]
-    val_texts = texts[-val_count:]
-
-    os.makedirs(parquet_dir, exist_ok=True)
+    # Second pass: stream into shards
+    rng_pq = random.Random(42)
     shard_idx = 0
-    for start in range(0, len(train_texts), rows_per_file):
-        batch = train_texts[start:start + rows_per_file]
+    batch = []
+    val_batch = []
+    doc_idx = 0
+
+    with open(jsonl_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            text = json.loads(line)['text']
+            doc_idx += 1
+
+            # Last val_count docs go to validation
+            if doc_idx > val_threshold:
+                val_batch.append(text)
+            else:
+                batch.append(text)
+
+            if len(batch) >= rows_per_file:
+                rng_pq.shuffle(batch)
+                table = pa.table({'text': batch})
+                path = os.path.join(parquet_dir, f"shard_{shard_idx:05d}.parquet")
+                pq.write_table(table, path, row_group_size=1024)
+                shard_idx += 1
+                batch = []
+
+    # Flush remaining train batch
+    if batch:
+        rng_pq.shuffle(batch)
         table = pa.table({'text': batch})
         path = os.path.join(parquet_dir, f"shard_{shard_idx:05d}.parquet")
         pq.write_table(table, path, row_group_size=1024)
         shard_idx += 1
 
-    val_table = pa.table({'text': val_texts})
-    val_path = os.path.join(parquet_dir, f"shard_{shard_idx:05d}.parquet")
-    pq.write_table(val_table, val_path, row_group_size=1024)
-    print(f"  Written {shard_idx} train shards + 1 val shard")
+    # Write val shard
+    if val_batch:
+        val_table = pa.table({'text': val_batch})
+        val_path = os.path.join(parquet_dir, f"val_shard.parquet")
+        pq.write_table(val_table, val_path, row_group_size=1024)
+
+    print(f"  Written {shard_idx} train shards + 1 val shard ({len(val_batch):,} val docs)")
 
 
 def main():
@@ -258,27 +297,38 @@ def main():
     rng = random.Random(args.seed)
     seen_hashes = set()
     stats = Counter()
-    all_documents = []
 
     print(f"Processing {len(args.inputs)} input file(s), max_tokens={args.max_tokens}")
 
-    for input_path in args.inputs:
-        if not os.path.exists(input_path):
-            print(f"WARNING: {input_path} not found, skipping")
-            continue
-        print(f"\nProcessing: {input_path} ({os.path.getsize(input_path)/1e9:.1f} GB)")
-        docs = process_jsonl(input_path, args.max_tokens, rng, seen_hashes, stats,
-                             max_records=args.max_records)
-        all_documents.extend(docs)
-
-    # Write output JSONL
+    # Stream documents directly to JSONL (no memory accumulation)
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
-    with open(args.output, 'w') as f:
-        for doc in all_documents:
-            f.write(json.dumps({"text": doc}) + '\n')
+    with open(args.output, 'w') as out_f:
+        for input_path in args.inputs:
+            if not os.path.exists(input_path):
+                print(f"WARNING: {input_path} not found, skipping")
+                continue
+            print(f"\nProcessing: {input_path} ({os.path.getsize(input_path)/1e9:.1f} GB)")
+            process_jsonl(input_path, args.max_tokens, rng, seen_hashes, stats,
+                          out_f, max_records=args.max_records)
 
     output_size = os.path.getsize(args.output) / 1e9
-    total_tokens_est = sum(estimate_tokens(d) for d in all_documents)
+
+    # Estimate tokens by sampling first 100K lines of output
+    sample_tokens = 0
+    sample_count = 0
+    with open(args.output) as f:
+        for line in f:
+            if sample_count >= 100000:
+                break
+            if line.strip():
+                sample_tokens += estimate_tokens(json.loads(line)['text'])
+                sample_count += 1
+
+    if sample_count > 0 and stats['docs_out'] > 0:
+        avg_tokens = sample_tokens / sample_count
+        total_tokens_est = int(avg_tokens * stats['docs_out'])
+    else:
+        total_tokens_est = 0
 
     print(f"\n{'='*60}")
     print(f"RESULTS:")
@@ -288,15 +338,22 @@ def main():
     print(f"  Deduplicated: {stats['dedup']:,}")
     print(f"  Chunk errors: {stats['chunk_error']:,}")
     print(f"  Output: {args.output} ({output_size:.2f} GB)")
+    print(f"  Dedup hash memory: {len(seen_hashes):,} entries (~{len(seen_hashes)*50/1e6:.0f} MB)")
     print(f"{'='*60}")
 
     # Parquet conversion
     if args.parquet_dir:
         write_parquet(args.output, args.parquet_dir)
 
-    # Token size distribution
-    sizes = [estimate_tokens(d) for d in all_documents[:100000]]
-    if sizes:
+    # Token size distribution from sample
+    if sample_count > 0:
+        sizes = []
+        with open(args.output) as f:
+            for line in f:
+                if len(sizes) >= 100000:
+                    break
+                if line.strip():
+                    sizes.append(estimate_tokens(json.loads(line)['text']))
         sizes.sort()
         n = len(sizes)
         print(f"\nToken distribution (first {n:,} docs):")
