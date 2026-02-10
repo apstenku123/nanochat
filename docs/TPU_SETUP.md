@@ -10,7 +10,7 @@ We run three TPU VMs with **spot/preemptible pricing** for cost efficiency:
 | -------------------- | ----------- | ----------------- | ----- | -------- | -------------------- | ------- |
 | nanochat-tpu | v5litepod-8 | us-west4-a | 8 | 16 GB | Base training 1024 | Running |
 | nanochat-v6e-small | v6e-4 | asia-northeast1-b | 4 | 32 GB | Base training 2048 | Running |
-| nanochat-v6e-longctx | v6e-4 | asia-northeast1-b | 4 | 32 GB | Long-context 16384 | Setup |
+| nanochat-v6e-longctx | v6e-4 | asia-northeast1-b | 4 | 32 GB | Base training 2048 | Running |
 
 ### Project Configuration
 
@@ -61,19 +61,31 @@ grad_accum_steps = 524288 / (4 * 16384 * 4) = 2
 
 ## XLA Flash Attention
 
-For long-context training (seq_len >= 4096), we use XLA Flash Attention via Pallas TPU kernels:
+For long-context training (seq_len >= 4096), XLA Flash Attention via Pallas TPU kernels is planned:
 
 ```bash
 python -m scripts.base_train --xla_flash_attn --max_seq_len=16384 --window_pattern=L
 ```
 
-### Requirements
+### BLOCKED: PJRT API Version Conflict (as of 2026-02-10)
 
-- **JAX** must be installed (provides Pallas kernels): `pip install jax==0.4.38 jaxlib==0.4.38`
-- **libtpu 0.0.21** (for Python 3.10) or **libtpu 0.0.35** (for Python 3.13)
-- **CRITICAL**: JAX 0.6+ is incompatible with libtpu 0.0.21 (PJRT API version mismatch)
+XLA Flash Attention currently **cannot work** due to an irreconcilable PJRT API version conflict:
 
-### Window Patterns
+| Component | Needs PJRT API | libtpu Version |
+|-----------|---------------|----------------|
+| **torch_xla 2.9.0** | ~0.75 | libtpu 0.0.21 |
+| **JAX Pallas kernels** | ~0.89+ | libtpu 0.0.34+ |
+
+- torch_xla 2.9.0 uses libtpu 0.0.21 (PJRT API 0.75) for TPU access
+- JAX Pallas (used by torch_xla for flash attention compilation) requires libtpu with PJRT API 0.89+
+- No JAX version bridges this gap: jax 0.4.30-0.4.31 expect API 0.54, jax 0.4.33+ expects >0.75
+- Python 3.13 doesn't help: libtpu 0.0.21.1 (py313) has PJRT API 0.89, incompatible with torch_xla 2.9.0
+
+**Resolution**: Wait for torch_xla 2.10+ which should support newer PJRT API versions.
+
+**Current workaround**: All TPUs train with `max_seq_len=2048` without flash attention.
+
+### Window Patterns (for future use)
 
 - `--window_pattern=L`: All layers use local (sliding window) attention
 - `--window_pattern=GL`: Alternating global/local attention layers
@@ -168,11 +180,13 @@ nohup python3 -u -m scripts.base_train \
     > ~/train_v6e_cppeval.log 2>&1 &
 ```
 
-### v6e Long-Context (4 chips, seq_len=16384, XLA Flash Attention)
+### v6e Long-Context (4 chips, seq_len=2048, streaming data)
+
+> **Note**: Originally planned for 16K context with XLA flash attention, but blocked by PJRT API version conflict (see above). Running at seq_len=2048 without flash attention instead.
 
 ```bash
 ssh dave@<v6e-longctx-IP>
-source /home/dave/venv/bin/activate
+source /home/dave/venv/bin/activate  # venv -> venv310_backup (Python 3.10)
 source ~/.tpu_env
 cd /home/dave/nanochat
 export NANOCHAT_BASE_DIR=/home/dave/data
@@ -182,11 +196,10 @@ export XLA_NO_SPECIAL_SCALARS=1
 
 nohup python3 -u -m scripts.base_train \
     --depth=16 --num_iterations=50000 \
-    --device_batch_size=4 --max_seq_len=16384 \
+    --device_batch_size=8 --max_seq_len=2048 \
     --kernel=current --no_compile \
-    --xla_flash_attn --window_pattern=L \
     --data_dir=/home/dave/data/parquet --streaming_data \
-    --run=d16_400M_v6e4_longctx_16k_cppeval \
+    --run=d16_400M_v6e4_longctx_2k_cppeval \
     --core_metric_every=5000 --save_every=5000 --sample_every=5000 \
     > ~/train_longctx.log 2>&1 &
 ```
@@ -198,12 +211,10 @@ nohup python3 -u -m scripts.base_train \
 | `--kernel=current` | PyTorch native | CCE requires CUDA/Triton (not available on TPU) |
 | `--no_compile` | Disable torch.compile | torch.compile doesn't work on TPU/XLA |
 | `--device_batch_size=8` | Per-chip batch | v5e: 16GB, v6e: 32GB (don't use 16/32 on v6e - OOM) |
-| `--device_batch_size=4` | Long-context batch | 16384 seq_len needs smaller batches |
 | `--max_seq_len=1024` | v5e | Shorter sequences for 16GB chips |
 | `--max_seq_len=2048` | v6e | Standard sequences for 32GB chips |
-| `--max_seq_len=16384` | v6e long-context | Long sequences with XLA flash attention |
-| `--xla_flash_attn` | Enable flash attn | Uses Pallas TPU kernels (requires JAX) |
-| `--window_pattern=L` | Sliding window | All layers use local attention for 16K context |
+| `--xla_flash_attn` | Enable flash attn | **BLOCKED** - Pallas TPU kernels have PJRT version conflict |
+| `--window_pattern=L` | Sliding window | For use with flash attention (currently blocked) |
 | `--streaming_data` | Dynamic shard load | For streaming data pipeline (see DATA_PIPELINE.md) |
 | `--data_dir=<path>` | Custom data dir | Override default parquet path |
 | `XLA_NO_SPECIAL_SCALARS=1` | Env var | Prevents recompilation on every LR change |
@@ -247,7 +258,7 @@ Using **spot/preemptible pricing**:
 
 ### v6e (Trillium) - 32 GB HBM/chip
 - Latest generation TPU (2024)
-- Higher memory bandwidth, supports seq_len=2048 or 16384 (with flash attn)
+- Higher memory bandwidth, supports seq_len=2048 (16384 planned when flash attn PJRT conflict resolved)
 - **v6e-4 is the max single-host size** (4 chips)
 
 ### v5e (v5litepod) - 16 GB HBM/chip
@@ -297,39 +308,21 @@ gcloud compute tpus tpu-vm create <name> \
 
 ### Platform Requirements
 
-The TPU runtime ships with Python 3.10. For latest libtpu (0.0.35+), upgrade to Python 3.13:
+All TPUs use **Python 3.10** with torch_xla 2.9.0 and libtpu 0.0.21.
 
-| Package | Python 3.10 (current) | Python 3.13 (recommended) |
-| ---------- | --------------------- | ------------------------- |
-| torch | 2.9.1 | 2.9.1 |
-| torch_xla | 2.9.0 | 2.9.0 |
-| libtpu | 0.0.21 (max for 3.10) | **0.0.35** (latest) |
-| jax | 0.4.38 | latest compatible |
-| jaxlib | 0.4.38 | latest compatible |
-| pyarrow | 23.0.0 | 23.0.0 |
-| wandb | 0.24.2 | 0.24.2 |
-| numpy | 2.2.6 | 2.2.6 |
+| Package | Version | Notes |
+| ---------- | ------- | ----- |
+| torch | 2.9.1 | PyTorch with XLA support |
+| torch_xla | 2.9.0 | Latest stable (Nov 2025) |
+| libtpu | 0.0.21 | Must use this version (PJRT API 0.75) |
+| jax/jaxlib | 0.4.38 | Installed but **not used for TPU** (PJRT conflict) |
+| pyarrow | 23.0.0 | Parquet data loading |
+| wandb | 0.24.2 | Experiment tracking |
+| numpy | 2.2.6 | Numerical computing |
 
-### Python 3.13 Upgrade (Recommended for v6e)
+> **Python 3.13 Note**: Attempted upgrade to Python 3.13 + libtpu 0.0.35 failed — libtpu 0.0.21.1 (py313 wheel) has PJRT API 0.89, incompatible with torch_xla 2.9.0. Waiting for torch_xla 2.10+.
 
-```bash
-# Install Python 3.13 via deadsnakes PPA
-sudo add-apt-repository ppa:deadsnakes/ppa
-sudo apt update
-sudo apt install python3.13 python3.13-venv python3.13-dev
-
-# Create new venv
-python3.13 -m venv ~/venv313
-source ~/venv313/bin/activate
-
-# Install packages (latest versions)
-pip install torch==2.9.1 torch_xla==2.9.0 libtpu==0.0.35
-pip install jax jaxlib  # latest compatible
-pip install wandb pyarrow filelock psutil regex tabulate tiktoken tokenizers
-pip install rustbpe  # for tokenizer
-```
-
-### Python 3.10 Setup (Legacy / v5e)
+### Python 3.10 Setup (All TPUs)
 
 ```bash
 sudo apt-get install python3.10-venv
@@ -340,8 +333,8 @@ pip install torch~=2.9.0 torch_xla[tpu]~=2.9.0 \
   -f https://storage.googleapis.com/libtpu-releases/index.html \
   -f https://storage.googleapis.com/libtpu-wheels/index.html
 pip install wandb filelock pyarrow psutil regex tabulate tiktoken tokenizers rustbpe
-pip install jax==0.4.38 jaxlib==0.4.38  # for XLA flash attention
-pip install libtpu==0.0.21  # must pin after jax install
+pip install jax==0.4.38 jaxlib==0.4.38  # installed for compatibility, TPU backend not used
+pip install libtpu==0.0.21  # must pin after jax install (jax may pull newer version)
 ```
 
 ### GPU Setup (Vertex AI / A100)
