@@ -278,6 +278,12 @@ def write_parquet(jsonl_path: str, parquet_dir: str, rows_per_file: int = 50000)
 
     print(f"  Written {shard_idx} train shards + 1 val shard ({len(val_batch):,} val docs)")
 
+    # Write completion sentinel so streaming consumers know all shards are ready
+    sentinel = os.path.join(parquet_dir, "_COMPLETE")
+    with open(sentinel, 'w') as f:
+        f.write(f"{shard_idx} train shards, {len(val_batch)} val docs\n")
+    print(f"  Written _COMPLETE sentinel")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Chunk C++ data by function/class boundaries")

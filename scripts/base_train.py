@@ -141,6 +141,9 @@ parser.add_argument("--no_compile", action="store_true", help="disable torch.com
 # XLA/TPU optimizations
 parser.add_argument("--use_scan", action="store_true", help="use torch_xla scan_layers to reduce XLA compilation time (TPU only)")
 parser.add_argument("--xla_flash_attn", action="store_true", help="use XLA Pallas flash attention for TPU (O(n) memory, enables long seq_len). Does not support sliding window - use --window_pattern=L")
+# Data directory
+parser.add_argument("--data_dir", type=str, default="", help="Custom parquet data directory (default: base_data from NANOCHAT_BASE_DIR)")
+parser.add_argument("--streaming_data", action="store_true", help="Streaming mode: dynamically discover new parquet shards as they arrive. Waits for _COMPLETE sentinel.")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 
@@ -464,14 +467,17 @@ def train():
         dataloader_B = args.device_batch_size * ddp_world_size
         print0(f"SPMD dataloader batch size: {dataloader_B} (= {args.device_batch_size} per chip x {ddp_world_size} chips)")
 
+    data_dir = args.data_dir if args.data_dir else None
     train_loader = tokenizing_distributed_data_loader_with_state(
         tokenizer, dataloader_B, args.max_seq_len, split="train",
         device=device, resume_state_dict=dataloader_resume_state_dict,
         fim_rate=fim_rate, structured_fim_rate=structured_fim_rate,
-        structured_fim_path=structured_fim_path if structured_fim_rate > 0 else None
+        structured_fim_path=structured_fim_path if structured_fim_rate > 0 else None,
+        data_dir=data_dir, streaming=args.streaming_data
     )
     def build_val_loader():
-        loader = tokenizing_distributed_data_loader(tokenizer, dataloader_B, args.max_seq_len, split="val", device=device)
+        loader = tokenizing_distributed_data_loader(tokenizer, dataloader_B, args.max_seq_len, split="val", device=device,
+                                                     data_dir=data_dir)
         if spmd_mesh is None:
             return loader
         # Wrap val loader to shard each batch for SPMD

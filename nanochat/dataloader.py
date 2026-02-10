@@ -33,19 +33,45 @@ def get_structured_fim_dataset(tokenizer, pairs_path: str = None):
     return _structured_fim_dataset
 
 
-def _document_batches(split, resume_state_dict, tokenizer_batch_size):
+def _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=None, streaming=False):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
 
     Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
     where text_batch is a list of document strings, indices track position for resumption,
     and epoch counts how many times we've cycled through the dataset (starts at 1).
+
+    Args:
+        data_dir: Custom parquet directory (default: base_data from get_base_dir())
+        streaming: If True, dynamically discover new parquet files as they arrive.
+            Waits for files if none available. Stops waiting when _COMPLETE sentinel exists.
     """
+    import time as _time
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
-    parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+    def _scan_parquet(d):
+        paths = list_parquet_files(d)
+        if not paths:
+            return []
+        return paths[:-1] if split == "train" else paths[-1:]
+
+    def _is_complete(d):
+        d = d or os.path.join(get_base_dir(), "base_data")
+        return os.path.exists(os.path.join(d, "_COMPLETE"))
+
+    if streaming:
+        # Streaming mode: wait for first shard to appear
+        while True:
+            parquet_paths = _scan_parquet(data_dir)
+            if parquet_paths:
+                print(f"[streaming] Found {len(parquet_paths)} {split} shards, starting training")
+                break
+            print(f"[streaming] No parquet shards yet in {data_dir}, waiting 30s...")
+            _time.sleep(30)
+    else:
+        parquet_paths = list_parquet_files(data_dir)
+        assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
+        parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
 
     resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
     resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
@@ -53,6 +79,7 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     first_pass = True
     pq_idx = resume_pq_idx
     epoch = resume_epoch
+    known_count = len(parquet_paths)  # track how many shards we've seen
 
     while True:  # iterate infinitely (multi-epoch)
         pq_idx = resume_pq_idx if first_pass else 0
@@ -77,6 +104,36 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
                     yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
                 rg_idx += ddp_world_size
             pq_idx += 1
+
+        if streaming:
+            # Re-scan for new shards before wrapping epoch
+            new_paths = _scan_parquet(data_dir)
+            if len(new_paths) > known_count:
+                print(f"[streaming] Discovered {len(new_paths) - known_count} new shards ({len(new_paths)} total)")
+                # Continue from where we left off with new files
+                pq_idx = known_count  # start reading the new shards
+                parquet_paths = new_paths
+                known_count = len(new_paths)
+                continue  # don't increment epoch yet
+            elif not _is_complete(data_dir):
+                # No new files and not done — wait for more
+                print(f"[streaming] Waiting for more shards ({known_count} so far)...")
+                while not _is_complete(data_dir):
+                    _time.sleep(30)
+                    new_paths = _scan_parquet(data_dir)
+                    if len(new_paths) > known_count:
+                        break
+                # Pick up whatever new files appeared
+                new_paths = _scan_parquet(data_dir)
+                if len(new_paths) > known_count:
+                    pq_idx = known_count
+                    parquet_paths = new_paths
+                    known_count = len(new_paths)
+                    continue
+            # All shards present — normal epoch wrap
+            parquet_paths = _scan_parquet(data_dir)  # final re-scan
+            known_count = len(parquet_paths)
+
         first_pass = False
         epoch += 1
 
@@ -86,7 +143,8 @@ def tokenizing_distributed_data_loader_with_state(
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
     buffer_size=1000,
-    fim_rate=0.0, spm_rate=0.5, structured_fim_rate=0.0, structured_fim_path=None
+    fim_rate=0.0, spm_rate=0.5, structured_fim_rate=0.0, structured_fim_path=None,
+    data_dir=None, streaming=False
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping and memory optimization.
@@ -110,7 +168,8 @@ def tokenizing_distributed_data_loader_with_state(
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
     row_capacity = T + 1
-    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
+    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size,
+                                data_dir=data_dir, streaming=streaming)
     bos_token = tokenizer.get_bos_token_id()
     doc_buffer = []
     pq_idx, rg_idx, epoch = 0, 0, 1
