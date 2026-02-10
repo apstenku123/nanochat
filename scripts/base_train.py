@@ -140,6 +140,7 @@ parser.add_argument("--kernel", type=str, default="current", choices=["current",
 parser.add_argument("--no_compile", action="store_true", help="disable torch.compile (use for NVIDIA containers with triton issues)")
 # XLA/TPU optimizations
 parser.add_argument("--use_scan", action="store_true", help="use torch_xla scan_layers to reduce XLA compilation time (TPU only)")
+parser.add_argument("--xla_flash_attn", action="store_true", help="use XLA Pallas flash attention for TPU (O(n) memory, enables long seq_len). Does not support sliding window - use --window_pattern=L")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 
@@ -152,6 +153,11 @@ if args.no_compile:
 
 # Set kernel backend
 kernels.set_kernel_backend(args.kernel)
+
+# Enable XLA flash attention if requested (before any model creation)
+if args.xla_flash_attn:
+    from nanochat.flash_attention import enable_xla_flash_attention
+    enable_xla_flash_attention()
 # -----------------------------------------------------------------------------
 
 

@@ -11,9 +11,12 @@ Loss masking is computed automatically from token IDs:
 - Everything else → mask=1 (trained: thoughts, tool calls, code output)
 """
 
+import hashlib
 import json
 import os
+import time
 import torch
+import numpy as np
 from torch.utils.data import Dataset
 
 from nanochat.tokenizer import get_tokenizer
@@ -180,25 +183,110 @@ class ToolCallSFTDataset(Dataset):
         self.tokenizer = get_tokenizer()
         self.special_ids = _resolve_special_ids(self.tokenizer)
 
+        # Try loading from pre-tokenized cache
+        cache_path = self._cache_path(jsonl_path, max_len)
+        if self._load_cache(cache_path, jsonl_path):
+            return
+
         # Load and tokenize all examples
-        self.examples = []
+        t0 = time.time()
+        all_inputs = []
+        all_targets = []
         skipped = 0
+        total = 0
         with open(jsonl_path, "r") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
+                total += 1
                 item = json.loads(line)
                 text = item["text"]
 
                 result = self._tokenize(text)
                 if result is not None:
-                    self.examples.append(result)
+                    all_inputs.append(result[0])
+                    all_targets.append(result[1])
                 else:
                     skipped += 1
 
-        if skipped > 0:
-            print(f"ToolCallSFTDataset: skipped {skipped} examples (too short after tokenization)")
+                if total % 100000 == 0:
+                    print(f"  tokenized {total:,} examples ({len(all_inputs):,} kept)...")
+
+        dt = time.time() - t0
+        print(f"Tokenized {len(all_inputs):,} examples in {dt:.1f}s (skipped {skipped})")
+
+        # Pack into flat tensors for fast cache/load
+        self._pack_examples(all_inputs, all_targets)
+
+        # Save cache for next run
+        self._save_cache(cache_path)
+
+    @staticmethod
+    def _cache_path(jsonl_path: str, max_len: int) -> str:
+        """Derive cache path from JSONL path and max_len."""
+        # Include file size in cache key for invalidation
+        fsize = os.path.getsize(jsonl_path) if os.path.exists(jsonl_path) else 0
+        key = f"{os.path.abspath(jsonl_path)}:{fsize}:{max_len}"
+        h = hashlib.md5(key.encode()).hexdigest()[:12]
+        return jsonl_path + f".cache.{h}.pt"
+
+    def _pack_examples(self, all_inputs: list, all_targets: list):
+        """Pack variable-length examples into flat int16 tensors + offset index."""
+        n = len(all_inputs)
+        offsets = np.zeros(n + 1, dtype=np.int64)
+        for i, inp in enumerate(all_inputs):
+            offsets[i + 1] = offsets[i] + len(inp)
+        total_tokens = int(offsets[-1])
+
+        input_flat = np.zeros(total_tokens, dtype=np.int16)
+        target_flat = np.zeros(total_tokens, dtype=np.int16)
+        for i, (inp, tgt) in enumerate(zip(all_inputs, all_targets)):
+            start = offsets[i]
+            end = offsets[i + 1]
+            input_flat[start:end] = inp
+            target_flat[start:end] = tgt
+
+        self.offsets = torch.from_numpy(offsets)
+        self.input_flat = torch.from_numpy(input_flat)
+        self.target_flat = torch.from_numpy(target_flat)
+        self._num_examples = n
+        print(f"Packed {n:,} examples, {total_tokens:,} total tokens ({total_tokens * 4 / 1e9:.2f} GB)")
+
+    def _save_cache(self, cache_path: str):
+        """Save pre-tokenized data to cache file."""
+        t0 = time.time()
+        torch.save({
+            "offsets": self.offsets,
+            "input_flat": self.input_flat,
+            "target_flat": self.target_flat,
+        }, cache_path)
+        dt = time.time() - t0
+        sz = os.path.getsize(cache_path) / 1e9
+        print(f"Saved cache to {cache_path} ({sz:.2f} GB, {dt:.1f}s)")
+
+    def _load_cache(self, cache_path: str, jsonl_path: str) -> bool:
+        """Load pre-tokenized data from cache. Returns True on success."""
+        if not os.path.exists(cache_path):
+            return False
+        # Invalidate if JSONL is newer
+        if os.path.getmtime(jsonl_path) > os.path.getmtime(cache_path):
+            print(f"Cache stale (JSONL newer), re-tokenizing...")
+            return False
+        try:
+            t0 = time.time()
+            cache = torch.load(cache_path, weights_only=True)
+            self.offsets = cache["offsets"]
+            self.input_flat = cache["input_flat"]
+            self.target_flat = cache["target_flat"]
+            self._num_examples = len(self.offsets) - 1
+            dt = time.time() - t0
+            total_tokens = len(self.input_flat)
+            print(f"Loaded {self._num_examples:,} examples ({total_tokens:,} tokens) from cache in {dt:.1f}s")
+            return True
+        except Exception as e:
+            print(f"Cache load failed ({e}), re-tokenizing...")
+            return False
 
     def _tokenize(self, text: str):
         """Tokenize text and compute loss mask.
@@ -235,13 +323,14 @@ class ToolCallSFTDataset(Dataset):
         return input_ids, target_ids
 
     def __len__(self):
-        return len(self.examples)
+        return self._num_examples
 
     def __getitem__(self, idx):
-        input_ids, target_ids = self.examples[idx]
+        start = self.offsets[idx].item()
+        end = self.offsets[idx + 1].item()
         return (
-            torch.tensor(input_ids, dtype=torch.long),
-            torch.tensor(target_ids, dtype=torch.long),
+            self.input_flat[start:end].to(torch.long),
+            self.target_flat[start:end].to(torch.long),
         )
 
 

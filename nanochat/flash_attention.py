@@ -51,12 +51,46 @@ def _load_flash_attention():
 _fa3_funcs, _backend_info = _load_flash_attention()
 HAS_FA3 = _fa3_funcs is not None
 
+# =============================================================================
+# XLA Flash Attention (TPU Pallas kernels)
+# =============================================================================
+_xla_flash_attn = None
+_xla_flash_enabled = False
+
+def _load_xla_flash_attention():
+    """Try to load XLA flash attention for TPU."""
+    try:
+        from torch_xla.experimental.custom_kernel import flash_attention
+        return flash_attention
+    except ImportError:
+        return None
+
+def enable_xla_flash_attention():
+    """Enable XLA flash attention for TPU. Call before training."""
+    global _xla_flash_attn, _xla_flash_enabled, _backend_info
+    _xla_flash_attn = _load_xla_flash_attention()
+    if _xla_flash_attn is not None:
+        _xla_flash_enabled = True
+        _backend_info = "xla_flash_pallas"
+        print(f"XLA Flash Attention enabled (Pallas TPU kernels)")
+    else:
+        print("WARNING: XLA flash attention requested but not available, using SDPA")
+
 # Print which backend is being used
 def get_backend_info():
     return _backend_info
 
 # Override for testing: set to 'fa3', 'sdpa', or None (auto)
 _override_impl = None
+
+
+def _use_xla_flash(tensor_device=None):
+    """Check if we should use XLA flash attention."""
+    if not _xla_flash_enabled or _xla_flash_attn is None:
+        return False
+    if tensor_device is not None and not str(tensor_device).startswith("xla"):
+        return False
+    return True
 
 
 def _use_fa3(tensor_device=None):
@@ -150,6 +184,16 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     if _use_fa3(q.device):
         fa3_func, _ = _fa3_funcs
         return fa3_func(q, k, v, causal=causal, window_size=window_size)
+
+    # XLA Flash Attention (TPU Pallas kernels) — O(n) memory
+    # Note: does not support sliding window, use window_pattern=L for long context
+    if _use_xla_flash(q.device):
+        # XLA flash expects (B, H, T, D), our input is (B, T, H, D)
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2)
+        v_t = v.transpose(1, 2)
+        y = _xla_flash_attn(q_t, k_t, v_t, causal=causal)
+        return y.transpose(1, 2)  # back to (B, T, H, D)
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
     q = q.transpose(1, 2)

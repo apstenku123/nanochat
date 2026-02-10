@@ -95,6 +95,8 @@ parser.add_argument("--kernel", type=str, default="current", choices=["current",
 parser.add_argument("--compile", action="store_true", help="Use torch.compile")
 parser.add_argument("--dataset_type", type=str, default="auto", choices=["auto", "instruction", "tool"],
                     help="Dataset type: 'instruction' for {instruction,response}, 'tool' for {text,source}, 'auto' detects from data")
+parser.add_argument("--resume", type=str, default="", help="Resume from SFT checkpoint directory (loads model + optimizer + step)")
+parser.add_argument("--resume_step", type=int, default=-1, help="Step to resume from (-1 = latest)")
 args = parser.parse_args()
 
 # Set kernel backend
@@ -188,8 +190,29 @@ def find_num_heads(model_dim, target_head_dim):
                 return candidate
     return 1
 
-if args.checkpoint_path:
-    # Load from pretrained checkpoint
+resume_step = 0
+resume_epoch = 0
+resume_optim_state = None
+
+if args.resume:
+    # Resume from SFT checkpoint (model + optimizer + step)
+    print0(f"Resuming SFT training from {args.resume}")
+    step_to_load = args.resume_step if args.resume_step >= 0 else find_last_step(args.resume)
+    model_state, optim_states, meta = load_checkpoint(args.resume, step_to_load, device)
+    model_config_kwargs = meta["model_config"]
+    model_config = GPTConfig(**model_config_kwargs)
+    model = GPT(model_config)
+    model.to(device)
+    model.init_weights()
+    model.load_state_dict(model_state, strict=True, assign=True)
+    del model_state
+    resume_step = meta.get("step", 0)
+    resume_epoch = meta.get("epoch", 0)
+    if optim_states:
+        resume_optim_state = optim_states[0]
+    print0(f"Resumed from step {resume_step}, epoch {resume_epoch}")
+elif args.checkpoint_path:
+    # Load from pretrained checkpoint (model only, fresh optimizer)
     print0(f"Loading pretrained model from {args.checkpoint_path}")
     step_to_load = args.checkpoint_step if args.checkpoint_step >= 0 else find_last_step(args.checkpoint_path)
     model_state, _, meta = load_checkpoint(args.checkpoint_path, step_to_load, device)
@@ -240,6 +263,10 @@ optimizer = torch.optim.AdamW(
     betas=(0.9, 0.999),
     fused=device_type == "cuda",
 )
+if resume_optim_state is not None:
+    optimizer.load_state_dict(resume_optim_state)
+    del resume_optim_state
+    print0("Restored optimizer state")
 
 # Output directory
 base_dir = get_base_dir()
@@ -264,18 +291,34 @@ def all_reduce_sums(loss_sum, token_sum):
         xm.all_reduce(xm.REDUCE_SUM, [loss_sum, token_sum])
     return loss_sum, token_sum
 
-global_step = 0
+global_step = resume_step
 model.train()
 
 for epoch in range(args.epochs):
+    # Skip already-completed epochs
+    if epoch < resume_epoch:
+        global_step_would_be = (epoch + 1) * num_steps_per_epoch
+        if global_step_would_be <= resume_step:
+            print0(f"Skipping epoch {epoch+1}/{args.epochs} (already completed)")
+            continue
+
     if sampler is not None:
         sampler.set_epoch(epoch)
+
+    # How many batches to skip within this epoch
+    skip_batches = 0
+    if epoch == resume_epoch and resume_step > 0:
+        skip_batches = resume_step - epoch * num_steps_per_epoch
+        if skip_batches > 0:
+            print0(f"Epoch {epoch+1}: skipping {skip_batches} batches to resume at step {resume_step}")
 
     epoch_loss = 0.0
     epoch_tokens = 0
     t_epoch = time.time()
 
     for batch_idx, (input_ids, targets) in enumerate(dataloader):
+        if batch_idx < skip_batches:
+            continue
         input_ids = input_ids.to(device)
         targets = targets.to(device)
         train_tokens = (targets != -1).sum().item()
