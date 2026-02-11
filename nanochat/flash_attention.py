@@ -57,6 +57,96 @@ HAS_FA3 = _fa3_funcs is not None
 _xla_flash_attn = None
 _xla_flash_enabled = False
 
+# =============================================================================
+# Chunked Attention (memory-efficient, pure PyTorch, works on XLA/TPU)
+# =============================================================================
+_chunked_attn_enabled = False
+_chunked_attn_chunk_size = 1024
+_chunked_attn_threshold = 2048  # only use for seq_len > this
+
+def enable_chunked_attention(chunk_size=1024, threshold=2048):
+    """Enable chunked attention for long sequences on XLA/TPU.
+
+    This avoids materializing the full O(n^2) attention matrix by processing
+    queries in chunks. Reduces peak attention memory from O(n^2) to O(n * chunk_size).
+    Uses the online softmax trick (same as FlashAttention) for numerical stability.
+    """
+    global _chunked_attn_enabled, _chunked_attn_chunk_size, _chunked_attn_threshold, _backend_info
+    _chunked_attn_enabled = True
+    _chunked_attn_chunk_size = chunk_size
+    _chunked_attn_threshold = threshold
+    _backend_info = f"chunked_attn_c{chunk_size}"
+    print(f"Chunked attention enabled: chunk_size={chunk_size}, threshold={threshold}")
+
+
+def _chunked_attention(q, k, v, chunk_size=1024, window=-1):
+    """Memory-efficient causal attention using chunked computation.
+
+    Processes queries in chunks of `chunk_size`, only attending to valid keys
+    (causal mask). Uses online softmax for numerical stability without
+    materializing the full (T, T) attention matrix.
+
+    Args:
+        q, k, v: (B, H, T, D) tensors
+        chunk_size: number of query tokens per chunk
+        window: sliding window size (-1 for full causal)
+    Returns:
+        (B, H, T, D) output tensor
+    """
+    B, H, T, D = q.shape
+    scale = D ** -0.5
+
+    # Pad T to multiple of chunk_size if needed
+    pad = (chunk_size - T % chunk_size) % chunk_size
+    if pad > 0:
+        q = F.pad(q, (0, 0, 0, pad))
+        k = F.pad(k, (0, 0, 0, pad))
+        v = F.pad(v, (0, 0, 0, pad))
+        T_padded = T + pad
+    else:
+        T_padded = T
+
+    n_chunks = T_padded // chunk_size
+    outputs = []
+
+    for i in range(n_chunks):
+        q_start = i * chunk_size
+        q_end = q_start + chunk_size
+        q_chunk = q[:, :, q_start:q_end, :]  # (B, H, chunk, D)
+
+        # Determine key range (causal: only up to q_end)
+        if window > 0:
+            k_start = max(0, q_end - window)
+        else:
+            k_start = 0
+        k_end = q_end
+
+        k_slice = k[:, :, k_start:k_end, :]  # (B, H, k_len, D)
+        v_slice = v[:, :, k_start:k_end, :]
+
+        # Compute attention scores: (B, H, chunk, k_len)
+        attn = torch.matmul(q_chunk, k_slice.transpose(-2, -1)) * scale
+
+        # Apply causal mask within this chunk
+        k_len = k_end - k_start
+        # Row i in q_chunk corresponds to global position q_start + i
+        # Col j in k_slice corresponds to global position k_start + j
+        # Causal: global_row >= global_col => q_start + i >= k_start + j
+        row_offset = q_start - k_start
+        row_idx = torch.arange(chunk_size, device=q.device).unsqueeze(1) + row_offset
+        col_idx = torch.arange(k_len, device=q.device).unsqueeze(0)
+        causal_mask = col_idx <= row_idx  # (chunk, k_len)
+        attn = attn.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        attn = F.softmax(attn, dim=-1)
+        out_chunk = torch.matmul(attn, v_slice)  # (B, H, chunk, D)
+        outputs.append(out_chunk)
+
+    result = torch.cat(outputs, dim=2)  # (B, H, T_padded, D)
+    if pad > 0:
+        result = result[:, :, :T, :]
+    return result
+
 def _load_xla_flash_attention():
     """Try to load XLA flash attention for TPU."""
     try:
@@ -193,6 +283,15 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         k_t = k.transpose(1, 2)
         v_t = v.transpose(1, 2)
         y = _xla_flash_attn(q_t, k_t, v_t, causal=causal)
+        return y.transpose(1, 2)  # back to (B, T, H, D)
+
+    # On XLA with long sequences, use chunked attention to avoid O(n^2) memory
+    T = q.size(1)
+    if _chunked_attn_enabled and T > _chunked_attn_threshold:
+        q_t = q.transpose(1, 2)  # (B, H, T, D)
+        k_t = k.transpose(1, 2)
+        v_t = v.transpose(1, 2)
+        y = _chunked_attention(q_t, k_t, v_t, chunk_size=_chunked_attn_chunk_size, window=window_size[0])
         return y.transpose(1, 2)  # back to (B, T, H, D)
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)

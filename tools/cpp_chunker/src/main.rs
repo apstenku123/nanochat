@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 mod chunker;
+mod deps;
 use chunker::{Chunk, ChunkKind};
 
 #[derive(ClapParser)]
@@ -36,6 +37,10 @@ struct Args {
     /// Batch size for parallel processing
     #[arg(long, default_value = "1000")]
     batch_size: usize,
+
+    /// Enable dependency-aware chunking (bottom-up ordering with call graph analysis)
+    #[arg(long, default_value = "false")]
+    dep_aware: bool,
 }
 
 #[derive(Deserialize)]
@@ -205,6 +210,36 @@ fn group_chunks(chunks: &[Chunk], preamble: &str, max_tokens: usize) -> Vec<Stri
     documents
 }
 
+/// Process a batch with dependency-aware chunking.
+fn process_batch_dep_aware(texts: &[String], max_tokens: usize) -> Vec<String> {
+    let mut parser = tree_sitter::Parser::new();
+    let lang = tree_sitter_cpp::LANGUAGE;
+    parser
+        .set_language(&lang.into())
+        .expect("Failed to set C++ language");
+
+    let mut all_docs = Vec::new();
+
+    for text in texts {
+        if text.len() < 50 {
+            continue;
+        }
+
+        let dep_info = deps::analyze_file(&mut parser, text);
+        let docs = deps::build_dep_aware_documents(&dep_info, max_tokens);
+
+        for doc in docs {
+            if estimate_tokens(&doc) > max_tokens * 2 {
+                all_docs.extend(split_oversized(&doc, max_tokens));
+            } else {
+                all_docs.push(doc);
+            }
+        }
+    }
+
+    all_docs
+}
+
 /// Process a batch of source texts, returning chunked documents.
 fn process_batch(texts: &[String], max_tokens: usize) -> Vec<String> {
     let mut parser = tree_sitter::Parser::new();
@@ -270,8 +305,8 @@ fn main() {
     }
 
     let num_threads = rayon::current_num_threads();
-    eprintln!("cpp-chunker: {} threads, max_tokens={}, batch_size={}",
-              num_threads, args.max_tokens, args.batch_size);
+    eprintln!("cpp-chunker: {} threads, max_tokens={}, batch_size={}, dep_aware={}",
+              num_threads, args.max_tokens, args.batch_size, args.dep_aware);
 
     let output_file = std::fs::File::create(&args.output).expect("Failed to create output file");
     let writer = Mutex::new(BufWriter::with_capacity(64 * 1024 * 1024, output_file));
@@ -321,9 +356,16 @@ fn main() {
             if batch.len() >= args.batch_size {
                 // Process batch in parallel using rayon chunks
                 let chunk_size = std::cmp::max(1, batch.len() / num_threads);
+                let dep_aware = args.dep_aware;
                 let batch_docs: Vec<Vec<String>> = batch
                     .par_chunks(chunk_size)
-                    .map(|sub_batch| process_batch(sub_batch, args.max_tokens))
+                    .map(|sub_batch| {
+                        if dep_aware {
+                            process_batch_dep_aware(sub_batch, args.max_tokens)
+                        } else {
+                            process_batch(sub_batch, args.max_tokens)
+                        }
+                    })
                     .collect();
 
                 // Dedup and write

@@ -141,6 +141,8 @@ parser.add_argument("--no_compile", action="store_true", help="disable torch.com
 # XLA/TPU optimizations
 parser.add_argument("--use_scan", action="store_true", help="use torch_xla scan_layers to reduce XLA compilation time (TPU only)")
 parser.add_argument("--xla_flash_attn", action="store_true", help="use XLA Pallas flash attention for TPU (O(n) memory, enables long seq_len). Does not support sliding window - use --window_pattern=L")
+parser.add_argument("--chunked_attn", action="store_true", help="use chunked attention for long sequences on XLA/TPU. Pure PyTorch, no JAX needed. Reduces O(n^2) to O(n*chunk)")
+parser.add_argument("--attn_chunk_size", type=int, default=1024, help="chunk size for chunked attention (default: 1024)")
 # Data directory
 parser.add_argument("--data_dir", type=str, default="", help="Custom parquet data directory (default: base_data from NANOCHAT_BASE_DIR)")
 parser.add_argument("--streaming_data", action="store_true", help="Streaming mode: dynamically discover new parquet shards as they arrive. Waits for _COMPLETE sentinel.")
@@ -161,6 +163,9 @@ kernels.set_kernel_backend(args.kernel)
 if args.xla_flash_attn:
     from nanochat.flash_attention import enable_xla_flash_attention
     enable_xla_flash_attention()
+if args.chunked_attn:
+    from nanochat.flash_attention import enable_chunked_attention
+    enable_chunked_attention(chunk_size=args.attn_chunk_size, threshold=2048)
 # -----------------------------------------------------------------------------
 
 
@@ -590,45 +595,7 @@ def train():
             })
             model.train()
 
-        # once in a while: evaluate C++ code generation quality (master process only)
-        # use the original uncompiled model because the inputs keep changing shape
-        # Disable FP8 for evaluation to use BF16 for more consistent/accurate results
-        results = {}
-        if args.core_metric_every > 0 and master_process and (last_step or (step > 0 and step % args.core_metric_every == 0)):
-            model.eval()
-            with disable_fp8(orig_model), autocast_ctx():
-                results = evaluate_cpp_model(orig_model, tokenizer, device)
-            print0(f"Step {step:05d} | C++ compile: {results['cpp_compile_rate']:.1%}, pass: {results['cpp_pass_rate']:.1%}")
-            wandb_run.log({
-                "step": step,
-                "total_training_flops": flops_so_far,
-                "total_training_time": total_training_time,
-                "cpp_metric": results["cpp_metric"],
-                "cpp_compile_rate": results["cpp_compile_rate"],
-                "cpp_pass_rate": results["cpp_pass_rate"],
-            })
-            model.train()
-
-        # once in a while: sample from the model (only on master process)
-        # use the original uncompiled model because the inputs keep changing shape
-        if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
-            model.eval()
-            prompts = [
-                "#include <vector>\n\n// Return the sum of all elements in a vector.\nint sum(const std::vector<int>& v) {",
-                "#include <string>\n\n// Convert a string to uppercase.\nstd::string to_upper(const std::string& s) {",
-                "#include <algorithm>\n#include <vector>\n\n// Remove duplicates from a sorted vector.\nstd::vector<int> remove_duplicates(std::vector<int> v) {",
-                "// Swap two integers without using a temporary variable.\nvoid swap(int& a, int& b) {",
-                "#include <cmath>\n\n// Calculate the distance between two 2D points.\ndouble distance(double x1, double y1, double x2, double y2) {",
-            ]
-            engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-            for prompt in prompts:
-                tokens = tokenizer(prompt, prepend="<|bos|>")
-                with disable_fp8(orig_model), autocast_ctx():
-                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=128, temperature=0)
-                print0(tokenizer.decode(sample[0]))
-            model.train()
-
-        # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
+        # save checkpoint FIRST (before eval/sample to prevent data loss on eval crash)
         if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
             save_checkpoint(
                 checkpoint_dir,
@@ -651,6 +618,50 @@ def train():
                 },
                 rank=ddp_rank,
             )
+
+        # once in a while: evaluate C++ code generation quality (master process only)
+        # use the original uncompiled model because the inputs keep changing shape
+        # Disable FP8 for evaluation to use BF16 for more consistent/accurate results
+        results = {}
+        if args.core_metric_every > 0 and master_process and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+            model.eval()
+            try:
+                with disable_fp8(orig_model), autocast_ctx():
+                    results = evaluate_cpp_model(orig_model, tokenizer, device)
+                print0(f"Step {step:05d} | C++ compile: {results['cpp_compile_rate']:.1%}, pass: {results['cpp_pass_rate']:.1%}")
+                wandb_run.log({
+                    "step": step,
+                    "total_training_flops": flops_so_far,
+                    "total_training_time": total_training_time,
+                    "cpp_metric": results["cpp_metric"],
+                    "cpp_compile_rate": results["cpp_compile_rate"],
+                    "cpp_pass_rate": results["cpp_pass_rate"],
+                })
+            except Exception as e:
+                print0(f"Step {step:05d} | C++ eval error: {e}")
+            model.train()
+
+        # once in a while: sample from the model (only on master process)
+        # use the original uncompiled model because the inputs keep changing shape
+        if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+            model.eval()
+            prompts = [
+                "#include <vector>\n\n// Return the sum of all elements in a vector.\nint sum(const std::vector<int>& v) {",
+                "#include <string>\n\n// Convert a string to uppercase.\nstd::string to_upper(const std::string& s) {",
+                "#include <algorithm>\n#include <vector>\n\n// Remove duplicates from a sorted vector.\nstd::vector<int> remove_duplicates(std::vector<int> v) {",
+                "// Swap two integers without using a temporary variable.\nvoid swap(int& a, int& b) {",
+                "#include <cmath>\n\n// Calculate the distance between two 2D points.\ndouble distance(double x1, double y1, double x2, double y2) {",
+            ]
+            try:
+                engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+                for prompt in prompts:
+                    tokens = tokenizer(prompt, prepend="<|bos|>")
+                    with disable_fp8(orig_model), autocast_ctx():
+                        sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=128, temperature=0)
+                    print0(tokenizer.decode(sample[0]))
+            except Exception as e:
+                print0(f"Step {step:05d} | Sample generation error: {e}")
+            model.train()
 
         # termination conditions (TODO: possibly also add loss explosions etc.)
         if last_step:
