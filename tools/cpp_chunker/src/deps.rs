@@ -206,7 +206,7 @@ pub fn analyze_file(parser: &mut Parser, source: &str) -> FileDepInfo {
     let mut classes: Vec<Chunk> = Vec::new();
     let mut others: Vec<Chunk> = Vec::new();
 
-    for (ci, chunk) in chunks.iter().enumerate() {
+    for chunk in &chunks {
         match chunk.kind {
             ChunkKind::Preamble => preamble_parts.push(&chunk.text),
             ChunkKind::Function => {
@@ -225,11 +225,6 @@ pub fn analyze_file(parser: &mut Parser, source: &str) -> FileDepInfo {
                     continue;
                 }
                 // Re-parse this function to extract calls
-                if std::env::var("DEBUG_CHUNKS").is_ok() {
-                    let preview: String = chunk.text.chars().take(80).collect();
-                    eprintln!("  [DEBUG] chunk {}: func '{}' len={} preview='{}'",
-                        ci, chunk.name, chunk.text.len(), preview.replace('\n', "\\n"));
-                }
                 let func_calls = extract_calls_from_text(parser, &chunk.text);
                 functions.push(FunctionInfo {
                     name: chunk.name.clone(),
@@ -249,10 +244,6 @@ pub fn analyze_file(parser: &mut Parser, source: &str) -> FileDepInfo {
 
     let preamble = preamble_parts.join("\n\n");
 
-    if std::env::var("DEBUG_CHUNKS").is_ok() {
-        eprintln!("  [DEBUG] {} functions extracted, computing deps...", functions.len());
-    }
-
     // 4. Build function name set (what's defined in this file)
     let local_names: HashSet<String> = functions
         .iter()
@@ -270,17 +261,7 @@ pub fn analyze_file(parser: &mut Parser, source: &str) -> FileDepInfo {
     }
 
     // 6. Compute dependency levels via BFS
-    if std::env::var("DEBUG_CHUNKS").is_ok() {
-        for (i, f) in functions.iter().enumerate() {
-            eprintln!("  [DEBUG] func[{}] '{}': {} callees: {:?}",
-                i, f.name, f.callees.len(), &f.callees);
-        }
-        eprintln!("  [DEBUG] Computing dep levels...");
-    }
     compute_dep_levels(&mut functions, &local_names);
-    if std::env::var("DEBUG_CHUNKS").is_ok() {
-        eprintln!("  [DEBUG] Dep levels computed.");
-    }
 
     // 7. Build topological order (lowest dep_level first)
     let mut topo_order: Vec<usize> = (0..functions.len()).collect();
@@ -329,33 +310,34 @@ fn compute_dep_levels(functions: &mut Vec<FunctionInfo>, local_names: &HashSet<S
         .map(|(i, f)| (normalize_name(&f.name), i))
         .collect();
 
-    // Build adjacency: func_idx -> set of local callee indices
+    // Build adjacency: func_idx -> set of local callee indices (deduplicated)
+    // IMPORTANT: Must deduplicate because template overloads like ReadFromBuffer<UINT32>
+    // and ReadFromBuffer<WCHAR *> normalize to the same name, producing duplicate indices.
+    // Duplicate edges cause in_degree to be over-decremented via reverse_edges, which
+    // prematurely pushes cyclic nodes into the BFS queue, causing infinite loops.
     let edges: Vec<Vec<usize>> = functions
         .iter()
         .map(|f| {
-            f.callees
+            let self_norm = normalize_name(&f.name);
+            let deps: HashSet<usize> = f.callees
                 .iter()
                 .filter_map(|c| {
                     let norm = normalize_name(c);
-                    if !is_system_call(c) && local_names.contains(&norm) {
+                    if !is_system_call(c) && local_names.contains(&norm) && norm != self_norm {
                         name_to_idx.get(&norm).copied()
                     } else {
                         None
                     }
                 })
-                .filter(|&idx| idx != name_to_idx.get(&normalize_name(&f.name)).copied().unwrap_or(usize::MAX))
-                .collect()
+                .collect();
+            deps.into_iter().collect()
         })
         .collect();
 
     // BFS from leaves (nodes with no local callees)
     let mut in_degree: Vec<usize> = vec![0; functions.len()];
-    // in_degree[i] = number of local functions that i calls (not reverse!)
-    // We want level 0 = functions that call NO local functions
     for (i, deps) in edges.iter().enumerate() {
-        // Remove self-references
-        let unique_deps: HashSet<usize> = deps.iter().copied().collect();
-        in_degree[i] = unique_deps.len();
+        in_degree[i] = deps.len();
     }
 
     let mut queue: VecDeque<usize> = VecDeque::new();
