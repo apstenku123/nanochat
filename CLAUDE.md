@@ -129,6 +129,75 @@ Contains:
 
 **Conclusion**: TE adds overhead for small models. Original FA3 + CCE is 1.7x faster.
 
+## TPU Training (Google Cloud v6e)
+
+For full TPU setup guide, see [docs/TPU_SETUP.md](docs/TPU_SETUP.md).
+
+### Quick Start: v6e with 16K Flash Attention
+
+The v6e TPU supports 16K context training using XLA Pallas flash attention. This requires a **Python 3.11 venv** with specific JAX versions.
+
+**Critical package versions:**
+
+| Package | Version | Why |
+|---------|---------|-----|
+| Python | 3.11 | jaxlib 0.7.x needs >= 3.11 |
+| jax | **0.7.0** | Pallas flash attention kernels |
+| jaxlib | **0.7.0** | Must match jax version |
+| libtpu | 0.0.21 | PJRT API 0.75, compatible with torch_xla 2.9.0 |
+| torch_xla | 2.9.0 | Latest stable release |
+
+> **Do NOT use jax 0.7.1** — it generates Mosaic IR v8, but libtpu 0.0.21 only supports v7.
+
+**Setup venv:**
+```bash
+python3.11 -m venv ~/venv311
+source ~/venv311/bin/activate
+pip install torch~=2.9.0 torch_xla[tpu]~=2.9.0 \
+  -f https://storage.googleapis.com/libtpu-releases/index.html \
+  -f https://storage.googleapis.com/libtpu-wheels/index.html
+pip install jax==0.7.0 jaxlib==0.7.0
+pip install libtpu==0.0.21
+pip install wandb filelock pyarrow psutil regex tabulate tiktoken tokenizers rustbpe
+```
+
+**Launch 16K training:**
+```bash
+source ~/venv311/bin/activate && source ~/.tpu_env
+cd ~/nanochat
+export NANOCHAT_BASE_DIR=/home/dave/data
+export WANDB_API_KEY=<key>
+export XLA_NO_SPECIAL_SCALARS=1
+export NANOCHAT_GCS_CHECKPOINT_BUCKET=gs://nanochat-training-data-2026/checkpoints/v6e-longctx
+
+nohup python3 -u -m scripts.base_train \
+    --depth=16 --num_iterations=50000 \
+    --device_batch_size=1 --max_seq_len=16384 \
+    --kernel=current --no_compile --xla_flash_attn \
+    --data_dir=/home/dave/data/parquet --streaming_data \
+    --run=d16_400M_v6e4_longctx_16k_flash_cppeval \
+    --core_metric_every=5000 --save_every=5000 --sample_every=5000 \
+    > ~/train_longctx_16k.log 2>&1 &
+```
+
+**Performance:** 470-630K tok/sec, 35-62% MFU on v6e-4 (4 chips, 32GB HBM each).
+
+### Flash Attention Integration
+
+The `--xla_flash_attn` flag calls `enable_xla_flash_attention()` in `nanochat/flash_attention.py`, which:
+1. Imports `flash_attention` from `torch_xla.experimental.custom_kernel`
+2. Uses it in `flash_attn_func()` for training (B, T, H, D) -> transpose to (B, H, T, D)
+3. Does NOT support sliding window attention — use `--window_pattern=L` for long-context models
+
+### TPU Training Gotchas
+
+- **Always `source ~/.tpu_env`** before training (sets `PJRT_DEVICE=TPU`)
+- **`XLA_NO_SPECIAL_SCALARS=1`** prevents recompilation on every LR change
+- **`@torch.no_grad()` not `@torch.inference_mode()`** — inference_mode crashes on XLA when slicing RoPE buffers
+- **Checkpoint save order**: Save BEFORE eval/sample to prevent data loss on eval crash
+- **First XLA compilation** takes 30-60+ minutes — this is normal
+- **Spot instances** can be preempted — always use `NANOCHAT_GCS_CHECKPOINT_BUCKET` for cloud checkpoints
+
 ---
 
 This project uses **beads (bd)** for issue tracking with Jira synchronization.

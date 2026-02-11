@@ -206,11 +206,30 @@ pub fn analyze_file(parser: &mut Parser, source: &str) -> FileDepInfo {
     let mut classes: Vec<Chunk> = Vec::new();
     let mut others: Vec<Chunk> = Vec::new();
 
-    for chunk in &chunks {
+    for (ci, chunk) in chunks.iter().enumerate() {
         match chunk.kind {
             ChunkKind::Preamble => preamble_parts.push(&chunk.text),
             ChunkKind::Function => {
+                // Skip extremely large functions to avoid pathological parsing
+                if chunk.text.len() > 200_000 {
+                    functions.push(FunctionInfo {
+                        name: chunk.name.clone(),
+                        qualified_name: chunk.name.clone(),
+                        text: chunk.text.clone(),
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        callees: vec![],
+                        is_leaf: true,
+                        dep_level: 0,
+                    });
+                    continue;
+                }
                 // Re-parse this function to extract calls
+                if std::env::var("DEBUG_CHUNKS").is_ok() {
+                    let preview: String = chunk.text.chars().take(80).collect();
+                    eprintln!("  [DEBUG] chunk {}: func '{}' len={} preview='{}'",
+                        ci, chunk.name, chunk.text.len(), preview.replace('\n', "\\n"));
+                }
                 let func_calls = extract_calls_from_text(parser, &chunk.text);
                 functions.push(FunctionInfo {
                     name: chunk.name.clone(),
@@ -230,6 +249,10 @@ pub fn analyze_file(parser: &mut Parser, source: &str) -> FileDepInfo {
 
     let preamble = preamble_parts.join("\n\n");
 
+    if std::env::var("DEBUG_CHUNKS").is_ok() {
+        eprintln!("  [DEBUG] {} functions extracted, computing deps...", functions.len());
+    }
+
     // 4. Build function name set (what's defined in this file)
     let local_names: HashSet<String> = functions
         .iter()
@@ -247,7 +270,17 @@ pub fn analyze_file(parser: &mut Parser, source: &str) -> FileDepInfo {
     }
 
     // 6. Compute dependency levels via BFS
+    if std::env::var("DEBUG_CHUNKS").is_ok() {
+        for (i, f) in functions.iter().enumerate() {
+            eprintln!("  [DEBUG] func[{}] '{}': {} callees: {:?}",
+                i, f.name, f.callees.len(), &f.callees);
+        }
+        eprintln!("  [DEBUG] Computing dep levels...");
+    }
     compute_dep_levels(&mut functions, &local_names);
+    if std::env::var("DEBUG_CHUNKS").is_ok() {
+        eprintln!("  [DEBUG] Dep levels computed.");
+    }
 
     // 7. Build topological order (lowest dep_level first)
     let mut topo_order: Vec<usize> = (0..functions.len()).collect();

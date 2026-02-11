@@ -409,9 +409,16 @@ fn main() {
         // Process remaining batch
         if !batch.is_empty() {
             let chunk_size = std::cmp::max(1, batch.len() / num_threads);
+            let dep_aware = args.dep_aware;
             let batch_docs: Vec<Vec<String>> = batch
                 .par_chunks(chunk_size)
-                .map(|sub_batch| process_batch(sub_batch, args.max_tokens))
+                .map(|sub_batch| {
+                    if dep_aware {
+                        process_batch_dep_aware(sub_batch, args.max_tokens)
+                    } else {
+                        process_batch(sub_batch, args.max_tokens)
+                    }
+                })
                 .collect();
 
             let mut w = writer.lock().unwrap();
