@@ -62,7 +62,7 @@ class CppBenchmark:
         self.tokenizer = tokenizer
         self.device = device
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate(self, prompt: str, max_tokens: int = 512,
                  temperature: float = 0.8, top_k: int = 50,
                  num_samples: int = 1, stop_tokens: Optional[list] = None) -> list[str]:

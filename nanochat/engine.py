@@ -176,7 +176,7 @@ class Engine:
         self.tokenizer = tokenizer # needed for tool use
         self.tool_runtime = tool_runtime # ToolRuntime instance for C++ tool calls
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
         """Same as generate, but does single prefill and then clones the KV cache."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
