@@ -26,6 +26,30 @@ def _patch_missing_config_keys(model_config_kwargs):
     # Old models were trained with full context (no sliding window)
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
+    # Optional Engram + mHC integration defaults to baseline-safe disabled behavior
+    model_config_kwargs.setdefault("engram_enabled", False)
+    model_config_kwargs.setdefault("engram_layers", "")
+    model_config_kwargs.setdefault("engram_ngram_orders", "2,3,4")
+    model_config_kwargs.setdefault("engram_bottleneck_dim", 0)
+    model_config_kwargs.setdefault("engram_dropout", 0.0)
+    model_config_kwargs.setdefault("mhc_enabled", False)
+    model_config_kwargs.setdefault("mhc_num_branches", 0)
+    model_config_kwargs.setdefault("mhc_sinkhorn_iters", 5)
+    model_config_kwargs.setdefault("mhc_temperature", 1.0)
+    model_config_kwargs.setdefault("mhc_epsilon", 1e-6)
+    model_config_kwargs.setdefault("mhc_blend_alpha", 1.0)
+    model_config_kwargs.setdefault("aux_loss_weight", 0.0)
+
+
+def _build_gpt_config(model_config_kwargs):
+    supported_keys = set(getattr(GPTConfig, "__dataclass_fields__", {}).keys())
+    if not supported_keys:
+        return GPTConfig(**model_config_kwargs)
+    filtered_kwargs = {k: v for k, v in model_config_kwargs.items() if k in supported_keys}
+    ignored_keys = sorted(set(model_config_kwargs.keys()) - set(filtered_kwargs.keys()))
+    if ignored_keys:
+        log0(f"Ignoring unsupported GPTConfig keys in this checkout: {', '.join(ignored_keys)}")
+    return GPTConfig(**filtered_kwargs)
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -113,7 +137,7 @@ def build_model(checkpoint_dir, step, device, phase):
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
+    model_config = _build_gpt_config(model_config_kwargs)
     _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
         model = GPT(model_config)

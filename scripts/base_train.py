@@ -94,6 +94,18 @@ parser.add_argument("--aspect_ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head_dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max_seq_len", type=int, default=2048, help="max context length (supports up to 16384 for long context)")
 parser.add_argument("--window_pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--engram", action="store_true", help="enable optional Engram branches")
+parser.add_argument("--engram_layers", type=str, default="", help="comma-separated layer indices for Engram insertion (empty=disabled)")
+parser.add_argument("--engram_ngram_orders", type=str, default="2,3,4", help="comma-separated n-gram orders for Engram branch")
+parser.add_argument("--engram_bottleneck_dim", type=int, default=0, help="Engram bottleneck dimension (0=auto)")
+parser.add_argument("--engram_dropout", type=float, default=0.0, help="dropout on Engram branch")
+parser.add_argument("--mhc", action="store_true", help="enable optional mHC branch mixing")
+parser.add_argument("--mhc_num_branches", type=int, default=0, help="mHC branch count (0=auto)")
+parser.add_argument("--mhc_sinkhorn_iters", type=int, default=5, help="mHC Sinkhorn iterations")
+parser.add_argument("--mhc_temperature", type=float, default=1.0, help="mHC transport temperature")
+parser.add_argument("--mhc_epsilon", type=float, default=1e-6, help="mHC numerical epsilon")
+parser.add_argument("--mhc_blend_alpha", type=float, default=1.0, help="global mHC blend strength")
+parser.add_argument("--aux_loss_weight", type=float, default=0.0, help="auxiliary regularization loss weight")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num_iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target_flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -148,6 +160,17 @@ parser.add_argument("--data_dir", type=str, default="", help="Custom parquet dat
 parser.add_argument("--streaming_data", action="store_true", help="Streaming mode: dynamically discover new parquet shards as they arrive. Waits for _COMPLETE sentinel.")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+
+
+def _build_gpt_config(model_config_kwargs):
+    supported_keys = set(getattr(GPTConfig, "__dataclass_fields__", {}).keys())
+    if not supported_keys:
+        return GPTConfig(**model_config_kwargs)
+    filtered_kwargs = {k: v for k, v in model_config_kwargs.items() if k in supported_keys}
+    dropped_keys = sorted(set(model_config_kwargs.keys()) - set(filtered_kwargs.keys()))
+    if dropped_keys:
+        print0(f"Ignoring unsupported GPTConfig keys in this checkout: {', '.join(dropped_keys)}")
+    return GPTConfig(**filtered_kwargs)
 
 # If --no_compile is set, also disable compile in Muon optimizer via env var
 # This must be done before importing muon.py
@@ -289,8 +312,28 @@ def train():
     # Initialize the Model
 
     # Create a new model with random weights (directly on CUDA, no meta device)
-    model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern)
-    model_config = GPTConfig(**model_config_kwargs)
+    model_config_kwargs = dict(
+        sequence_len=args.max_seq_len,
+        vocab_size=vocab_size,
+        n_layer=num_layers,
+        n_head=num_heads,
+        n_kv_head=num_kv_heads,
+        n_embd=model_dim,
+        window_pattern=args.window_pattern,
+        engram_enabled=args.engram,
+        engram_layers=args.engram_layers,
+        engram_ngram_orders=args.engram_ngram_orders,
+        engram_bottleneck_dim=args.engram_bottleneck_dim,
+        engram_dropout=args.engram_dropout,
+        mhc_enabled=args.mhc,
+        mhc_num_branches=args.mhc_num_branches,
+        mhc_sinkhorn_iters=args.mhc_sinkhorn_iters,
+        mhc_temperature=args.mhc_temperature,
+        mhc_epsilon=args.mhc_epsilon,
+        mhc_blend_alpha=args.mhc_blend_alpha,
+        aux_loss_weight=args.aux_loss_weight,
+    )
+    model_config = _build_gpt_config(model_config_kwargs)
     model = GPT(model_config)
     model.to(device)  # Move model to GPU before init_weights (rotary embeddings need correct device)
     model.init_weights()
