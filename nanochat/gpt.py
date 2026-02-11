@@ -42,6 +42,9 @@ from nanochat import kernels
 from contextlib import nullcontext
 from typing import Any, Optional
 
+from nanochat.engram import EngramBranch
+from nanochat.mhc import ManifoldBranchMixer
+
 @dataclass
 class PrecisionPlan:
     name: str
@@ -71,6 +74,44 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "L"
+    # Optional Engram branch
+    engram_enabled: bool = False
+    engram_layers: str = ""
+    engram_ngram_orders: str = "2,3,4"
+    engram_bottleneck_dim: int = 0
+    engram_dropout: float = 0.0
+    # Optional mHC branch mixer
+    mhc_enabled: bool = False
+    mhc_num_branches: int = 0
+    mhc_sinkhorn_iters: int = 5
+    mhc_temperature: float = 1.0
+    mhc_epsilon: float = 1e-6
+    mhc_blend_alpha: float = 1.0
+    # Reserved for optional auxiliary objectives
+    aux_loss_weight: float = 0.0
+
+
+def _parse_csv_ints(value: str) -> list[int]:
+    if not value:
+        return []
+    values = []
+    for raw in value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        values.append(int(raw))
+    return values
+
+
+def _parse_engram_layers(layer_spec: str, n_layer: int) -> set[int]:
+    layers = set()
+    for layer_idx in _parse_csv_ints(layer_spec):
+        # Allow negative indices for convenience (-1 means final layer).
+        if layer_idx < 0:
+            layer_idx += n_layer
+        assert 0 <= layer_idx < n_layer, f"Invalid engram layer index {layer_idx}, expected [0, {n_layer - 1}]"
+        layers.add(layer_idx)
+    return layers
 
 
 def norm(x):
@@ -155,15 +196,46 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, engram_layers):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.engram = None
+        self.mhc = None
+        self.use_engram = bool(config.engram_enabled) and layer_idx in engram_layers
+        self.use_mhc = bool(config.mhc_enabled)
+        if self.use_engram:
+            self.engram = EngramBranch(
+                n_embd=config.n_embd,
+                ngram_orders=config.engram_ngram_orders,
+                bottleneck_dim=config.engram_bottleneck_dim,
+                dropout=config.engram_dropout,
+            )
+        if self.use_mhc:
+            self.mhc = ManifoldBranchMixer(
+                n_embd=config.n_embd,
+                sinkhorn_iters=config.mhc_sinkhorn_iters,
+                temperature=config.mhc_temperature,
+                epsilon=config.mhc_epsilon,
+                blend_alpha=config.mhc_blend_alpha,
+                max_branches=config.mhc_num_branches,
+            )
 
     def forward(self, x, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x
+        x_attn = x + self.attn(norm(x), cos_sin, window_size, kv_cache)
+        baseline_out = x_attn + self.mlp(norm(x_attn))
+
+        engram_out = None
+        if self.engram is not None:
+            engram_out = baseline_out + self.engram(norm(x))
+
+        if self.mhc is None:
+            return engram_out if engram_out is not None else baseline_out
+
+        branches = [baseline_out, x]
+        if engram_out is not None:
+            branches.append(engram_out)
+        return self.mhc(branches)
 
 
 class GPT(nn.Module):
@@ -175,6 +247,7 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        self.engram_layers = _parse_engram_layers(config.engram_layers, config.n_layer) if config.engram_enabled else set()
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -190,7 +263,7 @@ class GPT(nn.Module):
         self.padded_vocab_size = padded_vocab_size
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, layer_idx, self.engram_layers) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -238,6 +311,14 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if block.engram is not None:
+                torch.nn.init.uniform_(block.engram.in_proj.weight, -s, s)
+                for mix in block.engram.order_mix:
+                    torch.nn.init.uniform_(mix.weight, -s, s)
+                torch.nn.init.zeros_(block.engram.out_proj.weight)
+            if block.mhc is not None:
+                torch.nn.init.uniform_(block.mhc.score_proj.weight, -s, s)
+                torch.nn.init.zeros_(block.mhc.score_out.weight)
 
         # Per-layer scalars
         with torch.no_grad():
