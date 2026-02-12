@@ -44,6 +44,7 @@ from typing import Any, Optional
 
 from nanochat.engram import EngramBranch
 from nanochat.mhc import ManifoldBranchMixer
+from nanochat.sparse_attention import DeepSeekSparseAttention
 
 @dataclass
 class PrecisionPlan:
@@ -87,6 +88,16 @@ class GPTConfig:
     mhc_temperature: float = 1.0
     mhc_epsilon: float = 1e-6
     mhc_blend_alpha: float = 1.0
+    # Optional Multi-Token Prediction (DeepSeek-V3 style)
+    mtp_enabled: bool = False
+    mtp_lambda: float = 0.3       # MTP loss weight (DeepSeek uses 0.3 early, 0.1 later)
+    # Optional DeepSeek Sparse Attention (DSA)
+    dsa_enabled: bool = False
+    dsa_start_layer: int = 7      # first layer to use sparse attention (0-indexed)
+    dsa_top_k_ratio: float = 0.5  # fraction of tokens to select per query
+    dsa_local_window: int = 128   # local window always included
+    dsa_indexer_heads: int = 16   # number of lightweight indexer heads
+    dsa_indexer_dim: int = 32     # dimension per indexer head
     # Reserved for optional auxiliary objectives
     aux_loss_weight: float = 0.0
 
@@ -198,7 +209,18 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx, engram_layers):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        # Use DSA for layers >= dsa_start_layer when enabled
+        use_dsa = bool(config.dsa_enabled) and layer_idx >= config.dsa_start_layer
+        if use_dsa:
+            self.attn = DeepSeekSparseAttention(
+                config, layer_idx,
+                dsa_top_k_ratio=config.dsa_top_k_ratio,
+                dsa_local_window=config.dsa_local_window,
+                dsa_indexer_heads=config.dsa_indexer_heads,
+                dsa_indexer_dim=config.dsa_indexer_dim,
+            )
+        else:
+            self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
         self.engram = None
         self.mhc = None
@@ -266,6 +288,12 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx, self.engram_layers) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+        # Optional MTP head (DeepSeek-V3 Multi-Token Prediction)
+        self.mtp = None
+        if config.mtp_enabled:
+            from nanochat.mtp import MTPModule
+            self.mtp = MTPModule(config)
+            self.mtp_lambda = config.mtp_lambda
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -319,6 +347,23 @@ class GPT(nn.Module):
             if block.mhc is not None:
                 torch.nn.init.uniform_(block.mhc.score_proj.weight, -s, s)
                 torch.nn.init.zeros_(block.mhc.score_out.weight)
+            # DSA: initialize indexer projections
+            if isinstance(block.attn, DeepSeekSparseAttention):
+                torch.nn.init.uniform_(block.attn.indexer.q_proj.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.indexer.k_proj.weight, -s, s)
+                # Small random init for w_proj so importance scores vary (enables gradient flow)
+                torch.nn.init.uniform_(block.attn.indexer.w_proj.weight, -s * 0.1, s * 0.1)
+
+        # MTP module initialization
+        if self.mtp is not None:
+            torch.nn.init.zeros_(self.mtp.proj.weight)  # conservative: start near zero
+            blk = self.mtp.block
+            torch.nn.init.uniform_(blk.attn.c_q.weight, -s, s)
+            torch.nn.init.uniform_(blk.attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(blk.attn.c_v.weight, -s, s)
+            torch.nn.init.zeros_(blk.attn.c_proj.weight)
+            torch.nn.init.uniform_(blk.mlp.c_fc.weight, -s, s)
+            torch.nn.init.zeros_(blk.mlp.c_proj.weight)
 
         # Per-layer scalars
         with torch.no_grad():
@@ -400,11 +445,14 @@ class GPT(nn.Module):
         # Exclude non-matmul params: embeddings and per-layer scalars
         nparams_exclude = self.transformer.wte.weight.numel() + self.resid_lambdas.numel() + self.x0_lambdas.numel()
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Sum attention FLOPs per layer, accounting for sliding window
+        # Sum attention FLOPs per layer, accounting for sliding window and DSA
         attn_flops = 0
-        for window_size in self.window_sizes:
+        for i, window_size in enumerate(self.window_sizes):
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
+            # DSA layers attend to fewer tokens (top_k_ratio fraction)
+            if self.config.dsa_enabled and i >= self.config.dsa_start_layer:
+                effective_seq = int(effective_seq * self.config.dsa_top_k_ratio)
             attn_flops += 12 * h * q * effective_seq
         num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
         return num_flops_per_token
@@ -424,8 +472,10 @@ class GPT(nn.Module):
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into 5 groups (matrix, embedding, lm_head, resid_lambdas, x0_lambdas)
+        # Separate out all parameters into groups (matrix, embedding, lm_head, resid_lambdas, x0_lambdas, [mtp])
         matrix_params = list(self.transformer.h.parameters())
+        if self.mtp is not None:
+            matrix_params += list(self.mtp.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
@@ -485,7 +535,7 @@ class GPT(nn.Module):
             # Training: use fused linear + cross entropy (CCE recommended)
             # CCE avoids materializing the huge logits tensor (B*T*V), saving ~8GB for large vocabs.
             # Note: lm_head.weight may have padded_vocab_size rows (see __init__ comment for trade-off).
-            loss = kernels.fused_linear_cross_entropy(
+            main_loss = kernels.fused_linear_cross_entropy(
                 x.to(torch.bfloat16),
                 self.lm_head.weight.to(torch.bfloat16),
                 targets,
@@ -493,7 +543,14 @@ class GPT(nn.Module):
                 softcap=softcap,
                 reduction=loss_reduction,
             )
-            return loss
+            # Multi-Token Prediction: predict token at position i+2
+            if self.mtp is not None and loss_reduction == 'mean':
+                mtp_loss = self.mtp(
+                    x, targets, self.transformer.wte,
+                    self.lm_head.weight, cos_sin, softcap=softcap,
+                )
+                return main_loss + self.mtp_lambda * mtp_loss
+            return main_loss
         else:
             # Inference: compute full logits
             logits = self.lm_head(x) # (B, T, padded_vocab_size)
