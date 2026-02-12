@@ -168,6 +168,18 @@ fn extract_includes(path: &Path) -> (Vec<String>, Vec<String>) {
 /// Detect inter-project dependencies by scanning include directives.
 /// Uses parallel scanning for speed.
 pub fn detect_dependencies(projects: &mut Vec<ProjectNode>, header_map: &HashMap<String, String>) {
+    // Pre-compute project name lookup: lowercase name -> original name (O(1) instead of O(N))
+    let mut name_lookup: HashMap<String, String> = HashMap::new();
+    for proj in projects.iter() {
+        let lower = proj.name.to_lowercase();
+        name_lookup.insert(lower.clone(), proj.name.clone());
+        // Also add underscore variant: "gcc-mirror" -> "gcc_mirror"
+        let underscore = lower.replace('-', "_");
+        if underscore != lower {
+            name_lookup.insert(underscore, proj.name.clone());
+        }
+    }
+
     // Collect all includes from each project in parallel
     let project_includes: Vec<HashSet<String>> = projects
         .par_iter()
@@ -207,18 +219,11 @@ pub fn detect_dependencies(projects: &mut Vec<ProjectNode>, header_map: &HashMap
                         }
                     }
 
-                    // Try well-known prefix patterns
-                    let parts: Vec<&str> = inc_normalized.split('/').collect();
-                    if parts.len() >= 2 {
-                        // "boost/asio.hpp" -> check if "boost" is a project
-                        let top_dir = parts[0].to_lowercase();
-                        for proj_inner in projects.iter() {
-                            if proj_inner.name.to_lowercase() == top_dir
-                                || proj_inner.name.to_lowercase().replace('-', "_") == top_dir
-                            {
-                                deps.insert(proj_inner.name.clone());
-                                break;
-                            }
+                    // Try well-known prefix patterns with O(1) HashMap lookup
+                    if let Some(slash_pos) = inc_normalized.find('/') {
+                        let top_dir = inc_normalized[..slash_pos].to_lowercase();
+                        if let Some(proj_name) = name_lookup.get(&top_dir) {
+                            deps.insert(proj_name.clone());
                         }
                     }
                 }
@@ -297,16 +302,27 @@ pub fn plan_processing_order(
 ) -> Vec<ProjectNode> {
     eprintln!("Discovering projects in {}...", projects_dir.display());
 
-    // Discover projects
-    let mut projects: Vec<ProjectNode> = std::fs::read_dir(projects_dir)
+    // Collect project directories first, then discover in parallel
+    let project_dirs: Vec<(String, PathBuf)> = std::fs::read_dir(projects_dir)
         .expect("Failed to read projects directory")
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
             let path = e.path();
-            eprintln!("  Scanning: {}", name);
-            ProjectNode::discover(name, path, max_file_bytes)
+            (name, path)
+        })
+        .collect();
+
+    eprintln!("  Found {} directories, scanning in parallel...", project_dirs.len());
+
+    // Discover files in parallel across all projects
+    let mut projects: Vec<ProjectNode> = project_dirs
+        .into_par_iter()
+        .map(|(name, path)| {
+            let proj = ProjectNode::discover(name.clone(), path, max_file_bytes);
+            eprintln!("  Scanning: {} ({} files)", name, proj.total_files());
+            proj
         })
         .filter(|p| p.total_files() > 0)
         .collect();

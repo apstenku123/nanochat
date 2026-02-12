@@ -380,11 +380,11 @@ def fused_linear_cross_entropy(
         return fused_linear_cross_entropy_liger(
             hidden_states, lm_head_weight, targets, ignore_index, softcap, reduction
         )
-    # On XLA/TPU, use chunked to avoid materializing huge logits tensor
+    # On XLA/TPU, use chunked to avoid materializing huge logits tensor.
+    # chunk_size=4096 is optimal: fewer XLA graph nodes than smaller chunks.
     if hidden_states.device.type == 'xla':
         return fused_linear_cross_entropy_chunked(
             hidden_states, lm_head_weight, targets, ignore_index, softcap, reduction,
-            chunk_size=2048,
         )
     return fused_linear_cross_entropy_current(
         hidden_states, lm_head_weight, targets, ignore_index, softcap, reduction
