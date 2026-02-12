@@ -76,7 +76,7 @@ from nanochat.common import (
 )
 from nanochat import kernels
 from nanochat.tokenizer import get_tokenizer, get_token_bytes, verify_cpp_tokenizer
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_last_step
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.cpp_eval import evaluate_cpp_model
@@ -123,7 +123,7 @@ parser.add_argument("--adam_beta2", type=float, default=0.95, help="Adam beta2 f
 parser.add_argument("--warmup_ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown_ratio", type=float, default=0.4, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final_lr_frac", type=float, default=0.0, help="final LR as fraction of initial LR")
-parser.add_argument("--resume_from_step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--resume_from_step", type=int, default=-1, help="resume training from this step (-1 = disable, -2 = auto-detect latest checkpoint)")
 # Evaluation
 parser.add_argument("--eval_every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval_tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
@@ -347,6 +347,14 @@ def train():
     base_dir = get_base_dir()
     output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
     checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+    # Auto-detect latest checkpoint when resume_from_step == -2
+    if args.resume_from_step == -2:
+        try:
+            args.resume_from_step = find_last_step(checkpoint_dir)
+            print0(f"Auto-detected latest checkpoint: step {args.resume_from_step}")
+        except FileNotFoundError:
+            print0("No checkpoints found, starting from scratch")
+            args.resume_from_step = -1
     resuming = args.resume_from_step != -1
     if resuming:
         print0(f"Resuming optimization from step {args.resume_from_step}")

@@ -11,21 +11,28 @@ echo "============================================"
 echo "TPU v6e Setup - Verified Package Versions"
 echo "============================================"
 
-# Check Python version
-PYTHON_VERSION=$(python3 --version 2>&1)
-echo "Python: $PYTHON_VERSION"
+# Install python3-venv (required on v2-alpha-tpuv6e runtime)
+echo "Ensuring python3-venv is available..."
+sudo apt-get update -qq
+sudo apt-get install -y python3.10-venv python3.11-venv 2>/dev/null || true
 
-# Ensure python3-venv is available (v2-alpha-tpuv6e runtime may not have it)
-if ! python3 -m venv --help &>/dev/null; then
-    echo "Installing python3-venv..."
-    sudo apt-get update -qq && sudo apt-get install -y -qq python3.10-venv 2>/dev/null || true
+# Prefer Python 3.11 if available, fall back to 3.10
+if command -v python3.11 &>/dev/null && python3.11 -m venv --help &>/dev/null; then
+    PYTHON=python3.11
+    echo "Using Python 3.11"
+elif python3 -m venv --help &>/dev/null; then
+    PYTHON=python3
+    echo "Using $(python3 --version 2>&1)"
+else
+    echo "ERROR: No Python with venv support found"
+    exit 1
 fi
 
 # Create venv if needed
 if [ ! -d "$HOME/venv" ] || [ ! -f "$HOME/venv/bin/activate" ]; then
     rm -rf "$HOME/venv"
     echo "Creating virtual environment..."
-    python3 -m venv "$HOME/venv"
+    $PYTHON -m venv "$HOME/venv"
 fi
 source "$HOME/venv/bin/activate"
 
@@ -43,6 +50,15 @@ pip install 'torch~=2.9.0' 'torch_xla[tpu]~=2.9.0' \
 echo "=== Installing nanochat dependencies ==="
 pip install pyarrow tokenizers wandb tqdm datasets transformers \
     psutil tabulate scipy regex tiktoken rustbpe
+
+echo "=== Installing JAX for XLA Flash Attention (Pallas TPU kernels) ==="
+pip install 'jax==0.7.0' 'jaxlib==0.7.0' \
+    -f https://storage.googleapis.com/libtpu-releases/index.html \
+    -f https://storage.googleapis.com/libtpu-wheels/index.html
+# Pin libtpu to match torch_xla requirements
+pip install 'libtpu==0.0.21' \
+    -f https://storage.googleapis.com/libtpu-releases/index.html \
+    -f https://storage.googleapis.com/libtpu-wheels/index.html
 
 echo "=== Verifying installation ==="
 python3 -c "
@@ -65,11 +81,8 @@ print('TPU verification: PASSED')
 echo "=== Setting up environment variables ==="
 cat > "$HOME/.tpu_env" << 'ENVEOF'
 export PJRT_DEVICE=TPU
-export WANDB_API_KEY=\${WANDB_API_KEY:?Set WANDB_API_KEY before sourcing}
 export NANOCHAT_BASE_DIR=/home/dave/data
-export NANOCHAT_GCS_CHECKPOINT_BUCKET=gs://nanochat-training-data-2026/checkpoints
-# Note: LIBTPU_INIT_ARGS="--xla_tpu_disable_full_embedding_pipelining=true"
-# was tested but is NOT supported by libtpu 0.0.21 (v2-alpha-tpuv6e runtime)
+export XLA_NO_SPECIAL_SCALARS=1
 ENVEOF
 
 echo "source \$HOME/.tpu_env" >> "$HOME/.bashrc" 2>/dev/null || true

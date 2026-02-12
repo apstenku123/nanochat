@@ -60,33 +60,33 @@ from flash_attn import flash_attn_func, flash_attn_with_kvcache
 
 ### Architecture Comparison (20 training steps)
 
-| Architecture | Kernel Backend | Throughput | Peak Memory | Notes |
-|--------------|----------------|------------|-------------|-------|
-| **Original FA3** | CCE | **21,756 tok/s** | **8.59 GB** | **FASTEST - Use this!** |
-| **Original FA3** | current (PyTorch) | 16,040 tok/s | 9.65 GB | Good baseline |
-| **Original FA3** | Liger | 15,645 tok/s | 17.06 GB | Slower + 2x memory |
-| TE + BF16 | compiled | 12,524 tok/s | 17.79 GB | TE overhead |
-| TE + NVFP4 | compiled | 13,010 tok/s | 17.19 GB | 4% faster than TE BF16 |
+| Architecture     | Kernel Backend    | Throughput       | Peak Memory | Notes                   |
+| ---------------- | ----------------- | ---------------- | ----------- | ----------------------- |
+| **Original FA3** | CCE               | **21,756 tok/s** | **8.59 GB** | **FASTEST - Use this!** |
+| **Original FA3** | current (PyTorch) | 16,040 tok/s     | 9.65 GB     | Good baseline           |
+| **Original FA3** | Liger             | 15,645 tok/s     | 17.06 GB    | Slower + 2x memory      |
+| TE + BF16        | compiled          | 12,524 tok/s     | 17.79 GB    | TE overhead             |
+| TE + NVFP4       | compiled          | 13,010 tok/s     | 17.19 GB    | 4% faster than TE BF16  |
 
 ### Kernel Backend Comparison (Original FA3 architecture)
 
-| Backend | Throughput | Memory | Speedup vs Baseline |
-|---------|------------|--------|---------------------|
-| **CCE (Apple)** | 21,756 tok/s | 8.59 GB | **1.36x** |
-| current (PyTorch) | 16,040 tok/s | 9.65 GB | 1.00x |
-| Liger | 15,645 tok/s | 17.06 GB | 0.98x |
+| Backend           | Throughput   | Memory   | Speedup vs Baseline |
+| ----------------- | ------------ | -------- | ------------------- |
+| **CCE (Apple)**   | 21,756 tok/s | 8.59 GB  | **1.36x**           |
+| current (PyTorch) | 16,040 tok/s | 9.65 GB  | 1.00x               |
+| Liger             | 15,645 tok/s | 17.06 GB | 0.98x               |
 
 **Winner: Apple Cut Cross Entropy (CCE)** - 36% faster, 1 GB less memory than baseline!
 
 ### Top Kernels (CCE + FA3 profile)
 
-| Kernel | Time % | Description |
-|--------|--------|-------------|
-| `_cce_backward_kernel` | 5.8% | CCE custom backward pass |
-| `flash_bwd_dq_dk_dv_loop_seqk_parallel` | 4.8% | Flash Attention backward |
-| `triton_tem_fused__fused_rms_norm_mm_t` | 4.7% | Fused RMSNorm + MatMul |
-| `_cce_lse_forward_kernel` | 3.2% | CCE log-sum-exp forward |
-| `flash_fwd_kernel` | 2.1% | Flash Attention forward |
+| Kernel                                  | Time % | Description              |
+| --------------------------------------- | ------ | ------------------------ |
+| `_cce_backward_kernel`                  | 5.8%   | CCE custom backward pass |
+| `flash_bwd_dq_dk_dv_loop_seqk_parallel` | 4.8%   | Flash Attention backward |
+| `triton_tem_fused__fused_rms_norm_mm_t` | 4.7%   | Fused RMSNorm + MatMul   |
+| `_cce_lse_forward_kernel`               | 3.2%   | CCE log-sum-exp forward  |
+| `flash_fwd_kernel`                      | 2.1%   | Flash Attention forward  |
 
 ### Key Findings
 
@@ -139,13 +139,13 @@ The v6e TPU supports 16K context training using XLA Pallas flash attention. This
 
 **Critical package versions:**
 
-| Package | Version | Why |
-|---------|---------|-----|
-| Python | 3.11 | jaxlib 0.7.x needs >= 3.11 |
-| jax | **0.7.0** | Pallas flash attention kernels |
-| jaxlib | **0.7.0** | Must match jax version |
-| libtpu | 0.0.21 | PJRT API 0.75, compatible with torch_xla 2.9.0 |
-| torch_xla | 2.9.0 | Latest stable release |
+| Package   | Version   | Why                                            |
+| --------- | --------- | ---------------------------------------------- |
+| Python    | 3.11      | jaxlib 0.7.x needs >= 3.11                     |
+| jax       | **0.7.0** | Pallas flash attention kernels                 |
+| jaxlib    | **0.7.0** | Must match jax version                         |
+| libtpu    | 0.0.21    | PJRT API 0.75, compatible with torch_xla 2.9.0 |
+| torch_xla | 2.9.0     | Latest stable release                          |
 
 > **Do NOT use jax 0.7.1** — it generates Mosaic IR v8, but libtpu 0.0.21 only supports v7.
 

@@ -61,7 +61,7 @@ def _patch_missing_keys(model_data, model_config):
     if "x0_lambdas" not in model_data:
         model_data["x0_lambdas"] = torch.zeros(n_layer)
 
-def _upload_to_gcs(local_path, gcs_bucket=None):
+def _upload_to_gcs(local_path, gcs_bucket=None, max_retries=3):
     """Upload a file to GCS if bucket is configured via NANOCHAT_GCS_CHECKPOINT_BUCKET env var."""
     if gcs_bucket is None:
         gcs_bucket = os.environ.get("NANOCHAT_GCS_CHECKPOINT_BUCKET")
@@ -71,12 +71,29 @@ def _upload_to_gcs(local_path, gcs_bucket=None):
     base_dir = get_base_dir()
     rel_path = os.path.relpath(local_path, base_dir)
     gcs_path = f"{gcs_bucket.rstrip('/')}/{rel_path}"
-    try:
-        subprocess.run(["gcloud", "storage", "cp", local_path, gcs_path],
-                       capture_output=True, timeout=300)
-        logger.info(f"Uploaded to GCS: {gcs_path}")
-    except Exception as e:
-        logger.warning(f"GCS upload failed for {local_path}: {e}")
+    file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
+    # Use gsutil for large files (better multipart upload support), gcloud storage for small
+    if file_size_mb > 100:
+        cmd = ["gsutil", "-m", "-o", "GSUtil:parallel_composite_upload_threshold=50M", "cp", local_path, gcs_path]
+        timeout = 600  # 10 min for large files
+    else:
+        cmd = ["gcloud", "storage", "cp", local_path, gcs_path]
+        timeout = 300
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if result.returncode == 0:
+                logger.info(f"Uploaded to GCS: {gcs_path} ({file_size_mb:.1f} MB)")
+                return
+            else:
+                logger.warning(f"GCS upload attempt {attempt}/{max_retries} failed for {local_path} "
+                             f"(rc={result.returncode}): {result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            logger.warning(f"GCS upload attempt {attempt}/{max_retries} timed out for {local_path} "
+                         f"({file_size_mb:.1f} MB, timeout={timeout}s)")
+        except Exception as e:
+            logger.warning(f"GCS upload attempt {attempt}/{max_retries} error for {local_path}: {e}")
+    logger.error(f"GCS upload FAILED after {max_retries} attempts: {local_path} -> {gcs_path}")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -100,17 +117,46 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         logger.info(f"Saved optimizer state to: {optimizer_path}")
         _upload_to_gcs(optimizer_path)
 
+def _download_from_gcs(local_path, gcs_bucket=None):
+    """Download a file from GCS if not available locally."""
+    if os.path.exists(local_path):
+        return True
+    if gcs_bucket is None:
+        gcs_bucket = os.environ.get("NANOCHAT_GCS_CHECKPOINT_BUCKET")
+    if not gcs_bucket:
+        return False
+    base_dir = get_base_dir()
+    rel_path = os.path.relpath(local_path, base_dir)
+    gcs_path = f"{gcs_bucket.rstrip('/')}/{rel_path}"
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    try:
+        logger.info(f"Downloading from GCS: {gcs_path}")
+        result = subprocess.run(["gsutil", "-m", "cp", gcs_path, local_path],
+                               capture_output=True, text=True, timeout=600)
+        if result.returncode == 0:
+            logger.info(f"Downloaded from GCS: {local_path}")
+            return True
+        else:
+            logger.warning(f"GCS download failed (rc={result.returncode}): {result.stderr.strip()}")
+            return False
+    except Exception as e:
+        logger.warning(f"GCS download error for {local_path}: {e}")
+        return False
+
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
-    # Load the model state
+    # Load the model state (download from GCS if not available locally)
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
+    _download_from_gcs(model_path)
     model_data = torch.load(model_path, map_location=device)
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optimizer:
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
+        _download_from_gcs(optimizer_path)
         optimizer_data = torch.load(optimizer_path, map_location=device)
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+    _download_from_gcs(meta_path)
     with open(meta_path, "r", encoding="utf-8") as f:
         meta_data = json.load(f)
     return model_data, optimizer_data, meta_data
@@ -178,12 +224,35 @@ def find_largest_model(checkpoints_dir):
 
 
 def find_last_step(checkpoint_dir):
-    # Look into checkpoint_dir and find model_<step>.pt with the highest step
+    """Find the highest checkpoint step. Checks local files first, falls back to GCS."""
+    # Check local files first
     checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.pt"))
-    if not checkpoint_files:
-        raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
-    last_step = int(max(os.path.basename(f).split("_")[-1].split(".")[0] for f in checkpoint_files))
-    return last_step
+    if checkpoint_files:
+        last_step = int(max(os.path.basename(f).split("_")[-1].split(".")[0] for f in checkpoint_files))
+        return last_step
+    # Fall back to GCS if configured
+    gcs_bucket = os.environ.get("NANOCHAT_GCS_CHECKPOINT_BUCKET")
+    if gcs_bucket:
+        base_dir = get_base_dir()
+        rel_path = os.path.relpath(checkpoint_dir, base_dir)
+        gcs_dir = f"{gcs_bucket.rstrip('/')}/{rel_path}"
+        try:
+            result = subprocess.run(["gsutil", "ls", f"{gcs_dir}/model_*.pt"],
+                                   capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and result.stdout.strip():
+                gcs_files = result.stdout.strip().split("\n")
+                steps = []
+                for f in gcs_files:
+                    fname = f.rstrip("/").split("/")[-1]
+                    step_str = fname.split("_")[-1].split(".")[0]
+                    steps.append(int(step_str))
+                if steps:
+                    last_step = max(steps)
+                    logger.info(f"Found latest checkpoint in GCS: step {last_step}")
+                    return last_step
+        except Exception as e:
+            logger.warning(f"GCS checkpoint listing failed: {e}")
+    raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
 
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure

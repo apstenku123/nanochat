@@ -16,40 +16,40 @@ Three-stage training pipeline for C++ code generation with:
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                           Agent Orchestrator                            │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    FunctionGemma (270M)                          │   │
-│  │         Tool Router + Natural Language ↔ Function Calls          │   │
-│  └───────────────────────┬───────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                    FunctionGemma (270M)                         │    │
+│  │         Tool Router + Natural Language ↔ Function Calls         │    │
+│  └───────────────────────┬─────────────────────────────────────────┘    │
 │                          │                                              │
-│        ┌────────────────┼─────────────────┬────────────────────┐       │
-│        ▼                ▼                 ▼                    ▼       │
-│  ┌──────────┐    ┌───────────┐    ┌───────────────┐    ┌───────────┐  │
-│  │ CodeGen  │    │ CMakeGen  │    │ GKE Sandbox   │    │ Analysis  │  │
-│  │ (NanoChat│    │ (Specialist│    │ (Code Exec)   │    │ (Review)  │  │
-│  │ 400M)    │    │ 100M)     │    │               │    │           │  │
-│  └──────────┘    └───────────┘    └───────────────┘    └───────────┘  │
+│        ┌─────────────────┼─────────────────┬────────────────────┐       │
+│        ▼                 ▼                 ▼                    ▼       │
+│  ┌──────────┐    ┌───────────┐    ┌───────────────┐    ┌───────────┐    │
+│  │ CodeGen  │    │ CMakeGen  │    │ GKE Sandbox   │    │ Analysis  │    │
+│  │ (NanoChat│    │(Specialist│    │ (Code Exec)   │    │ (Review)  │    │
+│  │ 400M)    │    │ 100M)     │    │               │    │           │    │
+│  └──────────┘    └───────────┘    └───────────────┘    └───────────┘    │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Component Roles
 
-| Component | Model Size | Purpose |
-|-----------|------------|---------|
-| **NanoChat** | 400M | C++ code generation (FIM, completion) |
-| **CMakeGen** | 100M | CMakeLists.txt generation specialist |
-| **FunctionGemma** | 270M | Tool routing, NL↔function translation |
-| **GKE Sandbox** | - | Secure code execution environment |
+| Component         | Model Size | Purpose                               |
+| ----------------- | ---------- | ------------------------------------- |
+| **NanoChat**      | 400M       | C++ code generation (FIM, completion) |
+| **CMakeGen**      | 100M       | CMakeLists.txt generation specialist  |
+| **FunctionGemma** | 270M       | Tool routing, NL↔function translation |
+| **GKE Sandbox**   | -          | Secure code execution environment     |
 
 ---
 
 ## Stage 1: Base Pretraining (Enhanced)
 
 ### Data Mix
-| Component | Ratio | Description |
-|-----------|-------|-------------|
-| Raw C++ | 40% | Standard next-token prediction |
-| Random FIM | 40% | Random infilling (current) |
-| **Structured FIM** | **20%** | Docstring → function body |
+| Component          | Ratio   | Description                    |
+| ------------------ | ------- | ------------------------------ |
+| Raw C++            | 40%     | Standard next-token prediction |
+| Random FIM         | 40%     | Random infilling (current)     |
+| **Structured FIM** | **20%** | Docstring → function body      |
 
 ### Structured FIM Format
 ```
@@ -83,11 +83,11 @@ nohup .venv/bin/python -m scripts.base_train \
 ## Stage 2: SFT (Supervised Fine-Tuning)
 
 ### Data Sources
-| Dataset | Size | Description |
-|---------|------|-------------|
-| `diff_sft.jsonl` | 60k | PR/MR code repairs |
-| `docstring_sft.jsonl` | TBD | Docstring → implementation |
-| `pass_k_sft.jsonl` | TBD | Multiple solution variations |
+| Dataset               | Size | Description                  |
+| --------------------- | ---- | ---------------------------- |
+| `diff_sft.jsonl`      | 60k  | PR/MR code repairs           |
+| `docstring_sft.jsonl` | TBD  | Docstring → implementation   |
+| `pass_k_sft.jsonl`    | TBD  | Multiple solution variations |
 
 ### Multi-Solution SFT Data Format
 
@@ -163,13 +163,13 @@ def create_preference_pair(solutions: list[dict]) -> dict:
 
 ### Why GSPO over GRPO
 
-| Aspect | GRPO | GSPO |
-|--------|------|------|
-| **Importance ratio** | Token-level | Sequence-level |
-| **Variance** | High (per-token) | Low (per-sequence) |
-| **MoE stability** | Requires routing replay | Naturally stable |
-| **Training efficiency** | Baseline | 1.5-2x faster |
-| **Precision tolerance** | Sensitive | Tolerant (simpler infra) |
+| Aspect                  | GRPO                    | GSPO                     |
+| ----------------------- | ----------------------- | ------------------------ |
+| **Importance ratio**    | Token-level             | Sequence-level           |
+| **Variance**            | High (per-token)        | Low (per-sequence)       |
+| **MoE stability**       | Requires routing replay | Naturally stable         |
+| **Training efficiency** | Baseline                | 1.5-2x faster            |
+| **Precision tolerance** | Sensitive               | Tolerant (simpler infra) |
 
 **References**:
 - [GSPO Paper](https://arxiv.org/abs/2507.18071) (July 2025)
@@ -282,17 +282,17 @@ From [Google's announcement](https://cloud.google.com/blog/products/containers-k
 ┌─────────────────────────────────────────────────────────────────┐
 │                    GKE Autopilot Cluster                        │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │                  Pre-warmed Sandbox Pool                  │   │
-│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐        │   │
-│  │  │Sandbox 1│ │Sandbox 2│ │Sandbox 3│ │Sandbox N│        │   │
-│  │  │ gVisor  │ │ gVisor  │ │ gVisor  │ │ gVisor  │        │   │
-│  │  │ +g++    │ │ +g++    │ │ +g++    │ │ +g++    │        │   │
-│  │  └─────────┘ └─────────┘ └─────────┘ └─────────┘        │   │
+│  │                  Pre-warmed Sandbox Pool                 │   │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐         │   │
+│  │  │Sandbox 1│ │Sandbox 2│ │Sandbox 3│ │Sandbox N│         │   │
+│  │  │ gVisor  │ │ gVisor  │ │ gVisor  │ │ gVisor  │         │   │
+│  │  │ +g++    │ │ +g++    │ │ +g++    │ │ +g++    │         │   │
+│  │  └─────────┘ └─────────┘ └─────────┘ └─────────┘         │   │
 │  └──────────────────────────────────────────────────────────┘   │
 │                              │                                  │
 │                              ▼                                  │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │               Execution Controller Service                │   │
+│  │               Execution Controller Service               │   │
 │  │  POST /execute {code, test_cases, timeout}               │   │
 │  │  → Returns {compile_ok, run_ok, tests_passed, stdout}    │   │
 │  └──────────────────────────────────────────────────────────┘   │
@@ -660,28 +660,28 @@ python -m scripts.data.extract_cmake \
 
 ### New Files
 
-| File | Purpose |
-|------|---------|
-| `nanochat/gspo.py` | GSPO trainer (replaces grpo.py) |
-| `nanochat/gke_sandbox.py` | GKE sandbox client |
-| `nanochat/agent.py` | FunctionGemma orchestration |
-| `nanochat/cmake_model.py` | CMake specialist wrapper |
-| `scripts/gspo_train.py` | GSPO training script |
-| `scripts/cmake_train.py` | CMake model training |
-| `scripts/data/generate_pass_k.py` | Multi-solution generation |
-| `scripts/data/create_preference_pairs.py` | Contrastive pair creation |
-| `scripts/data/extract_cmake.py` | CMake data extraction |
-| `k8s/sandbox-pool.yaml` | GKE sandbox deployment |
-| `k8s/execution-controller.yaml` | Execution service |
+| File                                      | Purpose                         |
+| ----------------------------------------- | ------------------------------- |
+| `nanochat/gspo.py`                        | GSPO trainer (replaces grpo.py) |
+| `nanochat/gke_sandbox.py`                 | GKE sandbox client              |
+| `nanochat/agent.py`                       | FunctionGemma orchestration     |
+| `nanochat/cmake_model.py`                 | CMake specialist wrapper        |
+| `scripts/gspo_train.py`                   | GSPO training script            |
+| `scripts/cmake_train.py`                  | CMake model training            |
+| `scripts/data/generate_pass_k.py`         | Multi-solution generation       |
+| `scripts/data/create_preference_pairs.py` | Contrastive pair creation       |
+| `scripts/data/extract_cmake.py`           | CMake data extraction           |
+| `k8s/sandbox-pool.yaml`                   | GKE sandbox deployment          |
+| `k8s/execution-controller.yaml`           | Execution service               |
 
 ### Modified Files
 
-| File | Changes |
-|------|---------|
-| `nanochat/fim.py` | Add `apply_fim_structured()` |
-| `nanochat/dataloader.py` | Add `structured_fim_rate` |
-| `scripts/base_train.py` | Add `--structured_fim_rate` CLI |
-| `scripts/rl_train.py` | Update to use GSPO |
+| File                     | Changes                         |
+| ------------------------ | ------------------------------- |
+| `nanochat/fim.py`        | Add `apply_fim_structured()`    |
+| `nanochat/dataloader.py` | Add `structured_fim_rate`       |
+| `scripts/base_train.py`  | Add `--structured_fim_rate` CLI |
+| `scripts/rl_train.py`    | Update to use GSPO              |
 
 ---
 

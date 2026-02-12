@@ -35,17 +35,25 @@ def adamw_step_fused(
     All in one compiled graph to eliminate Python overhead between ops.
     The 0-D CPU tensors avoid recompilation when hyperparameter values change.
     """
+    # Cast scalar tensors to param dtype for XLA compatibility (no-op when dtypes match)
+    p_dtype = p.dtype
+    lr = lr_t.to(p_dtype)
+    wd = wd_t.to(p_dtype)
+    beta1 = beta1_t.to(p_dtype)
+    beta2 = beta2_t.to(p_dtype)
+    eps = eps_t.to(p_dtype)
+    step = step_t.to(p_dtype)
     # Weight decay (decoupled, applied before the update)
-    p.mul_(1 - lr_t * wd_t)
+    p.mul_(1 - lr * wd)
     # Update running averages (lerp_ is cleaner and fuses well)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
+    exp_avg.lerp_(grad.to(p_dtype), 1 - beta1)
+    exp_avg_sq.lerp_(grad.to(p_dtype).square(), 1 - beta2)
     # Bias corrections
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
+    bias1 = 1 - beta1 ** step
+    bias2 = 1 - beta2 ** step
     # Compute update and apply
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
+    denom = (exp_avg_sq / bias2).sqrt() + eps
+    step_size = lr / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
 
@@ -139,10 +147,24 @@ class DistAdamW(torch.optim.Optimizer):
                 self._eps_t.fill_(eps)
                 self._wd_t.fill_(eff_wd)
 
+                # On XLA/TPU (no compile), 0-D tensors must be on the same device as parameters
+                if _use_compile:
+                    step_t, lr_t = self._step_t, self._lr_t
+                    beta1_t, beta2_t = self._beta1_t, self._beta2_t
+                    eps_t, wd_t = self._eps_t, self._wd_t
+                else:
+                    p_dev = p_slice.device
+                    step_t = self._step_t.to(p_dev)
+                    lr_t = self._lr_t.to(p_dev)
+                    beta1_t = self._beta1_t.to(p_dev)
+                    beta2_t = self._beta2_t.to(p_dev)
+                    eps_t = self._eps_t.to(p_dev)
+                    wd_t = self._wd_t.to(p_dev)
+
                 # Fused update: weight_decay -> momentum -> bias_correction -> param_update
                 adamw_step_fused(
                     p_slice, g_slice, exp_avg, exp_avg_sq,
-                    self._step_t, self._lr_t, self._beta1_t, self._beta2_t, self._eps_t, self._wd_t,
+                    step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t,
                 )
 
                 # Only large params need all_gather

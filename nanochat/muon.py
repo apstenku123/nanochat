@@ -66,12 +66,17 @@ def muon_step_fused(
     Some of the constants are 0-D CPU tensors to avoid recompilation when values change.
     """
 
-    # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
+    # Use buffer dtype (matches param dtype) for all non-polar-express ops.
+    # This ensures dtype consistency for XLA which is strict about lerp_ weight dtype.
+    buf_dtype = momentum_buffer.dtype
+    grads = stacked_grads.to(buf_dtype)
 
-    # Polar express
+    # Nesterov momentum
+    momentum = momentum_t.to(buf_dtype)
+    momentum_buffer.lerp_(grads, 1 - momentum)
+    g = grads.lerp_(momentum_buffer, momentum)
+
+    # Polar express (always bfloat16 for numerical stability)
     X = g.bfloat16()
     if g.size(-2) > g.size(-1):
         X = X.mT
@@ -82,24 +87,24 @@ def muon_step_fused(
         X = a * X + B @ X
     if g.size(-2) > g.size(-1):
         X = X.mT
-    g = X
+    g = X.to(buf_dtype)
 
     # Variance reduction
-    beta2 = beta2_t.to(g.dtype)
+    beta2 = beta2_t.to(buf_dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    second_momentum_buffer.lerp_(v_mean.to(buf_dtype), 1 - beta2)
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    g = g * final_scale.to(g.dtype)
+    g = g * final_scale.to(buf_dtype)
 
     # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
+    lr = lr_t.to(buf_dtype)
+    wd = wd_t.to(buf_dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
@@ -179,16 +184,25 @@ class Muon(torch.optim.Optimizer):
             self._lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._wd_t.fill_(group["weight_decay"])
 
+            # On XLA/TPU (no compile), 0-D tensors must be on the same device as parameters
+            if _use_compile:
+                momentum_t, lr_t, wd_t, beta2_t = self._momentum_t, self._lr_t, self._wd_t, self._beta2_t
+            else:
+                momentum_t = self._momentum_t.to(device)
+                lr_t = self._lr_t.to(device)
+                wd_t = self._wd_t.to(device)
+                beta2_t = self._beta2_t.to(device)
+
             # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
             muon_step_fused(
                 stacked_grads,
                 stacked_params,
                 momentum_buffer,
                 second_momentum_buffer,
-                self._momentum_t,
-                self._lr_t,
-                self._wd_t,
-                self._beta2_t,
+                momentum_t,
+                lr_t,
+                wd_t,
+                beta2_t,
                 group["ns_steps"],
                 red_dim,
             )
@@ -321,16 +335,25 @@ class DistMuon(torch.optim.Optimizer):
                 self._lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
                 self._wd_t.fill_(group["weight_decay"])
 
+                # On XLA/TPU (no compile), 0-D tensors must be on the same device as parameters
+                if _use_compile:
+                    momentum_t, lr_t, wd_t, beta2_t = self._momentum_t, self._lr_t, self._wd_t, self._beta2_t
+                else:
+                    momentum_t = self._momentum_t.to(device)
+                    lr_t = self._lr_t.to(device)
+                    wd_t = self._wd_t.to(device)
+                    beta2_t = self._beta2_t.to(device)
+
                 # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
                 muon_step_fused(
                     owned_grads,
                     stacked_owned_params,
                     owned_momentum,
                     owned_second_momentum,
-                    self._momentum_t,
-                    self._lr_t,
-                    self._wd_t,
-                    self._beta2_t,
+                    momentum_t,
+                    lr_t,
+                    wd_t,
+                    beta2_t,
                     group["ns_steps"],
                     red_dim,
                 )
