@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "pytorch-hud": {
+      "type": "stdio",
+      "command": "/home/dave/source/nanochat/.venv/bin/python",
+      "args": [
+        "-m",
+        "pytorch_hud"
+      ],
+      "env": {}
+    },
+    "pytorch-docs": {
+      "type": "stdio",
+      "command": "/home/dave/source/nanochat/.venv/bin/python",
+      "args": [
+        "-m",
+        "mcp_server_pytorch"
+      ],
+      "env": {}
+    }
+  }
+}

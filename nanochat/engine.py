@@ -17,7 +17,7 @@ import signal
 import warnings
 from contextlib import contextmanager
 from collections import deque
-from nanochat.common import compute_init, autodetect_device_type
+from nanochat.common import compute_init, autodetect_device_type, no_grad_or_inference_mode
 from nanochat.checkpoint_manager import load_model
 from contextlib import nullcontext
 
@@ -132,7 +132,7 @@ class KVCache:
         self.cache_seqlens.fill_(other_pos)
 
 # -----------------------------------------------------------------------------
-@torch.inference_mode()
+@no_grad_or_inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
     """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
     assert temperature >= 0.0, "temperature must be non-negative"

@@ -98,6 +98,25 @@ def _is_tpu_requested() -> bool:
     return os.environ.get("PJRT_DEVICE", "").upper() == "TPU"
 
 
+def no_grad_or_inference_mode():
+    """Return the appropriate autograd-disabling context for the current device.
+
+    torch.inference_mode() is faster than torch.no_grad() on CUDA/CPU because it
+    disables view tracking and version counter bumps in addition to gradient
+    computation.  However, it is not reliably supported on non-CUDA backends:
+    PyTorch Lightning hit the same issue on HPU and fell back to no_grad (see
+    lightning changelog for 1.8.x), and XLA/TPU backends can raise errors or
+    produce incorrect results under inference_mode because the XLA tracing
+    layer doesn't fully implement the InferenceMode dispatch key.
+
+    Use this helper wherever you would write @torch.inference_mode() but need
+    the code to also run on TPU/XLA devices.
+    """
+    if _is_tpu_requested():
+        return torch.no_grad()
+    return torch.inference_mode()
+
+
 def _get_xla_dist_info():
     """Best-effort rank/world-size info for TPU PJRT runtimes."""
     try:
