@@ -321,6 +321,8 @@ download_data() {
                 echo 'Downloading training data...'
                 gsutil -m cp ${GCS_BUCKET}/parquet/base_data_v3/*.parquet ~/data/parquet/
             fi
+            # Streaming dataloader needs _COMPLETE sentinel to know dataset is finished
+            touch ~/data/parquet/_COMPLETE
             echo \"Data ready: \$(ls ~/data/parquet/*.parquet | wc -l) parquet files\"
         "
     log "Data ready"
