@@ -10,19 +10,27 @@ use std::time::Instant;
 mod chunker;
 mod deps;
 mod global_index;
+mod project_graph;
 use chunker::{Chunk, ChunkKind};
 use global_index::GlobalIndex;
 
 #[derive(ClapParser)]
 #[command(name = "cpp-chunker", about = "Syntax-aware C++ chunker using tree-sitter")]
 struct Args {
-    /// Input JSONL files
+    /// Input JSONL files (for JSONL mode)
     #[arg(long, num_args = 1..)]
     inputs: Vec<String>,
 
     /// Output JSONL path
     #[arg(long)]
     output: String,
+
+    /// Directory containing project subdirectories (for project-aware mode).
+    /// Each subdirectory is treated as a separate project. Dependencies are
+    /// auto-detected from #include directives and projects are processed in
+    /// topological order (foundational libraries first).
+    #[arg(long)]
+    project_dirs: Option<String>,
 
     /// Target max tokens per document
     #[arg(long, default_value = "1024")]
@@ -322,6 +330,16 @@ fn main() {
     }
 
     let num_threads = rayon::current_num_threads();
+
+    // Project-aware mode: reads raw project directories with dependency ordering
+    if let Some(ref proj_dir) = args.project_dirs {
+        eprintln!(
+            "cpp-chunker: {} threads, max_tokens={}, project_mode=true, cross_depth={}",
+            num_threads, args.max_tokens, args.cross_depth
+        );
+        run_project_mode(&args, proj_dir, num_threads);
+        return;
+    }
 
     if args.cross_file {
         eprintln!(
@@ -670,6 +688,181 @@ fn run_cross_file_mode(args: &Args, num_threads: usize) {
     eprintln!("  Deduplicated: {}", format_num(dedup));
     eprintln!("  Output: {} ({:.2} GB)", args.output, output_size);
     eprintln!("  Rate: {:.0} files/sec", files as f64 / total_time);
+    eprintln!("{}", "=".repeat(60));
+}
+
+/// Project-aware mode: reads raw project directories, detects dependencies,
+/// processes in topological order (foundational libraries first) with full
+/// parallelism. No serial JSONL bottleneck.
+fn run_project_mode(args: &Args, projects_dir: &str, num_threads: usize) {
+    let t0 = Instant::now();
+
+    // Phase 0: Discover projects and build dependency DAG
+    eprintln!("\n=== Phase 0: Project discovery and dependency analysis ===");
+    let projects = project_graph::plan_processing_order(
+        std::path::Path::new(projects_dir),
+        args.max_file_bytes,
+    );
+
+    let total_src: usize = projects.iter().map(|p| p.source_files.len()).sum();
+    let total_hdr: usize = projects.iter().map(|p| p.header_files.len()).sum();
+    eprintln!("Total: {} source files, {} headers across {} projects",
+        format_num(total_src as u64), format_num(total_hdr as u64), projects.len());
+
+    // Prepare output
+    let output_file = std::fs::File::create(&args.output).expect("Failed to create output file");
+    let writer = Mutex::new(BufWriter::with_capacity(64 * 1024 * 1024, output_file));
+    let seen_hashes: Mutex<HashSet<[u8; 16]>> = Mutex::new(HashSet::new());
+    let total_docs = AtomicU64::new(0);
+    let total_dedup = AtomicU64::new(0);
+
+    // Global index that grows as we process projects in dependency order
+    let mut global_index = GlobalIndex::new();
+
+    // Phase 1+2 combined: For each project in dependency order, index and generate docs
+    eprintln!("\n=== Processing projects in dependency order ===");
+
+    for (rank, proj) in projects.iter().enumerate() {
+        let proj_t0 = Instant::now();
+        eprintln!("\n[{}/{}] {} ({} src, {} hdr, {} deps)",
+            rank + 1, projects.len(), proj.name,
+            proj.source_files.len(), proj.header_files.len(),
+            proj.depends_on.len());
+
+        if proj.source_files.is_empty() {
+            eprintln!("  Skipping: no source files");
+            continue;
+        }
+
+        // Read all source files in parallel - no serial bottleneck!
+        let max_file_bytes = args.max_file_bytes;
+        let file_contents: Vec<(String, String)> = proj.source_files
+            .par_iter()
+            .filter_map(|path| {
+                let content = std::fs::read_to_string(path).ok()?;
+                if content.len() < 50 || content.len() > max_file_bytes {
+                    return None;
+                }
+                let rel_path = path.strip_prefix(&proj.path)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
+                Some((rel_path, content))
+            })
+            .collect();
+
+        eprintln!("  Read {} files in {:.1}s",
+            file_contents.len(), proj_t0.elapsed().as_secs_f64());
+
+        // Index: parse all files and add to global index (parallel)
+        let index_t0 = Instant::now();
+        let local_indexes: Vec<GlobalIndex> = file_contents
+            .par_chunks(std::cmp::max(1, file_contents.len() / num_threads))
+            .map(|chunk| {
+                let mut local = GlobalIndex::new();
+                let mut parser = tree_sitter::Parser::new();
+                let lang = tree_sitter_cpp::LANGUAGE;
+                parser.set_language(&lang.into()).unwrap();
+
+                for (_path, text) in chunk {
+                    let dep_info = deps::analyze_file(&mut parser, text);
+                    for func in &dep_info.functions {
+                        local.add(&func.name, func.text.clone(), func.callees.clone());
+                    }
+                }
+                local
+            })
+            .collect();
+
+        for local in local_indexes {
+            global_index.merge(local);
+        }
+
+        eprintln!("  Indexed in {:.1}s, global: {} names, {} unique",
+            index_t0.elapsed().as_secs_f64(),
+            format_num(global_index.name_count() as u64),
+            format_num(global_index.unique_count() as u64));
+
+        // Generate cross-file documents using the global index
+        // (which now includes all previously processed dependency projects)
+        let doc_t0 = Instant::now();
+        let cross_depth = args.cross_depth;
+        let max_tokens = args.max_tokens;
+        let batch_docs: Vec<Vec<String>> = file_contents
+            .par_chunks(std::cmp::max(1, file_contents.len() / num_threads))
+            .map(|chunk| {
+                let mut parser = tree_sitter::Parser::new();
+                let lang = tree_sitter_cpp::LANGUAGE;
+                parser.set_language(&lang.into()).unwrap();
+
+                let mut docs = Vec::new();
+                for (_path, text) in chunk {
+                    let dep_info = deps::analyze_file(&mut parser, text);
+                    let file_docs = deps::build_cross_file_documents(
+                        &dep_info, &global_index, max_tokens, cross_depth,
+                    );
+                    for doc in file_docs {
+                        if estimate_tokens(&doc) > max_tokens * 2 {
+                            docs.extend(split_oversized(&doc, max_tokens));
+                        } else {
+                            docs.push(doc);
+                        }
+                    }
+                }
+                docs
+            })
+            .collect();
+
+        // Write documents with dedup
+        let mut proj_docs = 0u64;
+        {
+            let mut w = writer.lock().unwrap();
+            let mut seen = seen_hashes.lock().unwrap();
+            for docs in batch_docs {
+                for doc in docs {
+                    let hash: [u8; 16] = md5::compute(doc.as_bytes()).into();
+                    if seen.contains(&hash) {
+                        total_dedup.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    seen.insert(hash);
+                    let out = OutputRecord { text: &doc };
+                    serde_json::to_writer(&mut *w, &out).unwrap();
+                    w.write_all(b"\n").unwrap();
+                    total_docs.fetch_add(1, Ordering::Relaxed);
+                    proj_docs += 1;
+                }
+            }
+        }
+
+        let proj_time = proj_t0.elapsed().as_secs_f64();
+        eprintln!("  Generated {} docs in {:.1}s ({:.0} files/sec)",
+            format_num(proj_docs), proj_time,
+            file_contents.len() as f64 / proj_time);
+    }
+
+    writer.lock().unwrap().flush().unwrap();
+
+    let total_time = t0.elapsed().as_secs_f64();
+    let docs = total_docs.load(Ordering::Relaxed);
+    let dedup = total_dedup.load(Ordering::Relaxed);
+    let output_size = std::fs::metadata(&args.output)
+        .map(|m| m.len() as f64 / 1e9)
+        .unwrap_or(0.0);
+
+    eprintln!("\n{}", "=".repeat(60));
+    eprintln!("RESULTS (project-aware mode):");
+    eprintln!("  Projects processed: {}", projects.len());
+    eprintln!("  Source files: {}", format_num(total_src as u64));
+    eprintln!("  Documents output: {}", format_num(docs));
+    eprintln!("  Deduplicated: {}", format_num(dedup));
+    eprintln!("  Global index: {} names, {} unique, ~{:.1} GB",
+        format_num(global_index.name_count() as u64),
+        format_num(global_index.unique_count() as u64),
+        global_index.memory_bytes() as f64 / 1e9);
+    eprintln!("  Output: {} ({:.2} GB)", args.output, output_size);
+    eprintln!("  Total time: {:.1}s ({:.0} files/sec)",
+        total_time, total_src as f64 / total_time);
     eprintln!("{}", "=".repeat(60));
 }
 
