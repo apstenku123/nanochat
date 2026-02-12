@@ -64,6 +64,10 @@ fn collect_files(
 
     for entry in entries.flatten() {
         let path = entry.path();
+        // Skip symlinks to avoid infinite cycles (e.g. ceph's .qa -> ..)
+        if path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            continue;
+        }
         if path.is_dir() {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             let name_lower = name.to_lowercase();
