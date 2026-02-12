@@ -20,6 +20,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# PyTorch 2.9 checkpoint calls getattr(torch, device_type) which fails for 'xla'
+# because torch_xla doesn't register as torch.xla. Fix: register it explicitly.
+try:
+    import torch_xla
+    if not hasattr(torch, 'xla'):
+        torch.xla = torch_xla
+except ImportError:
+    pass
+
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
@@ -541,10 +550,19 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             if self.training and self.config.gradient_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(
-                    block, x, cos_sin, self.window_sizes[i], kv_cache,
-                    use_reentrant=False,
-                )
+                if idx.device.type == 'xla':
+                    # XLA-specific checkpoint that uses optimization barriers
+                    # to force the compiler to respect checkpoint boundaries.
+                    # PyTorch's checkpoint does NOT save memory on XLA.
+                    from torch_xla.utils.checkpoint import checkpoint as xla_checkpoint
+                    x = xla_checkpoint(block, x, cos_sin, self.window_sizes[i], kv_cache,
+                                       preserve_rng_state=False)
+                else:
+                    x = torch.utils.checkpoint.checkpoint(
+                        block, x, cos_sin, self.window_sizes[i], kv_cache,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
             else:
                 x = block(x, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)

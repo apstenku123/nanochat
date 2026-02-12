@@ -301,6 +301,68 @@ def fused_linear_cross_entropy_cce(
     return loss
 
 
+def fused_linear_cross_entropy_chunked(
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int = -1,
+    softcap: Optional[float] = None,
+    reduction: str = 'mean',
+    chunk_size: int = 4096,
+) -> torch.Tensor:
+    """Chunked linear + cross entropy that avoids materializing full logits.
+
+    Instead of computing all (T, V) logits at once (4GB+ for 64K tokens),
+    processes tokens in chunks of `chunk_size`. Peak logits memory is
+    (chunk_size, V) instead of (T, V).
+
+    Works on any device (CPU, CUDA, XLA/TPU).
+    """
+    if hidden_states.dim() == 3:
+        B, T, D = hidden_states.shape
+        h = hidden_states.reshape(B * T, D)
+        t = targets.reshape(B * T)
+    else:
+        h = hidden_states
+        t = targets.reshape(-1)
+        B, T = 1, h.size(0)
+
+    total_tokens = h.size(0)
+
+    if reduction == 'none':
+        # Collect per-token losses for eval (bpb computation)
+        losses = []
+        for start in range(0, total_tokens, chunk_size):
+            end = min(start + chunk_size, total_tokens)
+            logits_chunk = F.linear(h[start:end], lm_head_weight)
+            if softcap is not None:
+                logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
+            chunk_loss = F.cross_entropy(
+                logits_chunk, t[start:end], ignore_index=ignore_index, reduction='none'
+            )
+            losses.append(chunk_loss)
+        loss = torch.cat(losses, dim=0)
+        if hidden_states.dim() == 3:
+            loss = loss.view(B, T)
+        return loss
+
+    # reduction == 'mean': accumulate sum and count
+    total_loss = torch.tensor(0.0, device=h.device, dtype=torch.float32)
+    n_valid = 0
+    for start in range(0, total_tokens, chunk_size):
+        end = min(start + chunk_size, total_tokens)
+        logits_chunk = F.linear(h[start:end], lm_head_weight)
+        if softcap is not None:
+            logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
+        chunk_loss = F.cross_entropy(
+            logits_chunk, t[start:end], ignore_index=ignore_index, reduction='sum'
+        )
+        total_loss = total_loss + chunk_loss
+        n_valid += (t[start:end] != ignore_index).sum()
+
+    return total_loss / n_valid.clamp(min=1)
+
+
 def fused_linear_cross_entropy(
     hidden_states: torch.Tensor,
     lm_head_weight: torch.Tensor,
@@ -317,6 +379,12 @@ def fused_linear_cross_entropy(
     if KERNEL_BACKEND in ["liger", "triton"] and LIGER_AVAILABLE:
         return fused_linear_cross_entropy_liger(
             hidden_states, lm_head_weight, targets, ignore_index, softcap, reduction
+        )
+    # On XLA/TPU, use chunked to avoid materializing huge logits tensor
+    if hidden_states.device.type == 'xla':
+        return fused_linear_cross_entropy_chunked(
+            hidden_states, lm_head_weight, targets, ignore_index, softcap, reduction,
+            chunk_size=2048,
         )
     return fused_linear_cross_entropy_current(
         hidden_states, lm_head_weight, targets, ignore_index, softcap, reduction
