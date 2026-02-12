@@ -29,6 +29,9 @@ import json
 import os
 import sys
 import hashlib
+
+# Increase recursion limit for deeply nested ASTs (gcc-mirror, llvm-project, boost)
+sys.setrecursionlimit(50000)
 from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -499,6 +502,7 @@ def build_training_documents(
 def _parse_file_batch(args_tuple):
     """Worker function for parallel parsing. Each worker creates its own Index."""
     filepaths, compile_db, default_args, project_dir = args_tuple
+    sys.setrecursionlimit(50000)  # Set in each worker process too
     clang_index = Index.create()
     results = []
     errors = 0
@@ -510,7 +514,7 @@ def _parse_file_batch(args_tuple):
         try:
             functions = parse_translation_unit(filepath, clang_index, args, project_dir)
             results.extend(f.to_dict() for f in functions)
-        except Exception:
+        except (Exception, RecursionError):
             errors += 1
     return results, len(filepaths), errors
 
@@ -620,6 +624,8 @@ def main():
                         help='Number of parallel parse workers within each project (default: 8)')
     parser.add_argument('--libclang-path', type=str, default=None,
                         help='Path to libclang.so (auto-detected if not set)')
+    parser.add_argument('--append', action='store_true',
+                        help='Append to output file instead of overwriting')
 
     args = parser.parse_args()
 
@@ -649,7 +655,8 @@ def main():
     total_docs = 0
     seen_hashes = set()
 
-    with open(args.output, 'w') as out:
+    append_mode = getattr(args, 'append', False)
+    with open(args.output, 'a' if append_mode else 'w') as out:
         if args.workers > 1 and len(project_dirs) > 1:
             # Multi-project parallel mode
             with ProcessPoolExecutor(max_workers=args.workers) as executor:
@@ -677,16 +684,21 @@ def main():
         else:
             # Sequential mode
             for pd in project_dirs:
-                docs = process_project(pd, args.max_tokens, args.max_dep_depth,
-                                       args.parse_workers)
-                for doc in docs:
-                    doc_hash = hashlib.md5(doc.encode()).hexdigest()
-                    if doc_hash in seen_hashes:
-                        continue
-                    seen_hashes.add(doc_hash)
-                    json.dump({'text': doc}, out)
-                    out.write('\n')
-                    total_docs += 1
+                try:
+                    docs = process_project(pd, args.max_tokens, args.max_dep_depth,
+                                           args.parse_workers)
+                    for doc in docs:
+                        doc_hash = hashlib.md5(doc.encode()).hexdigest()
+                        if doc_hash in seen_hashes:
+                            continue
+                        seen_hashes.add(doc_hash)
+                        json.dump({'text': doc}, out)
+                        out.write('\n')
+                        total_docs += 1
+                    out.flush()
+                except Exception as e:
+                    print(f"ERROR processing {pd}: {e}", file=sys.stderr)
+                    print(f"  Skipping project, continuing...", file=sys.stderr)
 
     print(f"\n{'='*60}", file=sys.stderr)
     print(f"Total documents: {total_docs}", file=sys.stderr)
