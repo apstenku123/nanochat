@@ -116,6 +116,9 @@ parser.add_argument("--dsa_top_k_ratio", type=float, default=0.5, help="fraction
 parser.add_argument("--dsa_local_window", type=int, default=128, help="local window always included in sparse attention")
 parser.add_argument("--dsa_indexer_heads", type=int, default=16, help="number of lightweight indexer heads for DSA")
 parser.add_argument("--dsa_indexer_dim", type=int, default=32, help="dimension per indexer head for DSA")
+# Memory optimization
+parser.add_argument("--gradient_checkpointing", action="store_true", help="enable gradient checkpointing (saves memory, trades compute)")
+parser.add_argument("--tensor_parallel", type=int, default=1, help="tensor parallelism degree (1=data-only, 2/4/8=split model across chips)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num_iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target_flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -202,6 +205,43 @@ if args.chunked_attn:
 # -----------------------------------------------------------------------------
 
 
+def _apply_tensor_parallel_sharding(model, mesh):
+    """Apply Megatron-style tensor parallelism via SPMD weight sharding.
+
+    Shards attention Q/K/V columns and MLP columns across the 'model' axis,
+    and attention/MLP output projections as row-parallel.
+    """
+    import torch_xla.distributed.spmd as xs
+
+    n_sharded = 0
+    for name, param in model.named_parameters():
+        # Attention Q/K/V projections: column-parallel (shard output dim)
+        # Weight shape: [n_head*head_dim, n_embd] -> shard dim 0 across 'model'
+        if any(k in name for k in ('c_q.weight', 'c_k.weight', 'c_v.weight')):
+            xs.mark_sharding(param, mesh, ('model', None))
+            n_sharded += 1
+        # Attention output projection: row-parallel (shard input dim)
+        # Weight shape: [n_embd, n_embd] -> shard dim 1 across 'model'
+        elif 'attn.c_proj.weight' in name:
+            xs.mark_sharding(param, mesh, (None, 'model'))
+            n_sharded += 1
+        # MLP first layer: column-parallel (shard output dim)
+        # Weight shape: [4*n_embd, n_embd] -> shard dim 0 across 'model'
+        elif 'mlp.c_fc.weight' in name:
+            xs.mark_sharding(param, mesh, ('model', None))
+            n_sharded += 1
+        # MLP output projection: row-parallel (shard input dim)
+        # Weight shape: [n_embd, 4*n_embd] -> shard dim 1 across 'model'
+        elif 'mlp.c_proj.weight' in name:
+            xs.mark_sharding(param, mesh, (None, 'model'))
+            n_sharded += 1
+        # MTP projection: replicated (it combines hidden states, not parallelizable easily)
+        # Embedding and lm_head: replicated across model dim
+        # Everything else: replicated (default)
+
+    print0(f"Tensor parallelism: sharded {n_sharded} weight matrices across 'model' axis")
+
+
 def train():
     """Main training function. Single process for all backends (GPU DDP, TPU SPMD, CPU)."""
     print_banner()
@@ -211,10 +251,12 @@ def train():
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 
-    # ---- SPMD setup for multi-chip TPU data parallelism ----
+    # ---- SPMD setup for multi-chip TPU data + tensor parallelism ----
     # SPMD uses a single process; XLA distributes data across chips via sharding
     # annotations. This avoids the ~2s/mark_step overhead of xmp.spawn.
+    # With --tensor_parallel > 1, we use a 2D mesh: (data, model) axes.
     spmd_mesh = None
+    tp_degree = args.tensor_parallel
     if device_type == "xla":
         import torch_xla.runtime as xr
         num_devices = xr.global_runtime_device_count()
@@ -224,11 +266,20 @@ def train():
             from torch_xla.distributed.spmd import Mesh
 
             device_ids = np.arange(num_devices)
-            spmd_mesh = Mesh(device_ids, (num_devices,), ('data',))
-            # Override world_size: SPMD reports world_size=1 (single process)
-            # but we have num_devices chips for data parallelism
-            ddp_world_size = num_devices
-            print0(f"SPMD data parallelism: {num_devices} TPU devices, mesh=({num_devices},)")
+            if tp_degree > 1:
+                assert num_devices % tp_degree == 0, f"num_devices={num_devices} not divisible by tp={tp_degree}"
+                dp_degree = num_devices // tp_degree
+                spmd_mesh = Mesh(device_ids.reshape(dp_degree, tp_degree),
+                                 (dp_degree, tp_degree), ('data', 'model'))
+                ddp_world_size = dp_degree  # data-parallel world size
+                print0(f"SPMD 2D mesh: {dp_degree}-way data × {tp_degree}-way tensor parallelism, {num_devices} TPU devices")
+            else:
+                spmd_mesh = Mesh(device_ids, (num_devices,), ('data',))
+                ddp_world_size = num_devices
+                print0(f"SPMD data parallelism: {num_devices} TPU devices, mesh=({num_devices},)")
+            # Tell flash attention about SPMD mesh so it uses partition specs
+            from nanochat.flash_attention import set_spmd_mesh
+            set_spmd_mesh(spmd_mesh, tp_degree=tp_degree)
 
     # PyTorch performance optimizations
     if device_type == "cuda":
@@ -356,11 +407,16 @@ def train():
         dsa_indexer_heads=args.dsa_indexer_heads,
         dsa_indexer_dim=args.dsa_indexer_dim,
         aux_loss_weight=args.aux_loss_weight,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
     model_config = _build_gpt_config(model_config_kwargs)
     model = GPT(model_config)
     model.to(device)  # Move model to GPU before init_weights (rotary embeddings need correct device)
     model.init_weights()
+
+    # ---- Tensor parallelism: shard model weights across 'model' mesh axis ----
+    if spmd_mesh is not None and tp_degree > 1:
+        _apply_tensor_parallel_sharding(model, spmd_mesh)
 
     # When using TE precision (NVFP4/FP8), convert model to bfloat16 for proper mixed precision
     if precision_plan.use_te:

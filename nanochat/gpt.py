@@ -97,6 +97,8 @@ class GPTConfig:
     dsa_top_k_ratio: float = 0.5  # fraction of tokens to select per query
     dsa_local_window: int = 128   # local window always included
     dsa_indexer_heads: int = 16   # number of lightweight indexer heads
+    # Gradient checkpointing (saves memory by recomputing activations during backward)
+    gradient_checkpointing: bool = False
     dsa_indexer_dim: int = 32     # dimension per indexer head
     # Reserved for optional auxiliary objectives
     aux_loss_weight: float = 0.0
@@ -476,11 +478,25 @@ class GPT(nn.Module):
         matrix_params = list(self.transformer.h.parameters())
         if self.mtp is not None:
             matrix_params += list(self.mtp.parameters())
+        # On XLA/TPU, DSA indexer params are unused (DSA falls back to full attention
+        # since mask-based sparse attention is O(T^2) memory). Exclude them from Muon
+        # which crashes on None grads. They'll be excluded from all optimizer groups.
+        device_type = str(next(self.parameters()).device).split(':')[0]
+        dsa_indexer_params = set()
+        if device_type == 'xla' and self.config.dsa_enabled:
+            for block in self.transformer.h:
+                if hasattr(block.attn, 'indexer'):
+                    for p in block.attn.indexer.parameters():
+                        dsa_indexer_params.add(id(p))
+            n_excluded = len(dsa_indexer_params)
+            matrix_params = [p for p in matrix_params if id(p) not in dsa_indexer_params]
+            print0(f"DSA: excluded {n_excluded} indexer params from optimizer (unused on XLA)")
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(resid_params) + len(x0_params)
+        n_optim = len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(resid_params) + len(x0_params) + len(dsa_indexer_params)
+        assert len(list(self.parameters())) == n_optim, f"Parameter count mismatch: {len(list(self.parameters()))} != {n_optim}"
         # Create the AdamW optimizer for the embedding, lm_head, and per-layer scalars
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -493,7 +509,6 @@ class GPT(nn.Module):
         ]
         adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0) # NOTE: weight decay is hardcoded to 0.0 for AdamW, only used in Muon
         # fused=True not supported on XLA/TPU devices
-        device_type = str(next(self.parameters()).device).split(':')[0]
         use_fused = device_type != 'xla'  # fused only works on CUDA, CPU, MPS
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=use_fused)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
@@ -525,7 +540,13 @@ class GPT(nn.Module):
         x0 = x  # save initial normalized embedding for x0 residual
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            x = block(x, cos_sin, self.window_sizes[i], kv_cache)
+            if self.training and self.config.gradient_checkpointing:
+                x = torch.utils.checkpoint.checkpoint(
+                    block, x, cos_sin, self.window_sizes[i], kv_cache,
+                    use_reentrant=False,
+                )
+            else:
+                x = block(x, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
         # Softcap: smoothly cap the logits to the range [-softcap, softcap]

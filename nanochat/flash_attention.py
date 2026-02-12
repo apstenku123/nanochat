@@ -56,6 +56,8 @@ HAS_FA3 = _fa3_funcs is not None
 # =============================================================================
 _xla_flash_attn = None
 _xla_flash_enabled = False
+_spmd_mesh = None
+_spmd_partition_spec = None
 
 # =============================================================================
 # Chunked Attention (memory-efficient, pure PyTorch, works on XLA/TPU)
@@ -165,6 +167,28 @@ def enable_xla_flash_attention():
         print(f"XLA Flash Attention enabled (Pallas TPU kernels)")
     else:
         print("WARNING: XLA flash attention requested but not available, using SDPA")
+
+def set_spmd_mesh(mesh, tp_degree=1):
+    """Set SPMD mesh for flash attention partition spec.
+
+    When set, the Pallas flash attention kernel will use SPMD-aware sharding,
+    avoiding costly all-gathers of the batch dimension across TPU chips.
+
+    With tensor parallelism (tp_degree > 1), the 2D mesh has axes ('data', 'model')
+    and attention heads are sharded across the 'model' axis.
+    """
+    global _spmd_mesh, _spmd_partition_spec
+    _spmd_mesh = mesh
+    # Input format is (B, H, T, D).
+    # Use plain tuple: torch_xla's FA serializes via str() then deserializes
+    # internally, and PartitionSpec isn't in its deserialization namespace.
+    if tp_degree > 1:
+        # 2D mesh: shard batch across 'data', heads across 'model'
+        _spmd_partition_spec = ('data', 'model', None, None)
+    else:
+        # 1D mesh: shard batch across 'data' only
+        _spmd_partition_spec = ('data', None, None, None)
+    print(f"Flash attention SPMD partition: {_spmd_partition_spec}")
 
 # Print which backend is being used
 def get_backend_info():
@@ -282,7 +306,11 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         q_t = q.transpose(1, 2)
         k_t = k.transpose(1, 2)
         v_t = v.transpose(1, 2)
-        y = _xla_flash_attn(q_t, k_t, v_t, causal=causal)
+        # Pass SPMD partition_spec so XLA shards batch across chips
+        # instead of all-gathering the full batch onto each chip
+        y = _xla_flash_attn(q_t, k_t, v_t, causal=causal,
+                            partition_spec=_spmd_partition_spec,
+                            mesh=_spmd_mesh)
         return y.transpose(1, 2)  # back to (B, T, H, D)
 
     # On XLA with long sequences, use chunked attention to avoid O(n^2) memory
