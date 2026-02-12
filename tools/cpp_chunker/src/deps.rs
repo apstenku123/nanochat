@@ -52,7 +52,7 @@ pub struct FileDepInfo {
 }
 
 /// Known C/C++ standard library namespaces and common prefixes.
-const SYSTEM_PREFIXES: &[&str] = &[
+pub const SYSTEM_PREFIXES: &[&str] = &[
     "std::", "boost::", "__", "_", "operator", "printf", "fprintf", "sprintf",
     "snprintf", "scanf", "sscanf", "malloc", "calloc", "realloc", "free",
     "memcpy", "memmove", "memset", "memcmp", "strlen", "strcpy", "strcat",
@@ -69,7 +69,7 @@ const SYSTEM_PREFIXES: &[&str] = &[
 ];
 
 /// Check if a callee name looks like a system/external function.
-fn is_system_call(name: &str) -> bool {
+pub fn is_system_call(name: &str) -> bool {
     // Empty or too short
     if name.is_empty() {
         return true;
@@ -164,7 +164,7 @@ fn extract_includes(root: &Node, source: &str) -> Vec<IncludeInfo> {
 
 /// Normalize a callee name for matching against function definitions.
 /// Strips namespace qualifiers, template args, etc.
-fn normalize_name(name: &str) -> String {
+pub fn normalize_name(name: &str) -> String {
     // Strip template arguments: foo<int> -> foo
     let without_templates = if let Some(pos) = name.find('<') {
         &name[..pos]
@@ -532,6 +532,233 @@ fn build_full_file_text(dep_info: &FileDepInfo) -> String {
         }
     }
     parts.join("\n\n")
+}
+
+/// Resolve cross-file dependencies via breadth-first search.
+/// Returns (depth, function_ref) pairs. Depth 0 = directly called by local code,
+/// higher depth = transitive dependencies of cross-file functions.
+fn resolve_cross_file_deps<'a>(
+    callees: &[String],
+    local_names: &HashSet<String>,
+    global: &'a crate::global_index::GlobalIndex,
+    max_depth: usize,
+) -> Vec<(usize, &'a crate::global_index::IndexedFunction)> {
+    let mut result = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut current_level: Vec<String> = callees.to_vec();
+
+    for depth in 0..max_depth {
+        let mut next_level = Vec::new();
+
+        for callee_name in &current_level {
+            let norm = normalize_name(callee_name);
+            if local_names.contains(&norm)
+                || visited.contains(&norm)
+                || is_system_call(callee_name)
+            {
+                continue;
+            }
+
+            if let Some(func) = global.resolve(&norm) {
+                visited.insert(norm);
+                result.push((depth, func));
+                next_level.extend(func.callees.iter().cloned());
+            }
+        }
+
+        if next_level.is_empty() {
+            break;
+        }
+        current_level = next_level;
+    }
+
+    result
+}
+
+/// Build training documents with cross-file dependency resolution.
+/// Each document includes: preamble + cross-file deps (deepest/most foundational first)
+/// + local deps (leaves first) + root function.
+pub fn build_cross_file_documents(
+    dep_info: &FileDepInfo,
+    global: &crate::global_index::GlobalIndex,
+    max_tokens: usize,
+    max_cross_depth: usize,
+) -> Vec<String> {
+    let estimate_tokens = |text: &str| -> usize { std::cmp::max(1, text.len() / 4) };
+
+    if dep_info.functions.is_empty() && dep_info.classes.is_empty() {
+        if !dep_info.preamble.is_empty() && estimate_tokens(&dep_info.preamble) >= 20 {
+            return vec![dep_info.preamble.clone()];
+        }
+        return vec![];
+    }
+
+    let mut documents: Vec<String> = Vec::new();
+
+    // Local function names
+    let local_names: HashSet<String> = dep_info
+        .functions
+        .iter()
+        .map(|f| normalize_name(&f.name))
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    // Local name -> index map
+    let name_to_idx: HashMap<String, usize> = dep_info
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f.name.is_empty())
+        .map(|(i, f)| (normalize_name(&f.name), i))
+        .collect();
+
+    // Check if full file fits in max_tokens (no cross-file needed)
+    let full_text = build_full_file_text(dep_info);
+    if estimate_tokens(&full_text) <= max_tokens && !full_text.is_empty() {
+        return vec![full_text];
+    }
+
+    // For each function, build a document with local + cross-file deps
+    for (root_idx, func) in dep_info.functions.iter().enumerate() {
+        // 1. Collect local transitive deps
+        let local_deps = collect_transitive_deps(root_idx, &dep_info.functions, &name_to_idx);
+
+        // 2. Gather all callees from root + local deps for cross-file resolution
+        let mut all_callees: Vec<String> = func.callees.clone();
+        for &dep_idx in &local_deps {
+            if dep_idx != root_idx {
+                all_callees.extend(dep_info.functions[dep_idx].callees.iter().cloned());
+            }
+        }
+        all_callees.sort();
+        all_callees.dedup();
+
+        // 3. Resolve cross-file deps via BFS
+        let cross_deps =
+            resolve_cross_file_deps(&all_callees, &local_names, global, max_cross_depth);
+
+        // 4. Build document: preamble + cross-file (deepest first) + local (leaves first)
+        let mut parts: Vec<&str> = Vec::new();
+        if !dep_info.preamble.is_empty() {
+            parts.push(&dep_info.preamble);
+        }
+
+        // Cross-file deps: deepest first (most foundational)
+        let mut sorted_cross = cross_deps;
+        sorted_cross.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, cf_func) in &sorted_cross {
+            parts.push(&cf_func.text);
+        }
+
+        // Local deps: leaves first (lowest dep_level first)
+        let mut sorted_local: Vec<usize> = local_deps.into_iter().collect();
+        sorted_local.sort_by_key(|&idx| dep_info.functions[idx].dep_level);
+        for &idx in &sorted_local {
+            parts.push(&dep_info.functions[idx].text);
+        }
+
+        let doc = parts.join("\n\n");
+        let tokens = estimate_tokens(&doc);
+
+        if tokens <= max_tokens * 2 && doc.len() >= 50 {
+            documents.push(doc);
+        } else if !sorted_cross.is_empty() {
+            // Too big with cross-file deps: try progressively trimming
+            // First try removing deepest cross-file levels
+            let mut trimmed = false;
+            if sorted_cross.len() > 1 {
+                let max_cf_depth = sorted_cross.first().map(|(d, _)| *d).unwrap_or(0);
+                for trim_depth in (1..=max_cf_depth).rev() {
+                    let filtered: Vec<_> = sorted_cross
+                        .iter()
+                        .filter(|(d, _)| *d < trim_depth)
+                        .collect();
+                    let mut parts: Vec<&str> = Vec::new();
+                    if !dep_info.preamble.is_empty() {
+                        parts.push(&dep_info.preamble);
+                    }
+                    for (_, cf_func) in &filtered {
+                        parts.push(&cf_func.text);
+                    }
+                    for &idx in &sorted_local {
+                        parts.push(&dep_info.functions[idx].text);
+                    }
+                    let doc = parts.join("\n\n");
+                    if estimate_tokens(&doc) <= max_tokens * 2 && doc.len() >= 50 {
+                        documents.push(doc);
+                        trimmed = true;
+                        break;
+                    }
+                }
+            }
+
+            if !trimmed {
+                // Fall back to local-only deps
+                let mut parts: Vec<&str> = Vec::new();
+                if !dep_info.preamble.is_empty() {
+                    parts.push(&dep_info.preamble);
+                }
+                for &idx in &sorted_local {
+                    parts.push(&dep_info.functions[idx].text);
+                }
+                let doc = parts.join("\n\n");
+                if estimate_tokens(&doc) <= max_tokens * 2 && doc.len() >= 50 {
+                    documents.push(doc);
+                } else if doc.len() >= 50 {
+                    // Even local deps too big: just root + preamble
+                    let simple = if !dep_info.preamble.is_empty() {
+                        format!("{}\n\n{}", dep_info.preamble, func.text)
+                    } else {
+                        func.text.clone()
+                    };
+                    if simple.len() >= 50 {
+                        documents.push(simple);
+                    }
+                }
+            }
+        } else if doc.len() >= 50 {
+            // No cross-file deps but still too big: just root + preamble
+            let simple = if !dep_info.preamble.is_empty() {
+                format!("{}\n\n{}", dep_info.preamble, func.text)
+            } else {
+                func.text.clone()
+            };
+            if simple.len() >= 50 {
+                documents.push(simple);
+            }
+        }
+    }
+
+    // Emit classes with preamble
+    for cls in &dep_info.classes {
+        let doc = if !dep_info.preamble.is_empty() {
+            format!("{}\n\n{}", dep_info.preamble, cls.text)
+        } else {
+            cls.text.clone()
+        };
+        if estimate_tokens(&doc) <= max_tokens * 2 && doc.len() >= 50 {
+            documents.push(doc);
+        } else if doc.len() >= 50 {
+            documents.push(cls.text.clone());
+        }
+    }
+
+    // Emit level-ordered document (all functions sorted by level, local only)
+    if dep_info.functions.len() >= 2 {
+        let mut level_parts: Vec<&str> = Vec::new();
+        if !dep_info.preamble.is_empty() {
+            level_parts.push(&dep_info.preamble);
+        }
+        for &idx in &dep_info.topo_order {
+            level_parts.push(&dep_info.functions[idx].text);
+        }
+        let level_doc = level_parts.join("\n\n");
+        if estimate_tokens(&level_doc) <= max_tokens && level_doc.len() >= 50 {
+            documents.push(level_doc);
+        }
+    }
+
+    documents
 }
 
 #[cfg(test)]
