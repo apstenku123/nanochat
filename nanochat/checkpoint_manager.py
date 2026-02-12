@@ -144,16 +144,19 @@ def _download_from_gcs(local_path, gcs_bucket=None):
         return False
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
+    # Always load to CPU first (XLA doesn't support direct torch.load).
+    # Caller is responsible for moving to device (e.g. via load_state_dict with assign=False).
+    load_device = "cpu" if str(device).startswith("xla") else device
     # Load the model state (download from GCS if not available locally)
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
     _download_from_gcs(model_path)
-    model_data = torch.load(model_path, map_location=device)
+    model_data = torch.load(model_path, map_location=load_device)
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optimizer:
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
         _download_from_gcs(optimizer_path)
-        optimizer_data = torch.load(optimizer_path, map_location=device)
+        optimizer_data = torch.load(optimizer_path, map_location=load_device)
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
     _download_from_gcs(meta_path)

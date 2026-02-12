@@ -106,6 +106,16 @@ parser.add_argument("--mhc_temperature", type=float, default=1.0, help="mHC tran
 parser.add_argument("--mhc_epsilon", type=float, default=1e-6, help="mHC numerical epsilon")
 parser.add_argument("--mhc_blend_alpha", type=float, default=1.0, help="global mHC blend strength")
 parser.add_argument("--aux_loss_weight", type=float, default=0.0, help="auxiliary regularization loss weight")
+# Multi-Token Prediction (DeepSeek-V3 style)
+parser.add_argument("--mtp", action="store_true", help="enable Multi-Token Prediction (predicts token i+2)")
+parser.add_argument("--mtp_lambda", type=float, default=0.3, help="MTP loss weight (DeepSeek uses 0.3 early, 0.1 later)")
+# DeepSeek Sparse Attention (DSA)
+parser.add_argument("--dsa", action="store_true", help="enable DeepSeek Sparse Attention from dsa_start_layer to last layer")
+parser.add_argument("--dsa_start_layer", type=int, default=7, help="first layer to use sparse attention (0-indexed)")
+parser.add_argument("--dsa_top_k_ratio", type=float, default=0.5, help="fraction of tokens to attend to in sparse layers")
+parser.add_argument("--dsa_local_window", type=int, default=128, help="local window always included in sparse attention")
+parser.add_argument("--dsa_indexer_heads", type=int, default=16, help="number of lightweight indexer heads for DSA")
+parser.add_argument("--dsa_indexer_dim", type=int, default=32, help="dimension per indexer head for DSA")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num_iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target_flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -281,6 +291,12 @@ def train():
     print0(f"model_dim: {model_dim}")
     print0(f"num_heads: {num_heads}")
     print0(f"num_kv_heads: {num_kv_heads}")
+    if args.dsa:
+        assert args.dsa_start_layer < num_layers, f"dsa_start_layer ({args.dsa_start_layer}) must be < num_layers ({num_layers})"
+        dsa_layers = num_layers - args.dsa_start_layer
+        print0(f"DSA enabled: layers {args.dsa_start_layer}-{num_layers-1} ({dsa_layers} sparse layers, top_k_ratio={args.dsa_top_k_ratio})")
+    if args.mtp:
+        print0(f"MTP enabled: lambda={args.mtp_lambda}")
 
     # Optimizer / data / training length related hyperparameters
     # figure out the needed gradient accumulation to reach the desired total batch size
@@ -331,6 +347,14 @@ def train():
         mhc_temperature=args.mhc_temperature,
         mhc_epsilon=args.mhc_epsilon,
         mhc_blend_alpha=args.mhc_blend_alpha,
+        mtp_enabled=args.mtp,
+        mtp_lambda=args.mtp_lambda,
+        dsa_enabled=args.dsa,
+        dsa_start_layer=args.dsa_start_layer,
+        dsa_top_k_ratio=args.dsa_top_k_ratio,
+        dsa_local_window=args.dsa_local_window,
+        dsa_indexer_heads=args.dsa_indexer_heads,
+        dsa_indexer_dim=args.dsa_indexer_dim,
         aux_loss_weight=args.aux_loss_weight,
     )
     model_config = _build_gpt_config(model_config_kwargs)
@@ -359,7 +383,16 @@ def train():
     if resuming:
         print0(f"Resuming optimization from step {args.resume_from_step}")
         model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-        model.load_state_dict(model_data, strict=True, assign=True)
+        # When adding MTP/DSA to an existing model, checkpoint won't have those keys.
+        # Use strict=False and report which new params were initialized from scratch.
+        # On XLA, checkpoint is loaded to CPU; use assign=False to copy into existing XLA params
+        # (assign=True would replace XLA params with CPU tensors).
+        use_assign = device_type != "xla"
+        missing, unexpected = model.load_state_dict(model_data, strict=False, assign=use_assign)
+        if missing:
+            print0(f"New parameters initialized from scratch ({len(missing)} tensors): {', '.join(missing[:10])}{'...' if len(missing) > 10 else ''}")
+        if unexpected:
+            print0(f"WARNING: unexpected keys in checkpoint ({len(unexpected)} tensors): {', '.join(unexpected[:10])}")
         del model_data # free up this memory after the copy
 
     # -----------------------------------------------------------------------------
@@ -503,6 +536,13 @@ def train():
 
     if resuming:
         for opt, dat in zip(optimizers, optimizer_data):
+            if device_type == "xla":
+                # On XLA, checkpoint was loaded to CPU. Move optimizer state tensors
+                # to XLA one parameter at a time to avoid doubling HBM usage.
+                for param_state in dat.get("state", {}).values():
+                    for k, v in param_state.items():
+                        if isinstance(v, torch.Tensor):
+                            param_state[k] = v.to(device)
             opt.load_state_dict(dat)
         del optimizer_data # free up the memory
 
