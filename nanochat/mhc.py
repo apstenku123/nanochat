@@ -63,21 +63,15 @@ class ManifoldBranchMixer(nn.Module):
         raw_matrix = (logits.unsqueeze(-1) + logits.unsqueeze(-2)) / temperature
         transport = self._sinkhorn(raw_matrix.float())
 
-        if not torch.isfinite(transport).all():
-            if not self._warned_fallback:
-                print0("ManifoldBranchMixer: Sinkhorn instability detected, falling back to uniform branch mixing.")
-                self._warned_fallback = True
-            n_branches = stacked.size(2)
-            weights = torch.full(
-                (stacked.size(0), n_branches),
-                1.0 / n_branches,
-                device=stacked.device,
-                dtype=stacked.dtype,
-            )
-        else:
-            weights = transport.mean(dim=1)
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + self.epsilon)
-            weights = weights.to(dtype=stacked.dtype)
+        # Compute weights from transport matrix, using torch.where for NaN/Inf
+        # fallback instead of data-dependent Python `if` (which forces host-device
+        # sync on XLA/TPU, causing 37x slowdown).
+        weights = transport.mean(dim=1)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + self.epsilon)
+        n_branches = stacked.size(2)
+        uniform = torch.full_like(weights, 1.0 / n_branches)
+        is_valid = torch.isfinite(weights).all(dim=-1, keepdim=True)
+        weights = torch.where(is_valid, weights, uniform).to(dtype=stacked.dtype)
 
         mixed = (stacked * weights[:, None, :, None]).sum(dim=2)
         alpha = min(max(self.blend_alpha, 0.0), 1.0)
