@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 mod chunker;
+mod compilable;
 mod deps;
 mod global_index;
 mod project_graph;
@@ -66,6 +67,12 @@ struct Args {
     /// Very large files (auto-generated code) can stall tree-sitter parsing.
     #[arg(long, default_value = "500000")]
     max_file_bytes: usize,
+
+    /// Generate near-compilable C++ chunks with proper ordering:
+    /// preamble → type definitions (topo order) → functions (bottom-up).
+    /// Use with --project_dirs for best results.
+    #[arg(long, default_value = "false")]
+    compilable: bool,
 }
 
 #[derive(Deserialize)]
@@ -586,7 +593,7 @@ fn run_cross_file_mode(args: &Args, num_threads: usize) {
                 let batch_docs: Vec<Vec<String>> = batch
                     .par_chunks(chunk_size)
                     .map(|sub_batch| {
-                        process_batch_cross_file(sub_batch, max_tokens, &global_index, cross_depth, max_file_bytes)
+                        process_batch_cross_file(sub_batch, max_tokens, &global_index, cross_depth, max_file_bytes, args.compilable)
                     })
                     .collect();
 
@@ -635,7 +642,7 @@ fn run_cross_file_mode(args: &Args, num_threads: usize) {
             let batch_docs: Vec<Vec<String>> = batch
                 .par_chunks(chunk_size)
                 .map(|sub_batch| {
-                    process_batch_cross_file(sub_batch, max_tokens, &global_index, cross_depth, max_file_bytes)
+                    process_batch_cross_file(sub_batch, max_tokens, &global_index, cross_depth, max_file_bytes, args.compilable)
                 })
                 .collect();
 
@@ -783,11 +790,12 @@ fn run_project_mode(args: &Args, projects_dir: &str, num_threads: usize) {
             format_num(global_index.name_count() as u64),
             format_num(global_index.unique_count() as u64));
 
-        // Generate cross-file documents using the global index
+        // Generate documents using the global index
         // (which now includes all previously processed dependency projects)
         let doc_t0 = Instant::now();
         let cross_depth = args.cross_depth;
         let max_tokens = args.max_tokens;
+        let use_compilable = args.compilable;
         let batch_docs: Vec<Vec<String>> = file_contents
             .par_chunks(std::cmp::max(1, file_contents.len() / num_threads))
             .map(|chunk| {
@@ -798,9 +806,15 @@ fn run_project_mode(args: &Args, projects_dir: &str, num_threads: usize) {
                 let mut docs = Vec::new();
                 for (_path, text) in chunk {
                     let dep_info = deps::analyze_file(&mut parser, text);
-                    let file_docs = deps::build_cross_file_documents(
-                        &dep_info, &global_index, max_tokens, cross_depth,
-                    );
+                    let file_docs = if use_compilable {
+                        compilable::build_compilable_documents(
+                            &dep_info, &global_index, max_tokens, cross_depth,
+                        )
+                    } else {
+                        deps::build_cross_file_documents(
+                            &dep_info, &global_index, max_tokens, cross_depth,
+                        )
+                    };
                     for doc in file_docs {
                         if estimate_tokens(&doc) > max_tokens * 2 {
                             docs.extend(split_oversized(&doc, max_tokens));
@@ -1007,6 +1021,7 @@ fn process_batch_cross_file(
     global: &GlobalIndex,
     cross_depth: usize,
     max_file_bytes: usize,
+    use_compilable: bool,
 ) -> Vec<String> {
     let mut parser = tree_sitter::Parser::new();
     let lang = tree_sitter_cpp::LANGUAGE;
@@ -1022,7 +1037,11 @@ fn process_batch_cross_file(
         }
 
         let dep_info = deps::analyze_file(&mut parser, text);
-        let docs = deps::build_cross_file_documents(&dep_info, global, max_tokens, cross_depth);
+        let docs = if use_compilable {
+            compilable::build_compilable_documents(&dep_info, global, max_tokens, cross_depth)
+        } else {
+            deps::build_cross_file_documents(&dep_info, global, max_tokens, cross_depth)
+        };
 
         for doc in docs {
             if estimate_tokens(&doc) > max_tokens * 2 {

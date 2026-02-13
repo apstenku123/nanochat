@@ -490,7 +490,7 @@ pub fn build_dep_aware_documents(
 }
 
 /// Collect transitive local dependencies for a function (BFS).
-fn collect_transitive_deps(
+pub fn collect_transitive_deps(
     root_idx: usize,
     functions: &[FunctionInfo],
     name_to_idx: &HashMap<String, usize>,
@@ -537,7 +537,7 @@ fn build_full_file_text(dep_info: &FileDepInfo) -> String {
 /// Resolve cross-file dependencies via breadth-first search.
 /// Returns (depth, function_ref) pairs. Depth 0 = directly called by local code,
 /// higher depth = transitive dependencies of cross-file functions.
-fn resolve_cross_file_deps<'a>(
+pub fn resolve_cross_file_deps<'a>(
     callees: &[String],
     local_names: &HashSet<String>,
     global: &'a crate::global_index::GlobalIndex,
