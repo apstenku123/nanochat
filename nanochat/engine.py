@@ -80,6 +80,31 @@ def use_calculator(expr):
     return eval_with_timeout(expr)
 
 # -----------------------------------------------------------------------------
+class MambaInferenceParams:
+    """Lightweight container for Mamba layer inference state.
+    Stores per-layer conv_state and ssm_state keyed by layer_idx."""
+    def __init__(self):
+        self.key_value_memory_dict = {}
+
+    def deep_copy_to(self, batch_size):
+        """Create a batch-expanded copy for decode after batch=1 prefill."""
+        new = MambaInferenceParams()
+        for key, val in self.key_value_memory_dict.items():
+            if isinstance(val, dict):
+                new_dict = {}
+                for k, v in val.items():
+                    if isinstance(v, torch.Tensor):
+                        new_dict[k] = v.expand(batch_size, *v.shape[1:]).clone()
+                    else:
+                        new_dict[k] = v
+                new.key_value_memory_dict[key] = new_dict
+            elif isinstance(val, torch.Tensor):
+                new.key_value_memory_dict[key] = val.expand(batch_size, *val.shape[1:]).clone()
+            else:
+                new.key_value_memory_dict[key] = val
+        return new
+
+
 class KVCache:
     """
     KV Cache designed for Flash Attention 3's flash_attn_with_kvcache API.
@@ -90,7 +115,7 @@ class KVCache:
     - Position tracked per batch element via cache_seqlens tensor
     """
 
-    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype=torch.bfloat16):
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype=torch.bfloat16, has_mamba=False):
         self.batch_size = batch_size
         self.max_seq_len = seq_len
         self.n_layers = num_layers
@@ -101,10 +126,14 @@ class KVCache:
         self.v_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
         # Current sequence length per batch element (FA3 needs int32)
         self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        # Mamba state (conv_state + ssm_state per layer)
+        self.mamba_params = MambaInferenceParams() if has_mamba else None
 
     def reset(self):
         """Reset cache to empty state."""
         self.cache_seqlens.zero_()
+        if self.mamba_params is not None:
+            self.mamba_params.key_value_memory_dict.clear()
 
     def get_pos(self):
         """Get current position (assumes all batch elements at same position)."""
@@ -130,6 +159,9 @@ class KVCache:
         self.k_cache[:, :, :other_pos, :, :] = other.k_cache[:, :, :other_pos, :, :]
         self.v_cache[:, :, :other_pos, :, :] = other.v_cache[:, :, :other_pos, :, :]
         self.cache_seqlens.fill_(other_pos)
+        # Copy Mamba state with batch expansion
+        if other.mamba_params is not None and self.mamba_params is not None:
+            self.mamba_params = other.mamba_params.deep_copy_to(self.batch_size)
 
 # -----------------------------------------------------------------------------
 @no_grad_or_inference_mode()
@@ -207,7 +239,8 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        has_mamba = getattr(m, 'mamba_enabled', False)
+        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer, "has_mamba": has_mamba}
         kv_cache_prefill = KVCache(
             batch_size=1,
             seq_len=len(tokens),

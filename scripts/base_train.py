@@ -116,6 +116,19 @@ parser.add_argument("--dsa_top_k_ratio", type=float, default=0.5, help="fraction
 parser.add_argument("--dsa_local_window", type=int, default=128, help="local window always included in sparse attention")
 parser.add_argument("--dsa_indexer_heads", type=int, default=16, help="number of lightweight indexer heads for DSA")
 parser.add_argument("--dsa_indexer_dim", type=int, default=32, help="dimension per indexer head for DSA")
+# Mamba-2/3 hybrid layers
+parser.add_argument("--mamba", action="store_true", help="enable Mamba-2 hybrid layers (pattern controls which layers)")
+parser.add_argument("--mamba_pattern", type=str, default="AAM", help="layer pattern: A=attention, M=mamba, tiled across layers (e.g. AAM, AM, M)")
+parser.add_argument("--mamba_d_state", type=int, default=64, help="SSM state dimension")
+parser.add_argument("--mamba_d_conv", type=int, default=4, help="depthwise conv kernel width")
+parser.add_argument("--mamba_expand", type=int, default=2, help="expansion factor (d_inner = expand * n_embd)")
+parser.add_argument("--mamba_headdim", type=int, default=128, help="head dimension for SSD")
+parser.add_argument("--mamba_ngroups", type=int, default=1, help="number of groups for B/C (GQA-like)")
+parser.add_argument("--mamba_chunk_size", type=int, default=256, help="chunk size for SSD scan")
+parser.add_argument("--mamba3_qknorm", action="store_true", help="Mamba-3 Phase 2: QK-norm on B/C")
+parser.add_argument("--mamba3_bias", action="store_true", help="Mamba-3 Phase 2: learnable B/C bias")
+parser.add_argument("--mamba3_complex_rope", action="store_true", help="Mamba-3 Phase 2: complex RoPE on B/C")
+parser.add_argument("--mamba3_trapezoidal", action="store_true", help="Mamba-3 Phase 3: trapezoidal discretization")
 # Memory optimization
 parser.add_argument("--gradient_checkpointing", action="store_true", help="enable gradient checkpointing (saves memory, trades compute)")
 parser.add_argument("--tensor_parallel", type=int, default=1, help="tensor parallelism degree (1=data-only, 2/4/8=split model across chips)")
@@ -408,6 +421,18 @@ def train():
         dsa_indexer_dim=args.dsa_indexer_dim,
         aux_loss_weight=args.aux_loss_weight,
         gradient_checkpointing=args.gradient_checkpointing,
+        mamba_enabled=args.mamba,
+        mamba_pattern=args.mamba_pattern,
+        mamba_d_state=args.mamba_d_state,
+        mamba_d_conv=args.mamba_d_conv,
+        mamba_expand=args.mamba_expand,
+        mamba_headdim=args.mamba_headdim,
+        mamba_ngroups=args.mamba_ngroups,
+        mamba_chunk_size=args.mamba_chunk_size,
+        mamba3_qknorm=args.mamba3_qknorm,
+        mamba3_bias=args.mamba3_bias,
+        mamba3_complex_rope=args.mamba3_complex_rope,
+        mamba3_trapezoidal=args.mamba3_trapezoidal,
     )
     model_config = _build_gpt_config(model_config_kwargs)
     model = GPT(model_config)

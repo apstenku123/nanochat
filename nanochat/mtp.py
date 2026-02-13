@@ -46,6 +46,7 @@ class MTPModule(nn.Module):
             engram_enabled=False,
             mhc_enabled=False,
             dsa_enabled=False,
+            mamba_enabled=False,
         )
         self.block = Block(plain_config, layer_idx=0, engram_layers=set())
 
@@ -73,8 +74,9 @@ class MTPModule(nn.Module):
         # T-1 may not satisfy this (e.g. 65536-1=65535). Truncate to nearest
         # multiple of 1024 so FA backward pass works. This drops at most 1023
         # tokens from the end of the MTP sequence, which is negligible.
+        # Only apply when T_mtp >= 1024 (skip for tiny test models / non-XLA).
         fa_block = 1024
-        if T_mtp % fa_block != 0:
+        if T_mtp >= fa_block and T_mtp % fa_block != 0:
             T_mtp = (T_mtp // fa_block) * fa_block
 
         h = hidden_states[:, :T_mtp]  # (B, T_mtp, C)

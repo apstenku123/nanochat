@@ -13,6 +13,7 @@ Notable features:
 - Apple Cut Cross Entropy (CCE) for memory-efficient loss computation
 """
 
+import math
 from functools import partial
 from dataclasses import dataclass
 
@@ -111,6 +112,26 @@ class GPTConfig:
     dsa_indexer_dim: int = 32     # dimension per indexer head
     # Reserved for optional auxiliary objectives
     aux_loss_weight: float = 0.0
+    # Mamba-2 hybrid layers
+    mamba_enabled: bool = False
+    mamba_pattern: str = ""            # A=attention, M=mamba, tiled across layers. Empty=all attention.
+    mamba_d_state: int = 64            # SSM state dimension
+    mamba_d_conv: int = 4              # depthwise conv kernel width
+    mamba_expand: int = 2              # expansion factor (d_inner = expand * n_embd)
+    mamba_headdim: int = 128           # head dimension for SSD
+    mamba_ngroups: int = 1             # number of groups for B/C (GQA-like)
+    mamba_chunk_size: int = 256        # chunk size for SSD scan
+    # Mamba-3 upgrades (Phase 2, all default off)
+    mamba3_qknorm: bool = False        # QK-norm on B/C
+    mamba3_bias: bool = False          # learnable B/C bias
+    mamba3_complex_rope: bool = False  # complex RoPE on B/C
+    # Mamba-3 Phase 3
+    mamba3_trapezoidal: bool = False   # trapezoidal discretization
+    # Attention window sizing (0 = use sequence_len)
+    window_long: int = 0
+    window_short: int = 0
+    # RoPE
+    rope_theta: float = 10000.0
 
 
 def _parse_csv_ints(value: str) -> list[int]:
@@ -194,10 +215,6 @@ class CausalSelfAttention(nn.Module):
                 causal=True,
                 window_size=window_size,
             )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
-
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
@@ -220,9 +237,17 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx, engram_layers):
         super().__init__()
-        # Use DSA for layers >= dsa_start_layer when enabled
-        use_dsa = bool(config.dsa_enabled) and layer_idx >= config.dsa_start_layer
-        if use_dsa:
+        # Determine layer type: Mamba > DSA > CSA (mutually exclusive priority)
+        m_pattern = getattr(config, 'mamba_pattern', '').upper()
+        if getattr(config, 'mamba_enabled', False) and not m_pattern:
+            m_pattern = "AAM"
+        self.is_mamba = bool(m_pattern) and m_pattern[layer_idx % len(m_pattern)] == 'M'
+        use_dsa = bool(getattr(config, 'dsa_enabled', False)) and layer_idx >= getattr(config, 'dsa_start_layer', 7)
+
+        if self.is_mamba:
+            from nanochat.mamba2 import Mamba2Layer
+            self.attn = Mamba2Layer(config, layer_idx)
+        elif use_dsa:
             self.attn = DeepSeekSparseAttention(
                 config, layer_idx,
                 dsa_top_k_ratio=config.dsa_top_k_ratio,
@@ -344,25 +369,43 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            # 1. Init sequence mixer (Mamba or Attention)
+            if getattr(block, "is_mamba", False):
+                torch.nn.init.uniform_(block.attn.in_proj.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.out_proj.weight)
+                # Meta-init safety: re-init per-head params that were set in constructor
+                with torch.no_grad():
+                    A = torch.empty(block.attn.nheads, device=block.attn.A_log.device).uniform_(1, 16)
+                    block.attn.A_log.data.copy_(torch.log(A))
+                    dt = torch.exp(torch.rand(block.attn.nheads, device=block.attn.dt_bias.device)
+                                   * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clamp(min=0.001)
+                    block.attn.dt_bias.data.copy_(dt + torch.log(-torch.expm1(-dt)))
+                    block.attn.D.data.fill_(1.0)
+                    if hasattr(block.attn, 'B_bias') and block.attn.B_bias is not None:
+                        block.attn.B_bias.data.zero_()
+                        block.attn.C_bias.data.zero_()
+            else:
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight)
+            # 2. Init MLP (always)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            # 3. Engram
             if block.engram is not None:
                 torch.nn.init.uniform_(block.engram.in_proj.weight, -s, s)
                 for mix in block.engram.order_mix:
                     torch.nn.init.uniform_(mix.weight, -s, s)
                 torch.nn.init.zeros_(block.engram.out_proj.weight)
+            # 4. mHC
             if block.mhc is not None:
                 torch.nn.init.uniform_(block.mhc.score_proj.weight, -s, s)
                 torch.nn.init.zeros_(block.mhc.score_out.weight)
-            # DSA: initialize indexer projections
-            if isinstance(block.attn, DeepSeekSparseAttention):
+            # 5. DSA indexer (additional, not replacement for c_q/c_k/c_v/c_proj)
+            if type(block.attn).__name__ == "DeepSeekSparseAttention":
                 torch.nn.init.uniform_(block.attn.indexer.q_proj.weight, -s, s)
                 torch.nn.init.uniform_(block.attn.indexer.k_proj.weight, -s, s)
-                # Small random init for w_proj so importance scores vary (enables gradient flow)
                 torch.nn.init.uniform_(block.attn.indexer.w_proj.weight, -s * 0.1, s * 0.1)
 
         # MTP module initialization
@@ -381,9 +424,10 @@ class GPT(nn.Module):
             self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
             self.x0_lambdas.fill_(0.0)      # 0.0 => skip connection to input is disabled at init
 
-        # Rotary embeddings
+        # Rotary embeddings (use configurable rope_theta for long-context support)
         head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        rope_theta = float(getattr(self.config, 'rope_theta', 10000.0))
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim, base=rope_theta)
         self.cos, self.sin = cos, sin
 
         # Cast entire model to bf16 for optimal performance with CCE
@@ -412,29 +456,42 @@ class GPT(nn.Module):
         """
         Compute per-layer window sizes for sliding window attention.
 
-        Returns list of (left, right) tuples for FA3's window_size parameter:
+        Returns list of (left, right) tuples for FA3's window_size parameter, or None for Mamba layers:
         - left: how many tokens before current position to attend to (-1 = unlimited)
         - right: how many tokens after current position to attend to (0 for causal)
+        - None: Mamba layer (ignores window_size)
 
-        Pattern string is tiled across layers. Final layer always gets L (full context).
+        Pattern string is tiled across layers. Last *attention* layer always gets L (full context).
         Characters: L=long (full context), S=short (half context)
         """
         pattern = config.window_pattern.upper()
         assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
-        # Map characters to window sizes
-        long_window = config.sequence_len
-        short_window = long_window // 2
+
+        # Determine Mamba layer pattern
+        m_pattern = getattr(config, 'mamba_pattern', '').upper()
+        if getattr(config, 'mamba_enabled', False) and not m_pattern:
+            m_pattern = "AAM"
+
+        # Window sizes: use dedicated fields if set, else derive from sequence_len
+        long_window = getattr(config, 'window_long', 0) or config.sequence_len
+        short_window = getattr(config, 'window_short', 0) or (long_window // 2)
         char_to_window = {
             "L": (long_window, 0),
             "S": (short_window, 0),
         }
-        # Tile pattern across layers
+        # Tile pattern across layers, with None for Mamba layers
         window_sizes = []
         for layer_idx in range(config.n_layer):
-            char = pattern[layer_idx % len(pattern)]
-            window_sizes.append(char_to_window[char])
-        # Final layer always gets full context
-        window_sizes[-1] = (long_window, 0)
+            if m_pattern and m_pattern[layer_idx % len(m_pattern)] == 'M':
+                window_sizes.append(None)  # Mamba layers ignore window_size
+            else:
+                char = pattern[layer_idx % len(pattern)]
+                window_sizes.append(char_to_window[char])
+        # Last attention layer always gets full context
+        if window_sizes[-1] is None:
+            print0(f"WARNING: Last layer ({config.n_layer-1}) is Mamba. Consider a pattern ending in 'A'.")
+        else:
+            window_sizes[-1] = (long_window, 0)
         return window_sizes
 
     def get_device(self):
@@ -459,6 +516,17 @@ class GPT(nn.Module):
         # Sum attention FLOPs per layer, accounting for sliding window and DSA
         attn_flops = 0
         for i, window_size in enumerate(self.window_sizes):
+            if window_size is None:
+                # Mamba layer: SSD chunked scan FLOPs per token (fwd+bwd = 3x fwd)
+                d_inner = getattr(self.config, 'mamba_expand', 2) * self.config.n_embd
+                d_state = getattr(self.config, 'mamba_d_state', 64)
+                headdim = getattr(self.config, 'mamba_headdim', 128)
+                chunk_size = getattr(self.config, 'mamba_chunk_size', 256)
+                nheads_m = d_inner // headdim
+                attn_flops += 6 * chunk_size * nheads_m * d_state   # CB contraction
+                attn_flops += 6 * chunk_size * nheads_m * headdim   # y_local matmul
+                attn_flops += 12 * nheads_m * d_state * headdim     # cross-chunk
+                continue
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             # DSA layers attend to fewer tokens (top_k_ratio fraction)
@@ -483,49 +551,61 @@ class GPT(nn.Module):
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into groups (matrix, embedding, lm_head, resid_lambdas, x0_lambdas, [mtp])
-        matrix_params = list(self.transformer.h.parameters())
-        if self.mtp is not None:
-            matrix_params += list(self.mtp.parameters())
+        # Route parameters: Muon gets 2D matrix weights only; AdamW gets everything else.
+        # Mamba introduces non-2D params (conv1d.weight=3D, A_log/dt_bias/D=1D, B_bias/C_bias=2D bias)
+        # that would crash Muon's Newton-Schulz orthogonalization.
+        matrix_params = []
+        mamba_adam_params = []  # non-2D params + 2D bias params → AdamW
+        wte_params = []
+        lm_head_params = []
+        resid_params = [self.resid_lambdas]
+        x0_params = [self.x0_lambdas]
         # On XLA/TPU, DSA indexer params are unused (DSA falls back to full attention
-        # since mask-based sparse attention is O(T^2) memory). Exclude them from Muon
-        # which crashes on None grads. They'll be excluded from all optimizer groups.
+        # since mask-based sparse attention is O(T^2) memory). Exclude them from all optimizers.
         device_type = str(next(self.parameters()).device).split(':')[0]
-        dsa_indexer_params = set()
+        dsa_indexer_params_list = []
         if device_type == 'xla' and self.config.dsa_enabled:
             for block in self.transformer.h:
                 if hasattr(block.attn, 'indexer'):
-                    for p in block.attn.indexer.parameters():
-                        dsa_indexer_params.add(id(p))
-            n_excluded = len(dsa_indexer_params)
-            matrix_params = [p for p in matrix_params if id(p) not in dsa_indexer_params]
-            print0(f"DSA: excluded {n_excluded} indexer params from optimizer (unused on XLA)")
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        n_optim = len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(resid_params) + len(x0_params) + len(dsa_indexer_params)
+                    dsa_indexer_params_list.extend(list(block.attn.indexer.parameters()))
+            if dsa_indexer_params_list:
+                print0(f"DSA: excluded {len(dsa_indexer_params_list)} indexer params from optimizer (unused on XLA)")
+        dsa_ids = {id(p) for p in dsa_indexer_params_list}
+        for name, p in self.named_parameters():
+            if id(p) in dsa_ids or id(p) == id(self.resid_lambdas) or id(p) == id(self.x0_lambdas):
+                continue
+            if "wte" in name:
+                wte_params.append(p)
+            elif "lm_head" in name:
+                lm_head_params.append(p)
+            elif p.ndim != 2 or name.endswith('.bias') or name.endswith('_bias'):
+                mamba_adam_params.append(p)
+            else:
+                matrix_params.append(p)
+        n_optim = len(matrix_params) + len(mamba_adam_params) + len(wte_params) + len(lm_head_params) + len(resid_params) + len(x0_params) + len(dsa_indexer_params_list)
         assert len(list(self.parameters())) == n_optim, f"Parameter count mismatch: {len(list(self.parameters()))} != {n_optim}"
-        # Create the AdamW optimizer for the embedding, lm_head, and per-layer scalars
+        # Create the AdamW optimizer for the embedding, lm_head, per-layer scalars, and Mamba non-matrix params
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
         adam_groups = [
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
-            dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
+            dict(params=wte_params, lr=embedding_lr * dmodel_lr_scale),
             dict(params=resid_params, lr=scalar_lr * 0.01), # these are a lot more sensitive because they accumulate in the residual stream
             dict(params=x0_params, lr=scalar_lr),
         ]
+        if mamba_adam_params:
+            adam_groups.append(dict(params=mamba_adam_params, lr=embedding_lr * dmodel_lr_scale))
         adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0) # NOTE: weight decay is hardcoded to 0.0 for AdamW, only used in Muon
         # fused=True not supported on XLA/TPU devices
         use_fused = device_type != 'xla'  # fused only works on CUDA, CPU, MPS
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=use_fused)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
-        # Create the Muon optimizer for the linear layers
+        # Create the Muon optimizer for 2D matrix weights only (no LR scaling for Muon)
         muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
         MuonFactory = DistMuon if ddp else Muon
         muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
-        # Combine them the two optimizers into one list
+        # Combine the two optimizers into one list
         optimizers = [adamw_optimizer, muon_optimizer]
         for opt in optimizers:
             for group in opt.param_groups:
@@ -565,6 +645,13 @@ class GPT(nn.Module):
                     )
             else:
                 x = block(x, cos_sin, self.window_sizes[i], kv_cache)
+
+        # Advance KV cache position ONCE after all layers, regardless of layer type.
+        # Previously this was inside CausalSelfAttention/DSA per-layer, which broke
+        # when the last layer was Mamba (advance never fired). See Bug #2 in design log.
+        if kv_cache is not None:
+            kv_cache.advance(T)
+
         x = norm(x)
 
         # Softcap: smoothly cap the logits to the range [-softcap, softcap]
