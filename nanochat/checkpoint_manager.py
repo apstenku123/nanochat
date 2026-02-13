@@ -52,6 +52,7 @@ def _patch_missing_config_keys(model_config_kwargs):
     model_config_kwargs.setdefault("mamba3_bias", False)
     model_config_kwargs.setdefault("mamba3_complex_rope", False)
     model_config_kwargs.setdefault("mamba3_trapezoidal", False)
+    model_config_kwargs.setdefault("mamba_xla_scan", False)
     # Attention window decoupling + RoPE
     model_config_kwargs.setdefault("window_long", 0)
     model_config_kwargs.setdefault("window_short", 0)

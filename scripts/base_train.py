@@ -129,6 +129,10 @@ parser.add_argument("--mamba3_qknorm", action="store_true", help="Mamba-3 Phase 
 parser.add_argument("--mamba3_bias", action="store_true", help="Mamba-3 Phase 2: learnable B/C bias")
 parser.add_argument("--mamba3_complex_rope", action="store_true", help="Mamba-3 Phase 2: complex RoPE on B/C")
 parser.add_argument("--mamba3_trapezoidal", action="store_true", help="Mamba-3 Phase 3: trapezoidal discretization")
+parser.add_argument("--mamba_xla_scan", action="store_true", help="use XLA scan backend for Mamba on TPU")
+parser.add_argument("--rope_theta", type=float, default=10000.0, help="RoPE base theta for attention and Mamba complex RoPE")
+parser.add_argument("--window_long", type=int, default=0, help="long attention window override (0 -> sequence_len)")
+parser.add_argument("--window_short", type=int, default=0, help="short attention window override (0 -> window_long//2)")
 # Memory optimization
 parser.add_argument("--gradient_checkpointing", action="store_true", help="enable gradient checkpointing (saves memory, trades compute)")
 parser.add_argument("--tensor_parallel", type=int, default=1, help="tensor parallelism degree (1=data-only, 2/4/8=split model across chips)")
@@ -433,6 +437,10 @@ def train():
         mamba3_bias=args.mamba3_bias,
         mamba3_complex_rope=args.mamba3_complex_rope,
         mamba3_trapezoidal=args.mamba3_trapezoidal,
+        mamba_xla_scan=args.mamba_xla_scan,
+        rope_theta=args.rope_theta,
+        window_long=args.window_long,
+        window_short=args.window_short,
     )
     model_config = _build_gpt_config(model_config_kwargs)
     model = GPT(model_config)

@@ -109,21 +109,25 @@ class Mamba2Layer(nn.Module):
     # -------------------------------------------------------------------------
     # Phase 2: Complex RoPE on B/C
     # -------------------------------------------------------------------------
-    def _apply_complex_rope(self, tensor, dt_soft, inference_params=None):
+    def _compute_rope_angles(self, dt_soft, N, inference_params=None):
         """
-        Rotate B or C using cumulative dt-based angles (Mamba-3 Proposition 4).
-        tensor: (B, L, G, N) where N = d_state
-        dt_soft: (B, L, H) after softplus
+        Compute complex RoPE angles from cumulative dt, updating stored state once.
+
+        Returns angles: (B, L, G, N//2) ready for rotation.
+        Must be called ONCE per step, then passed to _rotate_with_rope for both B and C.
+        This avoids the double-increment bug where calling per-tensor mutates state twice.
         """
-        B_sz, L, G, N = tensor.shape
+        B_sz = dt_soft.shape[0]
+        L = dt_soft.shape[1]
+        G = self.ngroups
         # Average dt across heads within each group
         dt_avg = dt_soft.view(B_sz, L, G, self.heads_per_group).mean(dim=-1)  # (B, L, G)
 
         if inference_params is not None and L == 1:
-            # Decode: accumulate angle from previous steps
+            # Decode: accumulate angle from previous steps (ONE increment per step)
             key = f"rope_angle_{self.layer_idx}"
             rope_angle = inference_params.key_value_memory_dict.setdefault(
-                key, torch.zeros(B_sz, G, device=tensor.device, dtype=tensor.dtype)
+                key, torch.zeros(B_sz, G, device=dt_soft.device, dtype=dt_soft.dtype)
             )
             rope_angle = rope_angle + dt_avg.squeeze(1)
             inference_params.key_value_memory_dict[key] = rope_angle
@@ -137,9 +141,58 @@ class Mamba2Layer(nn.Module):
                 key = f"rope_angle_{self.layer_idx}"
                 inference_params.key_value_memory_dict[key] = cumsum_dt[:, -1]
 
+        return angles
+
+    def _rotate_with_rope(self, tensor, angles):
+        """
+        Apply pre-computed complex RoPE rotation to a (B, L, G, N) tensor.
+        Pure function — no state mutation.
+        """
+        N = tensor.shape[-1]
         x1, x2 = tensor[..., :N // 2], tensor[..., N // 2:]
         cos, sin = torch.cos(angles), torch.sin(angles)
         return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+    # -------------------------------------------------------------------------
+    # Unified scan backend dispatch
+    # -------------------------------------------------------------------------
+    def _run_scan(self, x, dt, A, B, C, D=None, return_final_states=False):
+        """Route to best available SSD scan backend.
+
+        Returns (y, final_state_or_None). final_state is always fp32 when requested.
+        Triton and XLA paths are gated off for trapezoidal (they don't support it
+        natively, but Idea G calls _run_scan with standard Euler inputs anyway).
+        """
+        import logging
+
+        req_xla = getattr(self.config, 'mamba_xla_scan', False) and x.device.type == 'xla'
+        use_xla = req_xla and _HAVE_XLA_SCAN
+
+        if req_xla and not _HAVE_XLA_SCAN:
+            logging.getLogger(__name__).warning(
+                "mamba_xla_scan requested but torch_xla scan unavailable; falling back to ref"
+            )
+
+        if use_xla:
+            y, st = self._ssd_scan_xla(x, dt, A, B, C, D)
+            return y, st.to(torch.float32) if return_final_states else None
+        elif mamba_chunk_scan_combined is not None and x.device.type == "cuda":
+            if return_final_states:
+                y, st = mamba_chunk_scan_combined(
+                    x, dt, A, B, C,
+                    chunk_size=self.chunk_size, D=D, return_final_states=True,
+                )
+                # Triton returns (B,H,headdim,d_state) -> our convention (B,H,d_state,headdim)
+                return y, st.transpose(-1, -2).to(torch.float32)
+            else:
+                y = mamba_chunk_scan_combined(
+                    x, dt, A, B, C,
+                    chunk_size=self.chunk_size, D=D,
+                )
+                return y, None
+        else:
+            y, st = self._ssd_scan_ref(x, dt, A, B, C, D)
+            return y, st.to(torch.float32) if return_final_states else None
 
     # -------------------------------------------------------------------------
     # Forward dispatch
@@ -193,44 +246,61 @@ class Mamba2Layer(nn.Module):
 
         dt_soft = F.softplus(dt_raw + self.dt_bias)  # (B, L, H)
 
-        # --- Phase 2: Complex RoPE ---
+        # --- Phase 2: Complex RoPE (compute angles ONCE, rotate both B and C) ---
         if self.mamba3_complex_rope:
-            B_ssm = self._apply_complex_rope(B_ssm, dt_soft, inference_params)
-            C_ssm = self._apply_complex_rope(C_ssm, dt_soft, inference_params)
+            rope_angles = self._compute_rope_angles(dt_soft, self.d_state, inference_params)
+            B_ssm = self._rotate_with_rope(B_ssm, rope_angles)
+            C_ssm = self._rotate_with_rope(C_ssm, rope_angles)
 
         A = -torch.exp(self.A_log)  # (H,) negative
+        return_states = inference_params is not None
 
-        # --- Choose scan backend ---
-        # Use chunked reference scan on all backends: the SSD "dual" form uses
-        # O(nchunks) dense matmuls instead of O(T) recurrence. The cross-chunk
-        # state pass uses xla_scan when available (only ~64 iterations for 16K).
-        use_xla = False
-        use_triton = (mamba_chunk_scan_combined is not None and x.device.type == "cuda"
-                      and not self.mamba3_trapezoidal)
+        # --- Idea G: Dual-scan trapezoidal decomposition ---
+        # The trapezoidal rule couples adjacent timesteps:
+        #   h_t = exp(dt_t*A)*h_{t-1} + gamma_t*dt_t*B_t*x_t + beta_t*dt_t*exp(dt_t*A)*B_{t-1}*x_{t-1}
+        # Because the SSM recurrence is linear, we decompose into two standard scans:
+        #   Scan 1 (current term): input = x * lam (gamma weighting)
+        #   Scan 2 (previous term): input = x_prev * (1-lam) * exp(dt*A) (beta weighting with decay)
+        # The exp(dt*A) embedding into x_prev does NOT cause double-decay because
+        # the scan applies decay only to h_{t-1}, not to the new input injection at step t.
+        # This allows unmodified Triton/XLA kernels to compute trapezoidal math natively.
+        if self.mamba3_trapezoidal:
+            assert lam is not None
+            # Build shifted previous-step tensors (sequence-level shift, not per-chunk)
+            x_prev = F.pad(x_ssm, (0, 0, 0, 0, 1, 0))[:, :-1]  # zero at t=0
+            B_prev = F.pad(B_ssm, (0, 0, 0, 0, 1, 0))[:, :-1]
 
-        if use_xla:
-            y, final_state = self._ssd_scan_xla(x_ssm, dt_soft, A, B_ssm, C_ssm, self.D)
-        elif use_triton:
+            # Inject cached state from prior prefill/decode for inference continuity
             if inference_params is not None:
-                y, final_states = mamba_chunk_scan_combined(
-                    x_ssm, dt_soft, A, B_ssm, C_ssm,
-                    chunk_size=self.chunk_size, D=self.D, return_final_states=True,
-                )
-                # Triton returns (B,H,headdim,d_state) -> transpose to our (B,H,d_state,headdim)
-                final_state = final_states.transpose(-1, -2).to(torch.float32)
-            else:
-                y = mamba_chunk_scan_combined(
-                    x_ssm, dt_soft, A, B_ssm, C_ssm,
-                    chunk_size=self.chunk_size, D=self.D,
-                )
-                final_state = None
-        else:
-            y, final_state = self._ssd_scan_ref(x_ssm, dt_soft, A, B_ssm, C_ssm, self.D)
+                states = inference_params.key_value_memory_dict.setdefault(self.layer_idx, {})
+                if "prev_x" in states:
+                    x_prev[:, 0] = states["prev_x"].to(x.dtype)
+                if "prev_B" in states:
+                    B_prev[:, 0] = states["prev_B"].to(x.dtype)
 
-        # Store state for inference
-        if inference_params is not None and final_state is not None:
-            states = inference_params.key_value_memory_dict.setdefault(self.layer_idx, {})
-            states["ssm_state"] = final_state.to(torch.float32)
+            # Embed trapezoidal weights into modified inputs
+            x_curr_mod = x_ssm * lam.unsqueeze(-1)
+            dA = torch.exp(dt_soft * A.view(1, 1, self.nheads))
+            x_prev_mod = x_prev * ((1.0 - lam) * dA).unsqueeze(-1)
+
+            # Two parallel O(chunk_size) standard SSD scans
+            y_curr, st_curr = self._run_scan(x_curr_mod, dt_soft, A, B_ssm, C_ssm,
+                                             D=None, return_final_states=return_states)
+            y_prev, st_prev = self._run_scan(x_prev_mod, dt_soft, A, B_prev, C_ssm,
+                                             D=None, return_final_states=return_states)
+
+            y = y_curr + y_prev + x_ssm * self.D.view(1, 1, self.nheads, 1)
+
+            if return_states:
+                states["ssm_state"] = (st_curr + st_prev).to(torch.float32)
+                states["prev_B"] = B_ssm[:, -1].float()
+                states["prev_x"] = x_ssm[:, -1].float()
+        else:
+            y, final_state = self._run_scan(x_ssm, dt_soft, A, B_ssm, C_ssm,
+                                            D=self.D, return_final_states=return_states)
+            if return_states:
+                states = inference_params.key_value_memory_dict.setdefault(self.layer_idx, {})
+                states["ssm_state"] = final_state.to(torch.float32)
 
         # --- Output gate + projection ---
         y = y.reshape(B_sz, L, self.d_inner)
@@ -294,10 +364,11 @@ class Mamba2Layer(nn.Module):
         dt_soft = F.softplus(dt_raw + self.dt_bias)  # (B, H)
         A = -torch.exp(self.A_log)
 
-        # Phase 2: Complex RoPE (unsqueeze to L=1 for API compatibility)
+        # Phase 2: Complex RoPE (compute angles ONCE, rotate both B and C)
         if self.mamba3_complex_rope:
-            B_ssm = self._apply_complex_rope(B_ssm.unsqueeze(1), dt_soft.unsqueeze(1), inference_params).squeeze(1)
-            C_ssm = self._apply_complex_rope(C_ssm.unsqueeze(1), dt_soft.unsqueeze(1), inference_params).squeeze(1)
+            rope_angles = self._compute_rope_angles(dt_soft.unsqueeze(1), self.d_state, inference_params)
+            B_ssm = self._rotate_with_rope(B_ssm.unsqueeze(1), rope_angles).squeeze(1)
+            C_ssm = self._rotate_with_rope(C_ssm.unsqueeze(1), rope_angles).squeeze(1)
 
         # SSM recurrence
         dA = torch.exp(dt_soft * A)  # (B, H)
@@ -308,7 +379,7 @@ class Mamba2Layer(nn.Module):
             prev_B = states.setdefault("prev_B", torch.zeros(B_sz, self.ngroups, self.d_state,
                                                               device=x.device, dtype=torch.float32))
             prev_x = states.setdefault("prev_x", torch.zeros(B_sz, self.nheads, self.headdim,
-                                                              device=x.device, dtype=x.dtype))
+                                                               device=x.device, dtype=torch.float32))
 
             # Expand B to head-level for math
             prev_B_h = prev_B.repeat_interleave(self.heads_per_group, dim=1)  # (B, H, N)
@@ -325,7 +396,7 @@ class Mamba2Layer(nn.Module):
 
             # Cache at group-level for memory efficiency
             states["prev_B"].copy_(B_ssm.float())
-            states["prev_x"].copy_(x_ssm)
+            states["prev_x"].copy_(x_ssm.float())
         else:
             # Standard Mamba-2 recurrence
             B_ssm_h = B_ssm.repeat_interleave(self.heads_per_group, dim=1)
@@ -343,7 +414,7 @@ class Mamba2Layer(nn.Module):
     # -------------------------------------------------------------------------
     # XLA Scan (TPU-optimized, no Python loops)
     # -------------------------------------------------------------------------
-    def _ssd_scan_xla(self, x_ssm, dt, A, B_ssm, C_ssm, D):
+    def _ssd_scan_xla(self, x_ssm, dt, A, B_ssm, C_ssm, D=None):
         """Native XLA scan for TPU: O(T) with no Python loop overhead.
 
         Optimized for minimal scan body HLO: alpha and dtB are pre-computed
@@ -384,8 +455,11 @@ class Mamba2Layer(nn.Module):
         stateT, ys = xla_scan(body, state0, xs)
 
         # Add D skip-connection outside the scan (doesn't depend on carry)
-        D_g = D.view(1, 1, G, Hpg, 1).float()
-        ys_with_d = ys + D_g * x_g.transpose(0, 1).float()
+        if D is not None:
+            D_g = D.view(1, 1, G, Hpg, 1).float()
+            ys_with_d = ys + D_g * x_g.transpose(0, 1).float()
+        else:
+            ys_with_d = ys
 
         y = ys_with_d.transpose(0, 1).reshape(B_sz, T, H, D_head).to(x_ssm.dtype)
         final_state = stateT.reshape(B_sz, H, N, D_head).to(torch.float32)
@@ -394,10 +468,14 @@ class Mamba2Layer(nn.Module):
     # -------------------------------------------------------------------------
     # Chunked Reference Scan (CPU/CUDA fallback, ~8 iterations not T)
     # -------------------------------------------------------------------------
-    def _ssd_scan_ref(self, x, dt, A, B, C, D):
+    def _ssd_scan_ref(self, x, dt, A, B, C, D, lam=None):
         """
         Chunked SSD scan: cross-chunk + within-chunk (the "dual" of SSD).
         Loops over nchunks = L/256 ≈ 8, NOT over L.
+
+        Args:
+            lam: (B, L, H) lambda gate for trapezoidal discretization (Phase 3).
+                 When provided, uses trapezoidal rule instead of Euler.
         """
         B_sz, L, H, D_head = x.shape
         _, _, G, N = B.shape
@@ -411,6 +489,8 @@ class Mamba2Layer(nn.Module):
             dt = F.pad(dt, (0, 0, 0, pad))
             B = F.pad(B, (0, 0, 0, 0, 0, pad))
             C = F.pad(C, (0, 0, 0, 0, 0, pad))
+            if lam is not None:
+                lam = F.pad(lam, (0, 0, 0, pad))
 
         nchunks = x.shape[1] // cs
         x_c = x.view(B_sz, nchunks, cs, H, D_head)
@@ -428,7 +508,26 @@ class Mamba2Layer(nn.Module):
 
         # Cross-chunk states
         decay_to_end = torch.exp(dA_cumsum[:, :, -1:] - dA_cumsum)
-        x_dt = x_c * dt_c.unsqueeze(-1)
+
+        # Trapezoidal discretization: modify effective dt per position.
+        # Standard Euler: x_dt[s] = dt[s] * x[s]
+        # Trapezoidal: B_s*x_s contributes to h_t with weight:
+        #   dt_eff[s] = lam[s]*dt[s] + (1-lam[s+1])*dt[s+1]  for s < cs-1
+        #   dt_eff[s] = lam[s]*dt[s]                          for s = cs-1
+        # The decay factor is identical to standard SSD (proven by expanding
+        # beta_{s+1}*dA_{s+1} into the cumulative sum).
+        # Exception: the diagonal (l==s) only gets gamma=lam*dt, not full dt_eff.
+        if lam is not None:
+            lam_c = lam.view(B_sz, nchunks, cs, H)
+            gamma = lam_c * dt_c  # (B, nchunks, cs, H) - current step weight
+            # Next-step contribution: (1-lam[s+1])*dt[s+1] for s < cs-1
+            beta_next = torch.zeros_like(gamma)
+            beta_next[:, :, :-1] = (1.0 - lam_c[:, :, 1:]) * dt_c[:, :, 1:]
+            dt_eff = gamma + beta_next
+            x_dt = x_c * dt_eff.unsqueeze(-1)
+        else:
+            x_dt = x_c * dt_c.unsqueeze(-1)
+
         chunk_states = torch.einsum('bclhn,bclhd->bchnd', B_h * decay_to_end.unsqueeze(-1), x_dt)
 
         # --- Cross-chunk: parallel matmul scan (no Python loop) ---
@@ -474,7 +573,18 @@ class Mamba2Layer(nn.Module):
         attn = CB * decay_mat
         y_local = torch.einsum('bclsh,bcshd->bclhd', attn, x_dt)
 
-        y = y_local + y_cross + x_c * D.view(1, 1, 1, H, 1)
+        # Trapezoidal diagonal correction: the attention diagonal (l==s) should
+        # use gamma=lam*dt, but x_dt uses dt_eff=gamma+beta_next. Subtract the
+        # excess beta_next contribution from the diagonal.
+        if lam is not None:
+            CB_diag = (C_h * B_h).sum(dim=-1)  # (B, nchunks, cs, H)
+            diag_correction = CB_diag.unsqueeze(-1) * beta_next.unsqueeze(-1) * x_c
+            y_local = y_local - diag_correction
+
+        if D is not None:
+            y = y_local + y_cross + x_c * D.view(1, 1, 1, H, 1)
+        else:
+            y = y_local + y_cross
         y = y.reshape(B_sz, nchunks * cs, H, D_head)
 
         if pad > 0:

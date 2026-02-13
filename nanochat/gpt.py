@@ -127,6 +127,7 @@ class GPTConfig:
     mamba3_complex_rope: bool = False  # complex RoPE on B/C
     # Mamba-3 Phase 3
     mamba3_trapezoidal: bool = False   # trapezoidal discretization
+    mamba_xla_scan: bool = False       # use XLA scan backend on TPU
     # Attention window sizing (0 = use sequence_len)
     window_long: int = 0
     window_short: int = 0

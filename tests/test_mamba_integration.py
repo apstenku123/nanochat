@@ -955,6 +955,55 @@ class TestDualScanTrapezoidal:
         finally:
             kernels.set_kernel_backend(prev)
 
+    def test_trapezoidal_changes_output_and_has_gradient(self):
+        """Verify trapezoidal actually changes Mamba output and lambda gets gradient.
+
+        Tests with isolated Mamba layers to avoid bf16 precision issues
+        in the full model at tiny test scale.
+        """
+        if not _has_field("mamba3_trapezoidal"):
+            pytest.skip("mamba3_trapezoidal not in GPTConfig")
+
+        from nanochat.mamba2 import Mamba2Layer
+
+        prev = kernels.get_kernel_backend()
+        kernels.set_kernel_backend("current")
+        try:
+            # Euler and trapezoidal Mamba layers with same weights
+            cfg_e = _mamba_config(mamba_pattern="M")
+            cfg_t = _mamba_config(mamba_pattern="M", mamba3_trapezoidal=True)
+            config_e = GPTConfig(**cfg_e)
+            config_t = GPTConfig(**cfg_t)
+
+            torch.manual_seed(42)
+            m_euler = Mamba2Layer(config_e, layer_idx=0).to(torch.bfloat16)
+            m_euler._init_mamba_params()
+            state = {k: v.clone() for k, v in m_euler.state_dict().items()}
+
+            torch.manual_seed(42)
+            m_trap = Mamba2Layer(config_t, layer_idx=0).to(torch.bfloat16)
+            m_trap._init_mamba_params()
+            for k, v in state.items():
+                if k in m_trap.state_dict() and m_trap.state_dict()[k].shape == v.shape:
+                    m_trap.state_dict()[k].copy_(v)
+
+            x = torch.randn(2, 16, 64, dtype=torch.bfloat16)
+            y_euler = m_euler(x.clone())
+            y_trap = m_trap(x.clone())
+
+            # Trapezoidal should produce different output
+            assert not torch.allclose(y_euler, y_trap), \
+                "Trapezoidal should change output vs Euler"
+
+            # Lambda gate should get non-zero gradient
+            y_trap.sum().backward()
+            nheads = m_trap.nheads
+            lam_grad = m_trap.in_proj.weight.grad[-nheads:]
+            assert lam_grad.float().abs().sum() > 0, \
+                "Lambda gate gradient is zero — trapezoidal not active in training"
+        finally:
+            kernels.set_kernel_backend(prev)
+
     def test_trapezoidal_with_engram_and_mhc(self):
         """Trapezoidal Mamba + Engram on Mamba layer + mHC."""
         if not _has_field("mamba3_trapezoidal"):
