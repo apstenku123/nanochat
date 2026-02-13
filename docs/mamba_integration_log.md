@@ -1960,13 +1960,1670 @@ in bf16 over 8 chunks or many decode steps.
 
 ---
 
-## Files to Create/Modify
+---
+
+### Iteration 8 Review (Gemini "Ultimate Refinement" Proposal)
+
+**Date**: 2026-02-13
+**Source**: Gemini's self-described "final, complete, production-ready" code
+**Verdict**: 5 previously-open bugs now FIXED. 6 new bugs found (2 CRITICAL).
+
+#### What iteration 8 FIXED from iteration 7
+
+| Bug | Status | How |
+|-----|--------|-----|
+| #7 KVCache.prefill type mismatch | ✅ FIXED | Now handles both Tensor and dict via isinstance |
+| #8 Batch expansion missing | ✅ FIXED | `.expand(batch_size, ...).clone()` for nested dicts |
+| #9 Triton not used in prefill | ✅ FIXED | `return_final_states=True` branch added |
+| #10 has_mamba not passed | ✅ FIXED | Shown in both KVCache constructors |
+| #11 MTP hasattr guard | ✅ FIXED | Direct `replace(config, mamba_enabled=False)` |
+
+Also correctly incorporated:
+- ✅ FP32 accumulation in `_ssd_scan_ref` (chunk loop uses fp32 running_state)
+- ✅ FP32 init in `_ssd_step_ref` (new ssm_state initialized as fp32)
+- ✅ ndim!=2 filter for Muon optimizer routing
+- ✅ `.bias` / `_bias` suffix filter for 2D bias params
+- ✅ checkpoint_manager.py compat patching (all 11 mamba fields)
+- ✅ CLI args match existing `store_true` / named-param style
+- ✅ `estimate_flops` SSD-based formula (no double-count)
+- ✅ `kv_cache.advance(T)` centralized in GPT.forward
+
+#### NEW Bugs Found in Iteration 8
+
+##### Bug #12 (CRITICAL): Triton final_states shape transposed vs reference convention
+
+`mamba_chunk_scan_combined` returns `final_states` with shape
+**(B, nheads, headdim, d_state)** — this is the official mamba_ssm
+convention where the state matrix per head is (headdim × d_state).
+
+Our `_ssd_step_ref` initializes and expects ssm_state as
+**(B, nheads, d_state, headdim)** — matching the einsum convention
+`'bclhn,bclhd->bchnd'` which produces (B, chunks, H, N, D).
+
+These are **transposed on the last two dims**. When prefill runs on
+CUDA (Triton path) and decode uses `_ssd_step_ref`, the stored state
+has wrong dimension order. With default config (headdim=128, d_state=64),
+this causes a **silent shape mismatch** — the `.copy_()` in the step
+function writes values into the wrong positions, producing garbage output.
+
+**Location in proposal**:
+```python
+# forward() Triton branch stores directly:
+states["ssm_state"] = final_states  # shape (B, H, D, N) — WRONG for step
+
+# _ssd_step_ref expects:
+ssm_state = states["ssm_state"]     # expects (B, H, N, D)
+# Then does:
+dBx = (dt * B).unsqueeze(-1) * x.unsqueeze(-2)  # produces (B, H, N, D)
+ssm_state.copy_(ssm_state * dA + dBx)           # shape mismatch!
+```
+
+**Fix**: Transpose Triton output to match reference convention:
+```python
+# In forward(), after mamba_chunk_scan_combined with return_final_states:
+    y, final_states = mamba_chunk_scan_combined(...)
+    # Triton returns (B, H, headdim, d_state), we need (B, H, d_state, headdim)
+    states["ssm_state"] = final_states.transpose(-1, -2).contiguous()
+```
+
+Alternatively, adopt the Triton convention (H, D, N) everywhere and
+adjust `_ssd_scan_ref` and `_ssd_step_ref`. But transposing the Triton
+output is a 1-line fix vs rewriting two functions.
+
+**Note**: When headdim == d_state (e.g. both 64), the transpose is a
+no-op on shape and the bug is **silent** — the model trains and runs
+but with subtly wrong state propagation. This makes it extremely hard
+to catch by testing alone.
+
+---
+
+##### Bug #13 (CRITICAL): fp32 state precision lost at prefill→decode boundary
+
+The proposal correctly uses fp32 for state accumulation within each
+function, but the precision is **discarded at the boundary**:
+
+**Prefill → decode dtype flow**:
+
+| Path | Prefill stores as | Decode retrieves as | Decode accumulates in |
+|------|-------------------|--------------------|-----------------------|
+| Triton | bf16 (kernel output) | bf16 | fp32 via `.float()` in copy_ |
+| Ref scan | bf16 (`running_state.to(x.dtype)`) | bf16 | fp32 via `.float()` in copy_ |
+
+The problem is in `_ssd_step_ref`:
+```python
+if "ssm_state" not in states:
+    # Only this path creates fp32 state
+    states["ssm_state"] = torch.zeros(..., dtype=torch.float32)
+ssm_state = states["ssm_state"]
+# If state exists from prefill, it's bf16!
+# The .copy_() then truncates fp32 computation back to bf16
+ssm_state.copy_(ssm_state * dA.float() + dBx.float())
+```
+
+After prefill, `"ssm_state"` IS in states (set by prefill path), so the
+fp32 initialization is skipped. The existing bf16 tensor is used, and
+`.copy_()` silently downcasts the fp32 result to bf16 every step.
+
+**Fix**: Always upcast to fp32 after retrieval, and store as fp32:
+```python
+if "ssm_state" not in states:
+    states["ssm_state"] = torch.zeros(B_sz, self.nheads,
+        self.d_state, self.headdim, device=x.device, dtype=torch.float32)
+else:
+    # Upcast prefill state to fp32 for decode accumulation
+    if states["ssm_state"].dtype != torch.float32:
+        states["ssm_state"] = states["ssm_state"].float()
+ssm_state = states["ssm_state"]
+```
+
+Also fix `_ssd_scan_ref` to return fp32 state for inference:
+```python
+# At end of _ssd_scan_ref:
+    return y.to(x.dtype), running_state  # keep running_state as fp32, NOT .to(x.dtype)
+```
+
+Combined with Bug #12 fix:
+```python
+# In forward(), after Triton prefill:
+    states["ssm_state"] = final_states.transpose(-1, -2).contiguous().float()
+```
+
+---
+
+##### Bug #14 (MODERATE): Block.__init__ self-imports from nanochat.gpt
+
+The proposal adds these imports inside `Block.__init__`:
+```python
+from nanochat.gpt import CausalSelfAttention
+from nanochat.gpt import MLP
+```
+
+And in `Block.forward`:
+```python
+from nanochat.gpt import norm
+```
+
+But `Block` IS defined in `gpt.py`. These classes and the `norm()`
+function are already in scope — `CausalSelfAttention` is defined at
+line 152, `MLP` at line 207, and `norm()` at line 139 of the same file.
+
+The self-imports are:
+1. **Redundant** — Python resolves them via `sys.modules`, returning the
+   already-loaded module, so they don't crash
+2. **Wasteful** — `from X import Y` executes module lookup + attribute
+   access on every Block construction (24× during init)
+3. **Misleading** — suggests Block might be in a separate file, confusing
+   future maintainers
+
+**Fix**: Remove all `from nanochat.gpt import ...` inside Block. Use
+`CausalSelfAttention`, `MLP`, and `norm` directly as in the actual code.
+
+The only import that IS correct is `from nanochat.mamba2 import Mamba2Layer`
+(cross-module, lazy import to avoid circular dependency).
+
+---
+
+##### Bug #15 (MODERATE): Muon LR scaling regression
+
+**Proposal**:
+```python
+muon_kwargs = dict(lr=matrix_lr * dmodel_lr_scale, momentum=0.95, ...)
+```
+
+**Actual code** (gpt.py setup_optimizers):
+```python
+muon_kwargs = dict(lr=matrix_lr, momentum=0.95, ...)
+```
+
+The `dmodel_lr_scale = (model_dim / 768) ** -0.5` is only applied to
+AdamW param groups (lm_head, wte, resid, x0, mamba_adam). Muon's LR
+has been tuned experimentally at `matrix_lr=0.02` without this scaling.
+
+Applying the scale factor changes training dynamics:
+- At n_embd=768: scale=1.0, no difference
+- At n_embd=1536: scale≈0.71, Muon LR drops to 0.014
+- At n_embd=3072: scale=0.5, Muon LR drops to 0.01
+
+This could silently degrade training quality at larger model sizes.
+
+**Fix**: Remove `dmodel_lr_scale` from Muon kwargs:
+```python
+muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
+```
+
+---
+
+##### Bug #16 (MODERATE): _compute_window_sizes drops config fields
+
+**Proposal**:
+```python
+char_to_window = {"L": (config.sequence_len, 0), "S": (config.sequence_len // 2, 0)}
+```
+
+**Actual code** (gpt.py:411-438):
+```python
+long_window = config.sequence_len
+short_window = long_window // 2
+char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
+# Plus: assert char in "SL" validation
+```
+
+Two issues:
+1. The actual GPTConfig has a separate `short_window` field (not derived
+   from sequence_len). The proposal should use `config.short_window` for
+   the "S" mapping and `config.sequence_len` for "L".
+2. Missing `assert char in "SL"` validation — without it, a typo in
+   `window_pattern` silently produces `None` window sizes.
+
+**Fix**:
+```python
+def _compute_window_sizes(self, config):
+    pattern = getattr(config, 'window_pattern', 'L').upper()
+    m_pattern = getattr(config, 'mamba_pattern', 'A').upper() if getattr(config, 'mamba_enabled', False) else None
+
+    long_window = config.sequence_len
+    short_window = long_window // 2
+    char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
+
+    window_sizes = []
+    for layer_idx in range(config.n_layer):
+        if m_pattern and m_pattern[layer_idx % len(m_pattern)] == 'M':
+            window_sizes.append(None)
+        else:
+            char = pattern[layer_idx % len(pattern)]
+            assert char in "SL", f"Invalid window pattern char '{char}' at position {layer_idx}"
+            window_sizes.append(char_to_window[char])
+
+    # Last attention layer always gets full context
+    if window_sizes[-1] is None:
+        from nanochat.common import print0
+        print0(f"WARNING: Last layer ({config.n_layer-1}) is Mamba.")
+    else:
+        window_sizes[-1] = (long_window, 0)
+    return window_sizes
+```
+
+---
+
+##### Bug #17 (LOW): init_weights skips Mamba per-head params
+
+The proposal's `init_weights` only initializes `in_proj.weight` and
+`out_proj.weight` for Mamba layers:
+```python
+if getattr(block, "is_mamba", False):
+    torch.nn.init.uniform_(block.attn.in_proj.weight, -s, s)
+    torch.nn.init.zeros_(block.attn.out_proj.weight)
+```
+
+Missing: `conv1d.weight`, `conv1d.bias`, `A_log`, `dt_bias`, `D`,
+and optionally `B_bias`/`C_bias`.
+
+Currently these are initialized in `Mamba2Layer.__init__()`:
+- `conv1d`: PyTorch default kaiming_uniform (fan_in=d_conv=4)
+- `A_log`: `uniform_(1,16)` then `log()`
+- `dt_bias`: inverse softplus of log-uniform dt
+- `D`: `ones()`
+
+This works because the model is constructed normally (not on meta device).
+But if meta-init is ever introduced, constructor init would be lost.
+
+**Improvement** (not a runtime bug today, but defensive):
+```python
+if getattr(block, "is_mamba", False):
+    torch.nn.init.uniform_(block.attn.in_proj.weight, -s, s)
+    torch.nn.init.zeros_(block.attn.out_proj.weight)
+    # Conv1d: leave at kaiming default (fan_in=4, appropriate for depthwise)
+    # A_log, dt_bias, D: re-init from constructor ranges
+    A = torch.empty(block.attn.nheads, device=block.attn.A_log.device).uniform_(1, 16)
+    block.attn.A_log.data.copy_(torch.log(A))
+    dt = torch.exp(torch.rand(block.attn.nheads, device=block.attn.dt_bias.device)
+                   * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clamp(min=0.001)
+    block.attn.dt_bias.data.copy_(dt + torch.log(-torch.expm1(-dt)))
+    block.attn.D.data.fill_(1.0)
+```
+
+---
+
+#### Cumulative Bug Status Table (after iteration 8)
+
+| # | Severity | Description | Introduced | Fixed? |
+|---|----------|-------------|-----------|--------|
+| 1 | CRITICAL | F.pad 8-val on 4D pads batch dim | Iter 5 | ✅ Iter 7 |
+| 2 | CRITICAL | kv_cache.advance() never called (last layer Mamba) | Iter 5 | ✅ Iter 7 |
+| 3 | CRITICAL | init_weights skips DSA c_q/c_k/c_v/c_proj | Iter 5 | ✅ Iter 7 |
+| 4 | MODERATE | estimate_flops double-counts + wrong units | Iter 6 | ✅ Iter 7 |
+| 5 | MODERATE | Complex RoPE angle lost at prefill→decode | Iter 5 | ✅ Iter 7 |
+| 6 | MODERATE | Missing Block.__init__, KVCache, CLI, GPTConfig | Iter 5 | ✅ Iter 7 |
+| 7 | CRITICAL | KVCache.prefill() mamba state type mismatch | Iter 7 | ✅ Iter 8 |
+| 8 | CRITICAL | Mamba state batch expansion missing in prefill | Iter 7 | ✅ Iter 8 |
+| 9 | MODERATE | Triton kernel not used during inference prefill | Iter 7 | ✅ Iter 8 |
+| 10 | MODERATE | Engine.generate KVCache constructors not shown | Iter 7 | ✅ Iter 8 |
+| 11 | LOW | MTP hasattr guard unnecessary | Iter 7 | ✅ Iter 8 |
+| 12 | **CRITICAL** | **Triton final_states shape (H,D,N) vs ref (H,N,D)** | **Iter 8** | **NO** |
+| 13 | **CRITICAL** | **fp32 state lost at prefill→decode boundary** | **Iter 8** | **NO** |
+| 14 | MODERATE | Block.__init__ self-imports from nanochat.gpt | Iter 8 | **NO** |
+| 15 | MODERATE | Muon LR incorrectly scaled by dmodel_lr_scale | Iter 8 | **NO** |
+| 16 | MODERATE | _compute_window_sizes drops short_window config | Iter 8 | **NO** |
+| 17 | LOW | init_weights skips conv1d/A_log/dt_bias/D | Iter 8 | **NO** |
+
+Bugs #1-11 from iterations 5-7 are all **FIXED** in iteration 8.
+Bugs #12-13 are **CRITICAL** new issues in the Triton↔reference boundary.
+Bugs #14-16 are moderate regressions vs actual code.
+Bug #17 is a defensive improvement.
+
+---
+
+#### Corrected Code for All 6 Open Bugs (#12-#17)
+
+##### Bug #12 + #13 Combined Fix: Triton shape + fp32 boundary
+
+```python
+# In Mamba2Layer.forward(), Triton prefill branch:
+    if mamba_chunk_scan_combined is not None and x.device.type == "cuda":
+        if inference_params is not None:
+            y, final_states = mamba_chunk_scan_combined(
+                x_ssm, dt_soft, A, B_ssm, C_ssm,
+                chunk_size=self.chunk_size, D=self.D,
+                return_final_states=True,
+            )
+            states = inference_params.key_value_memory_dict.setdefault(self.layer_idx, {})
+            # BUG 12: Transpose from Triton (B,H,D,N) to our (B,H,N,D)
+            # BUG 13: Cast to fp32 for decode accumulation precision
+            states["ssm_state"] = final_states.transpose(-1, -2).contiguous().float()
+        else:
+            y = mamba_chunk_scan_combined(
+                x_ssm, dt_soft, A, B_ssm, C_ssm,
+                chunk_size=self.chunk_size, D=self.D,
+            )
+    else:
+        y, final_states = self._ssd_scan_ref(x_ssm, dt_soft, A, B_ssm, C_ssm, self.D)
+        if inference_params is not None:
+            states = inference_params.key_value_memory_dict.setdefault(self.layer_idx, {})
+            # BUG 13: Keep fp32 — _ssd_scan_ref already returns fp32 running_state
+            states["ssm_state"] = final_states
+
+# In _ssd_scan_ref, return fp32 running_state WITHOUT downcasting:
+    return y.to(x.dtype), running_state  # NOT running_state.to(x.dtype)
+
+# In _ssd_step_ref, upcast existing state if needed:
+    if "ssm_state" not in states:
+        states["ssm_state"] = torch.zeros(B_sz, self.nheads,
+            self.d_state, self.headdim, device=x.device, dtype=torch.float32)
+    ssm_state = states["ssm_state"]
+    if ssm_state.dtype != torch.float32:
+        states["ssm_state"] = ssm_state.float()
+        ssm_state = states["ssm_state"]
+```
+
+##### Bug #14 Fix: Remove self-imports from Block
+
+```python
+# Block.__init__ — use classes directly (they're in the same file):
+class Block(nn.Module):
+    def __init__(self, config, layer_idx, engram_layers):
+        super().__init__()
+        self.layer_idx = layer_idx
+
+        m_pattern = getattr(config, 'mamba_pattern', 'A').upper() if getattr(config, 'mamba_enabled', False) else "A"
+        self.is_mamba = m_pattern[layer_idx % len(m_pattern)] == 'M'
+        use_dsa = bool(getattr(config, 'dsa_enabled', False)) and layer_idx >= getattr(config, 'dsa_start_layer', 7)
+
+        if self.is_mamba:
+            from nanochat.mamba2 import Mamba2Layer  # ONLY cross-module import needed
+            self.attn = Mamba2Layer(config, layer_idx)
+        elif use_dsa:
+            self.attn = DeepSeekSparseAttention(  # already imported at top of gpt.py
+                config, layer_idx,
+                dsa_top_k_ratio=config.dsa_top_k_ratio,
+                dsa_local_window=config.dsa_local_window,
+                dsa_indexer_heads=config.dsa_indexer_heads,
+                dsa_indexer_dim=config.dsa_indexer_dim
+            )
+        else:
+            self.attn = CausalSelfAttention(config, layer_idx)  # same file
+
+        self.mlp = MLP(config)  # same file
+        # ... engram/mhc unchanged ...
+
+    def forward(self, x, cos_sin, window_size, kv_cache):
+        x_attn = x + self.attn(norm(x), cos_sin, window_size, kv_cache)  # norm() is module-level
+        baseline_out = x_attn + self.mlp(norm(x_attn))
+        # ... engram/mhc unchanged ...
+```
+
+##### Bug #15 Fix: Muon LR without scaling
+
+```python
+# In setup_optimizers:
+muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
+# NOT: lr=matrix_lr * dmodel_lr_scale
+```
+
+##### Bug #16 Fix: Use config fields for window sizes
+
+```python
+# In _compute_window_sizes:
+    long_window = config.sequence_len
+    short_window = long_window // 2
+    char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
+    # ...
+    char = pattern[layer_idx % len(pattern)]
+    assert char in "SL", f"Invalid window pattern char '{char}'"
+    window_sizes.append(char_to_window[char])
+```
+
+##### Bug #17 Fix: Add Mamba per-head param init
+
+```python
+# In init_weights, inside the mamba block branch:
+if getattr(block, "is_mamba", False):
+    torch.nn.init.uniform_(block.attn.in_proj.weight, -s, s)
+    torch.nn.init.zeros_(block.attn.out_proj.weight)
+    # Defensive: re-init per-head params (survives meta-init)
+    A = torch.empty(block.attn.nheads, device=block.attn.A_log.device).uniform_(1, 16)
+    block.attn.A_log.data.copy_(torch.log(A))
+    dt = torch.exp(torch.rand(block.attn.nheads, device=block.attn.dt_bias.device)
+                   * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clamp(min=0.001)
+    block.attn.dt_bias.data.copy_(dt + torch.log(-torch.expm1(-dt)))
+    block.attn.D.data.fill_(1.0)
+    # conv1d: leave at PyTorch kaiming default (fan_in=d_conv=4, appropriate for depthwise)
+```
+
+---
+
+---
+
+### Iteration 9: Skipped (identical to iteration 8, same 6 open bugs)
+
+---
+
+### Iteration 10 Review
+
+**Date**: 2026-02-13
+**Source**: Gemini "exceptional review process" proposal
+**Verdict**: 3 of 6 open bugs FIXED. Bug #13 partially fixed. 2 remaining
+issues. 1 new regression. **Closest to implementation-ready yet.**
+
+#### Status of Previously-Open Bugs (#12-17)
+
+**Bug #12 (Triton shape transpose)** — ✅ FIXED. Code has:
+```python
+states["ssm_state"] = final_states.transpose(-1, -2).to(torch.float32)
+```
+
+**Bug #13 (fp32 state at prefill→decode boundary)** — PARTIALLY FIXED.
+Two changes:
+
+1. Triton path: `.transpose(-1,-2).to(torch.float32)` — ✅ stores fp32
+2. Ref scan path: `states["ssm_state"] = final_states` — now returns
+   `running_state.to(torch.float32)` at end of `_ssd_scan_ref` — ✅ FIXED
+
+But `_ssd_step_ref` still only creates fp32 if state doesn't exist:
+```python
+if "ssm_state" not in states:
+    states["ssm_state"] = torch.zeros(..., dtype=torch.float32)
+```
+Since both prefill paths now store fp32, this is fine in normal flow.
+However, if the official `mamba_ssm.InferenceParams` is used instead of
+our `MambaInferenceParams`, the dtype depends on what their code stores.
+**Defensive upcast still recommended** but no longer a runtime crash.
+
+**Bug #14 (Block self-imports)** — ✅ FIXED. No self-imports from
+`nanochat.gpt`. Uses `CausalSelfAttention`, `MLP`, `norm` directly.
+Only cross-module `from nanochat.mamba2 import Mamba2Layer` remains.
+`from nanochat.sparse_attention import DeepSeekSparseAttention` is
+present but DSA is already imported at top of gpt.py — redundant but
+harmless since Python caches module imports.
+
+**Bug #15 (Muon LR scaling)** — ✅ FIXED. Now uses:
+```python
+muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
+```
+No `dmodel_lr_scale` applied to Muon. Matches actual code.
+
+**Bug #16 (_compute_window_sizes)** — STILL PRESENT (LOW severity now).
+Still uses `long_window // 2` for short windows. Matches actual code
+pattern so not a regression — both derive from sequence_len.
+
+**Bug #17 (init_weights skips per-head params)** — STILL PRESENT (LOW).
+Only initializes `in_proj.weight` and `out_proj.weight`. Works today
+since constructor handles A_log/dt_bias/D.
+
+#### NEW Issues in Iteration 10
+
+##### Bug #18 (MODERATE): GPT.forward has self-import of norm
+
+```python
+def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    ...
+    x = self.transformer.wte(idx)
+    from nanochat.gpt import norm    # ◄◄◄ UNNECESSARY
+    x = norm(x)
+```
+
+`norm()` is a module-level function defined at gpt.py:139. It's already
+in scope inside `GPT.forward()` since GPT is defined in the same file.
+This `from nanochat.gpt import norm` is the same self-import pattern
+from Bug #14 — redundant and wasteful (executes on every forward pass).
+
+**Fix**: Remove `from nanochat.gpt import norm`. Use `norm(x)` directly
+as in the actual code.
+
+##### Bug #19 (LOW): GPT.forward uses `self.config.mtp_lambda` instead of `self.mtp_lambda`
+
+```python
+return main_loss + getattr(self.config, "mtp_lambda", 0.3) * mtp_loss
+```
+
+The actual code at gpt.py:591 uses `self.mtp_lambda` (set in `GPT.__init__`
+from `config.mtp_lambda`). This is a cosmetic difference — both resolve
+to the same value — but accessing via config on every forward is slightly
+less clean than the instance attribute.
+
+#### What iteration 10 got RIGHT (improvements over iter 8/9)
+
+1. ✅ `_ssd_scan_ref` returns `running_state.to(torch.float32)` — keeps
+   fp32 for inference state. This FIXES the core of Bug #13.
+2. ✅ Muon LR no longer scaled (Bug #15 fixed)
+3. ✅ No self-imports in Block.__init__ (Bug #14 fixed for Block)
+4. ✅ DSA `_full_attention` shown with advance() removed — previously
+   only mentioned, now explicit code provided
+5. ✅ `GPT.forward` shows full output logic (softcap, MTP, inference)
+   instead of `# ... standard output matching ...` truncation
+6. ✅ `from nanochat.sparse_attention import DeepSeekSparseAttention`
+   inside Block is acceptable as lazy import (though redundant with
+   top-of-file import, it doesn't cause issues)
+
+#### Cumulative Bug Status Table (after iteration 10)
+
+| # | Severity | Description | Introduced | Fixed? |
+|---|----------|-------------|-----------|--------|
+| 1 | CRITICAL | F.pad 8-val on 4D pads batch dim | Iter 5 | ✅ Iter 7 |
+| 2 | CRITICAL | kv_cache.advance() never called (last layer Mamba) | Iter 5 | ✅ Iter 7 |
+| 3 | CRITICAL | init_weights skips DSA c_q/c_k/c_v/c_proj | Iter 5 | ✅ Iter 7 |
+| 4 | MODERATE | estimate_flops double-counts + wrong units | Iter 6 | ✅ Iter 7 |
+| 5 | MODERATE | Complex RoPE angle lost at prefill→decode | Iter 5 | ✅ Iter 7 |
+| 6 | MODERATE | Missing Block.__init__, KVCache, CLI, GPTConfig | Iter 5 | ✅ Iter 7 |
+| 7 | CRITICAL | KVCache.prefill() mamba state type mismatch | Iter 7 | ✅ Iter 8 |
+| 8 | CRITICAL | Mamba state batch expansion missing in prefill | Iter 7 | ✅ Iter 8 |
+| 9 | MODERATE | Triton kernel not used during inference prefill | Iter 7 | ✅ Iter 8 |
+| 10 | MODERATE | Engine.generate KVCache constructors not shown | Iter 7 | ✅ Iter 8 |
+| 11 | LOW | MTP hasattr guard unnecessary | Iter 7 | ✅ Iter 8 |
+| 12 | CRITICAL | Triton final_states shape (H,D,N) vs ref (H,N,D) | Iter 8 | ✅ Iter 10 |
+| 13 | CRITICAL | fp32 state lost at prefill→decode boundary | Iter 8 | ✅ Iter 10 |
+| 14 | MODERATE | Block.__init__ self-imports from nanochat.gpt | Iter 8 | ✅ Iter 10 |
+| 15 | MODERATE | Muon LR incorrectly scaled by dmodel_lr_scale | Iter 8 | ✅ Iter 10 |
+| 16 | LOW | _compute_window_sizes hardcodes short_window | Iter 8 | matches actual |
+| 17 | LOW | init_weights skips conv1d/A_log/dt_bias/D | Iter 8 | defensive only |
+| 18 | **MODERATE** | **GPT.forward self-import of norm** | **Iter 10** | **NO** |
+| 19 | LOW | GPT.forward uses config.mtp_lambda vs self.mtp_lambda | Iter 10 | cosmetic |
+
+**All CRITICAL bugs are now FIXED.** Remaining issues are moderate/low.
+
+#### Implementation Readiness Assessment
+
+This proposal is **ready for implementation** with these minor fixes
+applied during coding:
+
+1. Remove `from nanochat.gpt import norm` from GPT.forward (Bug #18)
+2. Use `self.mtp_lambda` instead of `getattr(self.config, "mtp_lambda", 0.3)` (Bug #19)
+3. Add defensive fp32 upcast in `_ssd_step_ref` for robustness (Bug #13 hardening):
+   ```python
+   ssm_state = states["ssm_state"]
+   if ssm_state.dtype != torch.float32:
+       states["ssm_state"] = ssm_state.float()
+       ssm_state = states["ssm_state"]
+   ```
+4. Optionally add Mamba per-head param re-init in init_weights (Bug #17)
+
+These are all trivial 1-3 line fixes that can be applied during
+implementation without needing another review cycle.
+
+---
+
+---
+
+### Alternative Proposal Review: Ideas to Merge
+
+**Date**: 2026-02-13
+**Source**: Independent review proposing Phase 1-3 implementation with
+XLA scan, trapezoidal discretization, and Nemotron-style sliding windows
+
+**Overall verdict**: DO NOT ADOPT as a whole (violates too many codebase
+conventions — different GPTConfig fields, different init style, different
+Block structure, RMSNorm as nn.Module, different optimizer API). But
+contains **6 valuable ideas** to extract and merge.
+
+---
+
+#### Idea A: XLA scan for TPU training (ADOPT — Phase 1)
+
+The alternative proposal uses `torch_xla.experimental.scan` to replace
+the Python loop in `_ssd_scan_ref`. This is significant for TPU:
+
+Our current `_ssd_scan_ref` has a Python loop over `nchunks ≈ 8`, which
+is fine for CUDA (Triton handles it), but on XLA the loop prevents
+torch_xla from fusing the entire scan into one HLO program.
+
+**What to add** (new method in Mamba2Layer):
+```python
+def _ssd_scan_xla(self, x, dt, A, B, C, D):
+    """XLA-optimized scan using torch_xla.experimental.scan."""
+    try:
+        from torch_xla.experimental.scan import scan as xla_scan
+    except ImportError:
+        return self._ssd_scan_ref(x, dt, A, B, C, D)
+
+    # Use xla_scan with (state, input) -> (state, output) body
+    # Body processes one chunk at a time (not one token)
+    # This lets XLA compile the entire scan into a single While loop
+    ...
+```
+
+**Key insight**: The proposal's O(T) Python loop version is WRONG for
+training (too slow), but the idea of using `xla_scan` with our chunked
+scan body (processing one chunk per iteration, ~8 iterations) is sound.
+We should add this as a third compute path alongside Triton and ref scan.
+
+**Decision**: Add `_ssd_scan_xla` method that wraps our existing chunked
+scan logic inside `xla_scan`. Defer to Phase 1 implementation.
+
+---
+
+#### Idea B: `mamba3_trapezoidal` config toggle + lambda projection (ADOPT — Phase 3 prep)
+
+The proposal adds `mamba3_trapezoidal: bool = False` as a GPTConfig field
+and extends `d_in_proj` by `nheads` when enabled (for the lambda gate):
+
+```python
+d_lambda = self.nheads if self.mamba3_trapezoidal else 0
+d_in_proj = 2 * d_inner + 2 * ngroups * d_state + nheads + d_lambda
+```
+
+This is exactly what our Phase 3 design spec requires. Adding the config
+field and in_proj width change NOW (even if trapezoidal scan isn't
+implemented yet) means:
+1. Checkpoints save the toggle
+2. Parameter count is correct when enabled
+3. The lambda projection weights exist for future training
+
+**What to add to GPTConfig**:
+```python
+mamba3_trapezoidal: bool = False
+```
+
+**What to add to Mamba2Layer.__init__**:
+```python
+d_lambda = self.nheads if self.mamba3_trapezoidal else 0
+d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads + d_lambda
+```
+
+**What to add to forward() projection split**:
+```python
+if self.mamba3_trapezoidal:
+    dt_raw, lam_raw = torch.split(tail, [self.nheads, self.nheads], dim=-1)
+    lam = torch.sigmoid(lam_raw.to(torch.float32))
+else:
+    dt_raw = tail
+    lam = None
+```
+
+**Decision**: Add config field and in_proj sizing in Phase 1. Trapezoidal
+scan body deferred to Phase 3. Also add to checkpoint_manager defaults.
+
+---
+
+#### Idea C: `window_long` / `window_short` explicit config fields (ADOPT)
+
+The proposal introduces `window_long: int = 0` and `window_short: int = 0`
+as explicit GPTConfig fields, decoupling window sizes from `sequence_len`:
+
+```python
+window_long: int = 0   # 0 => use sequence_len (backward compatible)
+window_short: int = 0  # 0 => use window_long//2 (backward compatible)
+```
+
+This solves our Bug #16 properly — instead of always deriving short
+window from `sequence_len // 2`, users can set explicit window sizes.
+The `0` default preserves backward compatibility.
+
+**What to add to GPTConfig**:
+```python
+window_long: int = 0    # 0 = use sequence_len, -1 = full context
+window_short: int = 0   # 0 = window_long // 2
+```
+
+**What to change in _compute_window_sizes**:
+```python
+long_window = config.window_long if config.window_long != 0 else config.sequence_len
+short_window = config.window_short if config.window_short != 0 else long_window // 2
+```
+
+**Decision**: Adopt. Cleaner than hardcoding `sequence_len // 2`. Add to
+checkpoint_manager defaults too.
+
+---
+
+#### Idea D: `scan_layers` safety check for hybrid blocks (ADOPT)
+
+The proposal identifies that `torch_xla.experimental.scan_layers`
+assumes homogeneous blocks (same compiled body). With hybrid A+M blocks,
+`scan_layers` would compile attention and Mamba into the same trace,
+which fails because they have different parameter shapes.
+
+**What to add to base_train.py** (where `scan_layers` is called):
+```python
+if args.use_scan and device_type == 'xla':
+    pat = getattr(config, 'mamba_pattern', 'A').upper()
+    is_hybrid = getattr(config, 'mamba_enabled', False) and 'A' in pat and 'M' in pat
+    if is_hybrid:
+        print0("WARNING: scan_layers disabled for hybrid attention+mamba stack")
+    else:
+        model.transformer.h = scan_layers(model.transformer.h)
+```
+
+**Decision**: Adopt. One-line guard prevents a hard-to-debug XLA crash.
+
+---
+
+#### Idea E: `rope_theta` config field for complex RoPE base (ADOPT)
+
+The proposal parameterizes the complex RoPE theta via config:
+```python
+rope_theta = float(getattr(config, "rope_theta", 10000.0))
+inv_freq = 1.0 / (rope_theta ** (arange(0, d_state, 2) / d_state))
+```
+
+Our current implementation hardcodes `10000` in `Mamba2Layer.__init__`.
+Making it configurable via `rope_theta` (already present in GPTConfig
+for attention RoPE) allows tuning for longer contexts.
+
+**What to change in Mamba2Layer.__init__**:
+```python
+rope_theta = float(getattr(config, 'rope_theta', 10000.0))
+inv_freq = 1.0 / (rope_theta ** (torch.arange(0, self.d_state, 2).float() / self.d_state))
+```
+
+**Decision**: Adopt. Trivial change, enables 1M+ context experiments.
+
+---
+
+#### Idea F: `prev_B`/`prev_x` state initialization in `_get_or_create_state_dict` (ADOPT — Phase 3)
+
+The proposal's state dict creation handles trapezoidal states cleanly:
+```python
+if self.mamba3_trapezoidal:
+    if "prev_B" not in states:
+        states["prev_B"] = torch.zeros(B, ngroups, d_state, ...)
+    if "prev_x" not in states:
+        states["prev_x"] = torch.zeros(B, nheads, headdim, ...)
+```
+
+This matches our Phase 3 spec from the Idea 5 section (iteration 7
+Proposal B ideas). The proposal also correctly stores `prev_B` in fp32
+and `prev_x` in input dtype, which matches our Strategy B analysis
+(4.5KB/layer vs 192KB/layer for the precomputed product approach).
+
+**Decision**: Adopt the state initialization pattern when implementing
+Phase 3 trapezoidal scan.
+
+---
+
+#### Rejected Ideas (DO NOT ADOPT)
+
+| Idea | Why rejected |
+|------|-------------|
+| Different GPTConfig fields | Uses `window_long/short`, `rope_base`, different field names. Our config has `window_pattern`, `sequence_len` derivation. Keep ours but adopt window_long/short. |
+| `RMSNorm` as `nn.Module` | Codebase uses functional `F.rms_norm` everywhere (`norm()` at gpt.py:139). Adding `nn.Module` RMSNorm creates orphan learnable params. |
+| Different `Block.__init__` structure | Uses `self.ln_1 = RMSNorm(...)` (not in actual code). Our blocks use `norm()` inline in forward. |
+| O(T) Python loop fallback | `_ssm_scan_python_mamba2` loops over T=2048. Our `_ssd_scan_ref` does chunked scan over ~8 iterations. 256x slower. |
+| Different `init_weights` scale | Uses `std=0.02` hardcoded. Actual code uses `s = sqrt(3) * n_embd^-0.5`. |
+| Different optimizer API | Uses `muon.Muon` with `nesterov=True, backend="newtonschulz5"`. Our code uses `nanochat.muon.Muon` with `momentum=0.95`. |
+| `Engram`/`MultiHeadContext` class names | Actual classes are `EngramBranch` and `ManifoldBranchMixer`. |
+| Removing RoPE from attention layers | Nemotron-style "no RoPE in attention" is a fundamental architecture change, not a Mamba integration detail. |
+| Different KVCache API | Uses `kv_cache.update(k, v)` instead of `flash_attn_with_kvcache`. |
+| `checkpoint` import in forward | Uses `from torch.utils.checkpoint import checkpoint` inline. Actual code has the same function but different import path. |
+
+---
+
+#### Summary of Mergeable Ideas
+
+| # | Idea | Phase | Effort |
+|---|------|-------|--------|
+| A | XLA scan for TPU training | 1 (impl) | Medium — new method in Mamba2Layer |
+| B | `mamba3_trapezoidal` config + lambda in_proj | 1 (config) / 3 (scan) | Low — config field + in_proj math |
+| C | `window_long`/`window_short` config fields | 1 | Low — 2 GPTConfig fields + _compute fix |
+| D | `scan_layers` safety for hybrid blocks | 1 | Trivial — 5 lines in base_train.py |
+| E | `rope_theta` for complex RoPE base | 1 | Trivial — 1 line in Mamba2Layer |
+| F | `prev_B`/`prev_x` state init pattern | 3 | Low — state dict creation |
+
+---
+
+---
+
+### Iteration 11: Gemini "Absolute Finish Line" Proposal
+
+**Date**: 2026-02-13
+**Verdict**: Fixes Bug #17 (meta-init) and Bug #18 (norm self-import).
+Still has Bug #14 (self-imports in Block.__init__) and reintroduces
+`import math` inside `init_weights`. Otherwise clean — ready for
+implementation with the 6 ideas from the alternative proposal.
+
+#### What iteration 11 FIXED from iteration 10
+
+| Bug | Status | How |
+|-----|--------|-----|
+| #17 | ✅ FIXED | `init_weights` now re-inits A_log/dt_bias/D/B_bias/C_bias under `with torch.no_grad()` for meta-init safety |
+| #18 | ✅ FIXED | `GPT.forward` no longer has `from nanochat.gpt import norm` — uses `norm(x)` directly |
+| #19 | ✅ FIXED | Uses `self.mtp_lambda` instead of `getattr(self.config, "mtp_lambda", 0.3)` |
+| #13 (defensive) | ✅ ADDED | `_ssd_step_ref` now has `if ssm_state.dtype != torch.float32: ssm_state = ssm_state.float()` |
+
+#### Remaining issues in iteration 11
+
+| Bug | Severity | Description |
+|-----|----------|-------------|
+| #14 | LOW | Block.__init__ still imports `from nanochat.gpt import CausalSelfAttention` and `from nanochat.gpt import MLP` — these are self-imports (Block IS in gpt.py). Fix during implementation: remove these lines. |
+| NEW | TRIVIAL | `import math` added inside `init_weights` body — should be a module-level import (already present at top of gpt.py). |
+
+#### Assessment: IMPLEMENTATION READY
+
+All critical and moderate bugs are resolved. The only remaining issues
+are cosmetic (self-imports, misplaced import statement) that take 2
+seconds to fix during implementation.
+
+---
+
+### 6 Ideas to Adopt from Alternative Proposal (Detailed)
+
+These ideas address real gaps in the current design. Each is described
+with full production code, exact file locations, integration context,
+and rationale. The next iteration should incorporate all of these into
+the proposed code.
+
+---
+
+#### Idea A: XLA Scan for TPU Training
+
+**Problem**: Our `_ssd_scan_ref` uses a chunked approach with a Python
+`for c in range(nchunks)` loop (~8 iterations for L=2048, cs=256).
+On TPU/XLA, each Python loop iteration generates a separate HLO
+computation graph. The XLA compiler cannot fuse these into one While
+loop, which increases compile time, prevents cross-iteration
+optimization, and wastes HBM due to duplicated intermediate buffers.
+
+**Impact**: For 8 Mamba layers x 8 chunks = 64 separate HLO bodies
+compiled vs 8 (one per layer). Compilation overhead ~8x higher.
+
+**Solution**: Add an alternative scan path that uses
+`torch_xla.experimental.scan` — XLA's native scan primitive that
+compiles the entire recurrence body once and executes it T times in a
+single HLO While loop. This is NOT a replacement for the chunked scan
+(which is more memory-efficient for training); it's an alternative
+for when XLA is available.
+
+**Where**: `nanochat/mamba2.py` — 3 changes:
+
+**Change 1**: Add import at the top of `mamba2.py`:
+```python
+# At top of mamba2.py, after the mamba_ssm import:
+try:
+    from torch_xla.experimental.scan import scan as xla_scan
+    _HAVE_XLA_SCAN = True
+except ImportError:
+    xla_scan = None
+    _HAVE_XLA_SCAN = False
+```
+
+**Change 2**: Add new method `_ssd_scan_xla` to `Mamba2Layer`:
+```python
+def _ssd_scan_xla(self, x_ssm, dt, A, B_ssm, C_ssm, D, init_state):
+    """
+    SSM recurrence using torch_xla.experimental.scan.
+
+    Unlike _ssd_scan_ref which chunks the sequence and loops over chunks,
+    this scans token-by-token using XLA's native While loop. XLA compiles
+    the body function once and executes it T times efficiently.
+
+    Args:
+        x_ssm: (B, T, H, D_head) input after conv+SiLU
+        dt: (B, T, H) softplus'd timestep
+        A: (H,) negative diagonal (float32)
+        B_ssm: (B, T, G, N) input projection B
+        C_ssm: (B, T, G, N) output projection C
+        D: (H,) skip connection
+        init_state: (B, H, N, D_head) initial SSM state (float32)
+
+    Returns:
+        y: (B, T, H, D_head) output
+        final_state: (B, H, N, D_head) final SSM state (float32)
+    """
+    B_sz, T, H, D_head = x_ssm.shape
+    G = self.ngroups
+    Hpg = self.nheads // G
+    N = self.d_state
+
+    # Reshape to grouped form — avoids repeat_interleave inside the scan
+    # by computing per-group and broadcasting across heads_per_group
+    x_g = x_ssm.view(B_sz, T, G, Hpg, D_head)
+    dt_g = dt.view(B_sz, T, G, Hpg)
+    A_g = A.view(G, Hpg)
+    D_g = D.view(G, Hpg)
+    state0 = init_state.view(B_sz, G, Hpg, N, D_head).float()
+
+    # XLA scan requires leading dimension = scan dimension (T)
+    # All inputs must be time-major: (T, B, ...)
+    xs = (
+        x_g.transpose(0, 1).float(),    # (T, B, G, Hpg, D)
+        dt_g.transpose(0, 1).float(),   # (T, B, G, Hpg)
+        B_ssm.transpose(0, 1).float(),  # (T, B, G, N)
+        C_ssm.transpose(0, 1).float(),  # (T, B, G, N)
+    )
+
+    def body(carry, inp):
+        """Single-step SSM recurrence. XLA compiles this once."""
+        x_t, dt_t, B_t, C_t = inp
+        # carry: (B, G, Hpg, N, D) float32
+
+        # Decay: alpha = exp(dt * A) per head
+        alpha = torch.exp(dt_t * A_g.view(1, G, Hpg))  # (B, G, Hpg)
+
+        # Input term: dt * B * x → outer product over (N, D)
+        dtB = dt_t.unsqueeze(-1) * B_t.unsqueeze(-2)       # (B, G, Hpg, N)
+        dBx = dtB.unsqueeze(-1) * x_t.unsqueeze(-2)        # (B, G, Hpg, N, D)
+
+        # State update: h = alpha * h + dt * B * x
+        new_carry = carry * alpha.unsqueeze(-1).unsqueeze(-1) + dBx
+
+        # Output: y = C * h + D * x
+        y_t = (C_t.unsqueeze(-2).unsqueeze(-1) * new_carry).sum(dim=-2)  # (B, G, Hpg, D)
+        y_t = y_t + D_g.view(1, G, Hpg, 1) * x_t
+
+        return new_carry, y_t
+
+    # xla_scan(fn, init, xs) → (final_carry, stacked_outputs)
+    # Scans over the leading dimension of xs (T)
+    stateT, ys = xla_scan(body, state0, xs)
+
+    # Reshape back to (B, T, H, D) and (B, H, N, D)
+    y = ys.transpose(0, 1).reshape(B_sz, T, H, D_head)
+    final_state = stateT.reshape(B_sz, H, N, D_head)
+
+    return y.to(x_ssm.dtype), final_state
+```
+
+**Change 3**: Modify the dispatch in `Mamba2Layer.forward()`. Replace
+the current two-way branch (Triton vs chunked-ref) with a three-way:
+```python
+        # In forward(), replace the scan dispatch block:
+        A = -torch.exp(self.A_log)
+
+        # Compute initial state for inference prefill
+        if inference_params is not None:
+            states = inference_params.key_value_memory_dict.setdefault(self.layer_idx, {})
+            if "ssm_state" in states:
+                init_state = states["ssm_state"]
+                # Ensure fp32 for accumulation
+                if init_state.dtype != torch.float32:
+                    init_state = init_state.float()
+            else:
+                init_state = torch.zeros(B_sz, self.nheads, self.d_state, self.headdim,
+                                         device=x.device, dtype=torch.float32)
+        else:
+            init_state = torch.zeros(B_sz, self.nheads, self.d_state, self.headdim,
+                                     device=x.device, dtype=torch.float32)
+
+        # Three-way dispatch: XLA scan > Triton kernel > chunked reference
+        use_xla = (x.device.type == 'xla') and _HAVE_XLA_SCAN
+        use_triton = (mamba_chunk_scan_combined is not None) and (x.device.type == "cuda")
+
+        if use_xla:
+            y, final_states = self._ssd_scan_xla(
+                x_ssm, dt_soft, A, B_ssm, C_ssm, self.D, init_state,
+            )
+        elif use_triton:
+            if inference_params is not None:
+                y, final_states_raw = mamba_chunk_scan_combined(
+                    x_ssm, dt_soft, A, B_ssm, C_ssm,
+                    chunk_size=self.chunk_size, D=self.D, return_final_states=True,
+                )
+                # Triton returns (B,H,headdim,d_state) — transpose to our (B,H,d_state,headdim)
+                final_states = final_states_raw.transpose(-1, -2).to(torch.float32)
+            else:
+                y = mamba_chunk_scan_combined(
+                    x_ssm, dt_soft, A, B_ssm, C_ssm,
+                    chunk_size=self.chunk_size, D=self.D,
+                )
+                final_states = None
+        else:
+            y, final_states = self._ssd_scan_ref(x_ssm, dt_soft, A, B_ssm, C_ssm, self.D)
+
+        # Store final state for inference
+        if inference_params is not None and final_states is not None:
+            states["ssm_state"] = final_states.to(torch.float32)
+```
+
+**Why this matters**: On TPU v6e x8, the Python loop in `_ssd_scan_ref`
+forces XLA to compile 8 separate HLO bodies per Mamba layer. With
+`xla_scan`, it compiles 1 body and executes it as a native While loop.
+Expected compile time reduction: ~4-8x. Training throughput improvement:
+~15-30% for the Mamba layer portion (Mamba is ~8/24 = 33% of layers,
+so overall improvement ~5-10%).
+
+**Tradeoff**: The XLA scan operates token-by-token (O(T) sequential
+steps) while the chunked ref scan operates chunk-by-chunk (O(T/cs)
+steps but each step is a matmul over cs tokens). For training with
+cs=256, the chunked approach is actually more computationally efficient
+because it parallelizes within each chunk. The XLA scan's advantage
+is purely compilation efficiency. For Phase 1, keep both paths and
+let the dispatch choose based on device type.
+
+---
+
+#### Idea B: `mamba3_trapezoidal` Config Field + Lambda Projection
+
+**Problem**: Phase 3 trapezoidal discretization changes the `in_proj`
+output width — it adds `nheads` extra dimensions for the λ (lambda)
+gate that interpolates between forward and backward Euler. If we train
+a model without this field and later enable trapezoidal, the saved
+checkpoint's `in_proj.weight` has shape `(d_model, old_width)` which
+doesn't match `(d_model, old_width + nheads)`. The model won't load.
+
+**Solution**: Add the config field and conditional `in_proj` width
+computation NOW, defaulting to `False`. When `False`, the width is
+identical to current code. When `True`, it adds `nheads` dims.
+
+**Where**: 4 files need changes:
+
+**File 1 — `nanochat/gpt.py` GPTConfig**:
+```python
+@dataclass
+class GPTConfig:
+    # ... existing fields ...
+    mamba3_qknorm: bool = False
+    mamba3_bias: bool = False
+    mamba3_complex_rope: bool = False
+    mamba3_trapezoidal: bool = False   # ← ADD THIS
+```
+
+**File 2 — `nanochat/mamba2.py` Mamba2Layer.__init__**:
+```python
+    def __init__(self, config, layer_idx):
+        # ... existing setup ...
+
+        # Phase 3 toggle
+        self.mamba3_trapezoidal = getattr(config, 'mamba3_trapezoidal', False)
+
+        # in_proj width: z + xBC + dt + (optional) lambda
+        d_lambda = self.nheads if self.mamba3_trapezoidal else 0
+        d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads + d_lambda
+        self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=False)
+
+        # ... rest unchanged ...
+```
+
+And in `forward()`, the projection split changes:
+```python
+        zxbcdt = self.in_proj(x)
+        z = zxbcdt[..., :self.d_inner]
+        xBC_raw = zxbcdt[..., self.d_inner : self.d_inner + self.d_inner + 2*self.ngroups*self.d_state]
+
+        if self.mamba3_trapezoidal:
+            dt = zxbcdt[..., -(self.nheads + self.nheads) : -self.nheads]
+            lam_raw = zxbcdt[..., -self.nheads:]
+            lam = torch.sigmoid(lam_raw.float())  # (B, L, H) in [0, 1]
+        else:
+            dt = zxbcdt[..., -self.nheads:]
+            lam = None
+```
+
+**File 3 — `nanochat/checkpoint_manager.py`**:
+```python
+    model_config_kwargs.setdefault('mamba3_trapezoidal', False)
+```
+
+**File 4 — `scripts/base_train.py`**:
+```python
+    parser.add_argument("--mamba3_trapezoidal", action="store_true",
+                        help="enable Mamba-3 trapezoidal discretization (Phase 3)")
+
+    # In model_config_kwargs:
+    mamba3_trapezoidal=args.mamba3_trapezoidal,
+```
+
+**Why now vs later**: Adding the config field + conditional in_proj
+width costs zero runtime when disabled. But it means ALL checkpoints
+saved from Phase 1 forward will have the field, so enabling trapezoidal
+later is a non-breaking config change rather than a checkpoint migration.
+
+---
+
+#### Idea C: `window_long` / `window_short` Config Fields
+
+**Problem**: Window sizes are currently derived from `sequence_len`:
+```python
+# Current code in _compute_window_sizes:
+long_window = config.sequence_len      # e.g. 2048
+short_window = long_window // 2        # e.g. 1024
+```
+
+This has three problems:
+1. Training at seq_len=65536 but wanting 128k windows — impossible
+2. Inference at different lengths than training — wrong window size
+3. Full context (`-1` in flash-attn) — can't express it
+
+**Solution**: Two new config fields with backward-compatible defaults.
+
+**File 1 — `nanochat/gpt.py` GPTConfig**:
+```python
+@dataclass
+class GPTConfig:
+    # ... existing fields ...
+    window_pattern: str = "L"
+    window_long: int = 0    # 0 = use sequence_len (backward compatible)
+    window_short: int = 0   # 0 = window_long // 2 (backward compatible)
+```
+
+**File 2 — `nanochat/gpt.py` `_compute_window_sizes`**:
+```python
+    def _compute_window_sizes(self, config):
+        pattern = getattr(config, 'window_pattern', 'L').upper()
+        assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}."
+
+        m_pattern = getattr(config, 'mamba_pattern', '').upper()
+        if getattr(config, 'mamba_enabled', False) and not m_pattern:
+            m_pattern = "AAM"
+
+        # Resolve window sizes from config or fallback to sequence_len
+        long_window = getattr(config, 'window_long', 0) or config.sequence_len
+        short_window = getattr(config, 'window_short', 0) or (long_window // 2)
+
+        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
+
+        window_sizes = []
+        for layer_idx in range(config.n_layer):
+            if m_pattern and m_pattern[layer_idx % len(m_pattern)] == 'M':
+                window_sizes.append(None)
+            else:
+                char = pattern[layer_idx % len(pattern)]
+                window_sizes.append(char_to_window[char])
+
+        # Last attention layer always gets full context
+        if window_sizes[-1] is None:
+            from nanochat.common import print0
+            print0(f"WARNING: Last layer ({config.n_layer-1}) is Mamba.")
+        else:
+            window_sizes[-1] = (long_window, 0)
+        return window_sizes
+```
+
+**File 3 — `nanochat/checkpoint_manager.py`**:
+```python
+    model_config_kwargs.setdefault('window_long', 0)
+    model_config_kwargs.setdefault('window_short', 0)
+```
+
+**File 4 — `scripts/base_train.py`** (optional CLI args):
+```python
+    parser.add_argument("--window_long", type=int, default=0,
+                        help="long window size (0=sequence_len)")
+    parser.add_argument("--window_short", type=int, default=0,
+                        help="short window size (0=window_long//2)")
+```
+
+**Example usage**: Training at seq_len=65536 with 128k sliding windows:
+```bash
+python base_train.py --sequence_len 65536 --window_long 131072 --window_short 65536
+```
+
+---
+
+#### Idea D: `scan_layers` Safety Check for Hybrid Blocks
+
+**Problem**: On TPU, `base_train.py` uses
+`scan_layers(model.transformer.h)` to compile all layers as one reused
+HLO body. This assumes all blocks have identical structure
+(homogeneous). With hybrid A+M patterns, `transformer.h` contains both
+`CausalSelfAttention` and `Mamba2Layer` blocks — `scan_layers` would
+either crash (different parameter shapes) or silently produce wrong
+results (treating Mamba params as attention params).
+
+**Solution**: Add a guard before the `scan_layers` call that detects
+hybrid patterns and skips the optimization with a warning.
+
+**Where**: `scripts/base_train.py`, near the existing `scan_layers`
+call. Find the section that looks like:
+```python
+if args.use_scan and device_type == "xla":
+    from torch_xla.experimental.scan import scan_layers
+    model.transformer.h = scan_layers(model.transformer.h)
+```
+
+**Replace with**:
+```python
+if args.use_scan and device_type == "xla":
+    # scan_layers requires homogeneous blocks (same compiled body).
+    # Hybrid A+M patterns have different block structures — skip.
+    pat = getattr(config, "mamba_pattern", "") or ""
+    is_hybrid = (
+        getattr(config, "mamba_enabled", False)
+        and pat.upper() != ""
+        and "A" in pat.upper()
+        and "M" in pat.upper()
+    )
+    if is_hybrid:
+        print0("WARNING: --use_scan disabled because transformer.h "
+               "contains heterogeneous blocks (attention + mamba). "
+               "Each block type will be compiled separately.")
+    else:
+        try:
+            from torch_xla.experimental.scan import scan_layers
+            model.transformer.h = scan_layers(model.transformer.h)
+            print0(f"Enabled XLA scan_layers ({config.n_layer} layers "
+                   f"-> 1 compiled block)")
+        except ImportError:
+            print0("WARNING: --use_scan requires torch_xla scan_layers")
+```
+
+**Why this matters**: Without this guard, running
+`--mamba --mamba_pattern AAM --use_scan` on TPU would crash with a
+shape mismatch error (attention params ≠ mamba params) or silently
+produce numerically wrong gradients. The guard is trivial to add and
+prevents a confusing failure mode.
+
+---
+
+#### Idea E: Configurable `rope_theta` for Complex RoPE
+
+**Problem**: The complex RoPE frequencies in `Mamba2Layer.__init__`
+use a hardcoded base theta of 10000:
+```python
+inv_freq = 1.0 / (10000 ** (torch.arange(0, self.d_state, 2).float() / self.d_state))
+```
+
+The standard attention RoPE in `CausalSelfAttention` also uses
+theta=10000 by default (gpt.py `_precompute_rotary_embeddings`
+line 394: `base=10000`). For long context models (128k-1M tokens),
+higher theta values are needed to spread the rotation frequencies
+across the longer sequence range. Nemotron uses theta=1M for their
+1M-context models.
+
+**Solution**: Read `rope_theta` from config instead of hardcoding:
+
+**Where**: `nanochat/mamba2.py`, in `Mamba2Layer.__init__`, the block
+that creates `inv_freq`:
+
+```python
+        # BEFORE (hardcoded):
+        if self.mamba3_complex_rope:
+            inv_freq = 1.0 / (10000 ** (torch.arange(0, self.d_state, 2).float() / self.d_state))
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # AFTER (configurable):
+        if self.mamba3_complex_rope:
+            rope_theta = float(getattr(config, 'rope_theta', 10000.0))
+            inv_freq = 1.0 / (rope_theta ** (torch.arange(0, self.d_state, 2).float() / self.d_state))
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+```
+
+**Note**: We don't need a separate `mamba_rope_theta` field. The
+attention RoPE theta is set via `_precompute_rotary_embeddings(base=)`
+which currently hardcodes 10000. If the user wants different theta for
+attention vs Mamba, they can add `mamba_rope_theta` later. For now,
+sharing `rope_theta` across both is the right default — Nemotron uses
+the same theta for both their attention and Mamba layers.
+
+**No additional file changes needed** — this is a 1-line change in
+`mamba2.py`. The config field doesn't need to exist in GPTConfig;
+`getattr(config, 'rope_theta', 10000.0)` handles missing gracefully.
+
+---
+
+#### Idea F: `prev_B`/`prev_x` State Caching for Trapezoidal Decode
+
+**Problem**: The trapezoidal discretization (Phase 3) computes:
+```
+h_t = α_t h_{t-1} + β_t (B_{t-1} ⊗ x_{t-1}) + γ_t (B_t ⊗ x_t)
+```
+
+The β_t term needs `B_{t-1}` and `x_{t-1}` from the PREVIOUS token.
+During autoregressive decode, each call to `_ssd_step_ref` processes
+one token, so the previous token's B and x must be cached in the state
+dict between calls.
+
+**Design decision**: Cache `prev_B` and `prev_x` separately (Strategy B
+from Idea 5 in iteration 7) rather than their outer product:
+- Strategy A (product): 192KB/layer in bf16
+- Strategy B (factors): 4.5KB/layer in bf16
+
+The outer product is trivially cheap to recompute from factors.
+
+**Where**: Multiple locations in `nanochat/mamba2.py`, gated by
+`self.mamba3_trapezoidal`:
+
+**Change 1 — State dict creation** (in `_ssd_step_ref` or a helper):
+```python
+        # When mamba3_trapezoidal is True, add to state dict:
+        if self.mamba3_trapezoidal:
+            if "prev_B" not in states:
+                states["prev_B"] = torch.zeros(
+                    B_sz, self.ngroups, self.d_state,
+                    device=x.device, dtype=torch.float32,
+                )
+            if "prev_x" not in states:
+                states["prev_x"] = torch.zeros(
+                    B_sz, self.nheads, self.headdim,
+                    device=x.device, dtype=x.dtype,
+                )
+```
+
+**Change 2 — Decode step** (replace standard SSM update in `_ssd_step_ref`):
+```python
+        if self.mamba3_trapezoidal:
+            # λ from projection (already split in forward projection)
+            lam = torch.sigmoid(lam_raw.float())  # (B, H)
+
+            # Retrieve previous token's B and x
+            prev_B = states["prev_B"]   # (B, G, N) float32
+            prev_x = states["prev_x"]   # (B, H, D) x.dtype
+
+            # Expand prev_B to match heads
+            prev_B_h = prev_B.repeat_interleave(heads_per_group, dim=1)  # (B, H, N)
+
+            # Trapezoidal coefficients (Eq. 4)
+            alpha = dA                                          # exp(dt * A), (B, H)
+            beta = (1.0 - lam) * dt_soft * alpha                # backward Euler weight
+            gamma = lam * dt_soft                                # forward Euler weight
+
+            # Previous term: β * B_{t-1} ⊗ x_{t-1}
+            dBx_prev = (beta.unsqueeze(-1) * prev_B_h).unsqueeze(-1) \
+                      * prev_x.to(torch.float32).unsqueeze(-2)  # (B, H, N, D)
+
+            # Current term: γ * B_t ⊗ x_t
+            dBx_curr = (gamma.unsqueeze(-1) * B_ssm).unsqueeze(-1) \
+                      * x_ssm.to(torch.float32).unsqueeze(-2)   # (B, H, N, D)
+
+            # State update (trapezoidal)
+            ssm_state.copy_(
+                ssm_state * alpha.view(B_sz, self.nheads, 1, 1).float()
+                + dBx_prev + dBx_curr
+            )
+
+            # Cache current B and x for next token
+            # Store B before repeat_interleave (grouped form, smaller)
+            states["prev_B"].copy_(B_ssm_grouped.float())  # (B, G, N)
+            states["prev_x"].copy_(x_ssm)                   # (B, H, D)
+        else:
+            # Standard Mamba-2 update (existing code)
+            ssm_state.copy_(ssm_state * dA.view(B_sz, self.nheads, 1, 1).float() + dBx.float())
+```
+
+**Change 3 — Prefill boundary**: At the end of prefill (in `forward()`),
+store the last token's B and x for decode continuation:
+```python
+        if self.mamba3_trapezoidal and inference_params is not None:
+            # Store last token's B and x for trapezoidal decode
+            states["prev_B"] = B_ssm[:, -1].float()  # (B, G, N)
+            states["prev_x"] = x_ssm[:, -1]           # (B, H, D)
+```
+
+**KVCache.prefill compatibility**: The existing `prefill()` method's
+`isinstance(v, dict)` branch handles `prev_B` and `prev_x` as regular
+tensor entries in the per-layer state dict. The batch expansion logic
+(`sv.expand(batch_size, ...).clone()`) works correctly for both shapes.
+No additional prefill code is needed.
+
+**First-token semantics**: At t=0, `prev_B` and `prev_x` are
+zero-initialized. This is semantically correct — there is no previous
+token, so `B_{-1} * x_{-1} = 0`. The β_t term contributes nothing,
+and the γ_t term (forward Euler, like standard Mamba-2) handles the
+first token naturally.
+
+---
+
+#### Cumulative Bug Status Table (after iteration 11)
+
+| # | Severity | Description | Introduced | Fixed? |
+|---|----------|-------------|-----------|--------|
+| 1 | CRITICAL | F.pad 8-val on 4D pads batch dim | Iter 5 | ✅ Iter 7 |
+| 2 | CRITICAL | kv_cache.advance() never called (last layer Mamba) | Iter 5 | ✅ Iter 7 |
+| 3 | CRITICAL | init_weights skips DSA c_q/c_k/c_v/c_proj | Iter 5 | ✅ Iter 7 |
+| 4 | MODERATE | estimate_flops double-counts + wrong units | Iter 6 | ✅ Iter 7 |
+| 5 | MODERATE | Complex RoPE angle lost at prefill→decode | Iter 5 | ✅ Iter 7 |
+| 6 | MODERATE | Missing Block.__init__, KVCache, CLI, GPTConfig | Iter 5 | ✅ Iter 7 |
+| 7 | CRITICAL | KVCache.prefill() mamba state type mismatch | Iter 7 | ✅ Iter 8 |
+| 8 | CRITICAL | Mamba state batch expansion missing in prefill | Iter 7 | ✅ Iter 8 |
+| 9 | MODERATE | Triton kernel not used during inference prefill | Iter 7 | ✅ Iter 8 |
+| 10 | MODERATE | Engine.generate KVCache constructors not shown | Iter 7 | ✅ Iter 8 |
+| 11 | LOW | MTP hasattr guard unnecessary | Iter 7 | ✅ Iter 8 |
+| 12 | CRITICAL | Triton final_states shape transposed | Iter 8 | ✅ Iter 8 |
+| 13 | CRITICAL | fp32 state lost at prefill→decode boundary | Iter 8 | ✅ Iter 10+11 |
+| 14 | LOW | Block.__init__ self-imports from gpt.py | Iter 8 | Still present (cosmetic) |
+| 15 | MODERATE | Muon LR incorrectly scaled | Iter 8 | ✅ Iter 10 |
+| 16 | LOW | _compute_window_sizes uses sequence_len//2 | Iter 8 | Addressed by Idea C |
+| 17 | LOW | init_weights skips Mamba per-head params | Iter 8 | ✅ Iter 11 |
+| 18 | MODERATE | norm self-import in GPT.forward | Iter 10 | ✅ Iter 11 |
+| 19 | LOW | config.mtp_lambda vs self.mtp_lambda | Iter 10 | ✅ Iter 11 |
+
+**All CRITICAL and MODERATE bugs are now FIXED.**
+Only Bug #14 remains (cosmetic self-import, fix during implementation).
+
+---
+
+---
+
+### Iteration 12 Review (Gemini "absolute final" + all 6 ideas adopted)
+
+**Date**: 2026-02-13
+**Verdict**: ALL 6 ideas from the alternative proposal successfully integrated.
+1 old cosmetic bug persists (#14), 1 old bug regressed (#18), 1 new bug (#20).
+
+#### Ideas Adoption Scorecard
+
+| Idea | Status | How |
+|------|--------|-----|
+| A: XLA scan | ✅ ADOPTED | `_ssd_scan_xla()` with `torch_xla.experimental.scan`, 3-way dispatch |
+| B: `mamba3_trapezoidal` | ✅ ADOPTED | GPTConfig field, `d_lambda` conditional in `d_in_proj`, trapezoidal `_ssd_step_ref` |
+| C: `window_long/short` | ✅ ADOPTED | GPTConfig fields, `_compute_window_sizes` uses `getattr(config, 'window_long', 0) or config.sequence_len` |
+| D: `scan_layers` safety | ✅ ADOPTED | Guard in base_train.py with `"A" in pat and "M" in pat` check |
+| E: `rope_theta` config | ✅ ADOPTED | `rope_theta` in GPTConfig, used in Mamba2Layer and `_precompute_rotary_embeddings(base=...)` |
+| F: `prev_B`/`prev_x` | ✅ ADOPTED | Full trapezoidal decode with `prev_B`/`prev_x` in `_ssd_step_ref` |
+
+#### Previously-Fixed Bugs Verified
+
+All critical bugs #1-13, #15, #17 remain fixed. Defensive fp32 cast
+in `_ssd_step_ref` present. Meta-init safety for A_log/dt_bias/D present.
+Muon LR uses `lr=matrix_lr` without `dmodel_lr_scale`. Triton state
+`.transpose(-1,-2).to(fp32)` present.
+
+#### Remaining Bugs
+
+##### Bug #14 (LOW): Block.__init__ self-imports — STILL PRESENT
+
+```python
+# Block.__init__ has:
+from nanochat.gpt import CausalSelfAttention  # same file
+from nanochat.gpt import MLP                   # same file
+```
+
+These are redundant — `CausalSelfAttention` and `MLP` are defined in
+gpt.py where Block lives. Only `from nanochat.mamba2 import Mamba2Layer`
+is a legitimate cross-module lazy import.
+
+**Fix**: Remove both imports, use classes directly.
+
+##### Bug #18 (MODERATE): GPT.forward norm self-import — REGRESSED
+
+```python
+# GPT.forward has:
+    x = self.transformer.wte(idx)
+    from nanochat.gpt import norm    # ← WRONG: self-import, runs every forward
+    x = norm(x)
+```
+
+This was fixed in iteration 11 but reintroduced in iteration 12.
+`norm()` is a module-level function at gpt.py:139, always in scope.
+
+**Fix**: Delete `from nanochat.gpt import norm`.
+
+##### Bug #20 (MODERATE): Trapezoidal prev_B shape too large
+
+```python
+# In _ssd_step_ref trapezoidal branch:
+    prev_B = states.setdefault("prev_B", torch.zeros_like(B_ssm))
+    prev_x = states.setdefault("prev_x", torch.zeros_like(x_ssm))
+```
+
+At this point `B_ssm` has shape `(B, nheads, d_state)` — AFTER
+`repeat_interleave(heads_per_group)`. Our design spec says `prev_B`
+should be `(B, ngroups, d_state)` to save memory (42x smaller when
+ngroups=1, nheads=12).
+
+With `zeros_like(B_ssm)`, `prev_B` is `(B, 12, 64)` = 768 elements
+instead of `(B, 1, 64)` = 64 elements per sample. Not a correctness
+bug (the math still works with expanded B), but wastes memory and
+diverges from the design spec.
+
+**Fix**: Initialize before `repeat_interleave`:
+```python
+if self.mamba3_trapezoidal:
+    # Store prev_B at group granularity (before repeat_interleave)
+    B_ssm_grouped = xBC_conv[..., self.d_inner : self.d_inner + self.ngroups*self.d_state].view(B_sz, self.ngroups, self.d_state)
+    prev_B = states.setdefault("prev_B", torch.zeros(B_sz, self.ngroups, self.d_state, device=x.device, dtype=torch.float32))
+    prev_x = states.setdefault("prev_x", torch.zeros(B_sz, self.nheads, self.headdim, device=x.device, dtype=x.dtype))
+    # ... after repeat_interleave for B_ssm:
+    prev_B_expanded = prev_B.repeat_interleave(heads_per_group, dim=1)
+```
+
+#### Design Notes (not bugs)
+
+**Trapezoidal training scan**: `_ssd_scan_ref` only implements Mamba-2
+chunked scan. When `mamba3_trapezoidal=True`, training uses the
+non-trapezoidal scan (equivalent to λ=1 forward Euler). Only decode
+uses the full trapezoidal recurrence. This is correct per our Phase 3
+design — the chunked trapezoidal scan requires Proposition 4 mask
+modifications or a custom Triton kernel. A warning would be helpful
+when `mamba3_trapezoidal=True` is used without the trapezoidal training
+scan being available.
+
+**XLA scan state not explicitly cast**: The XLA path stores
+`states["ssm_state"] = final_states` where `_ssd_scan_xla` returns
+fp32. This is correct but implicit — the Triton path explicitly casts
+with `.to(torch.float32)`. Consider adding explicit cast for clarity.
+
+#### Cumulative Bug Status Table (after iteration 12)
+
+| # | Severity | Description | Introduced | Fixed? |
+|---|----------|-------------|-----------|--------|
+| 1-11 | various | (see iterations 5-8) | Iter 5-7 | ✅ All fixed |
+| 12 | CRITICAL | Triton shape (H,D,N) vs ref (H,N,D) | Iter 8 | ✅ Iter 9 |
+| 13 | CRITICAL | fp32 lost at prefill→decode | Iter 8 | ✅ Iter 10 |
+| 14 | LOW | Block.__init__ self-imports | Iter 8 | **STILL OPEN** |
+| 15 | MODERATE | Muon LR scaled by dmodel_lr_scale | Iter 8 | ✅ Iter 10 |
+| 16 | LOW | window sizes hardcoded | Iter 8 | ✅ Iter 12 (Idea C) |
+| 17 | LOW | init_weights skips per-head params | Iter 8 | ✅ Iter 11 |
+| 18 | MODERATE | norm self-import in GPT.forward | Iter 8 | ✅ Iter 11, **REGRESSED Iter 12** |
+| 19 | LOW | config mtp_lambda vs self.mtp_lambda | Iter 10 | ✅ Iter 12 |
+| 20 | MODERATE | Trapezoidal prev_B shape (nheads vs ngroups) | Iter 12 | **NEW** |
+
+**Summary**: 20 bugs total. 17 fixed. 3 remaining (1 LOW cosmetic, 2 MODERATE).
+All CRITICAL bugs fixed. Ready to implement with 3 minor fixes during coding.
+
+---
+
+### Iteration 13: Bug Fixes #14, #18, #20
+
+**Date**: 2026-02-13
+**Verdict**: All 3 remaining bugs correctly fixed. 20/20 bugs resolved.
+
+**Bug #14 FIXED**: Block.__init__ now uses `CausalSelfAttention` and `MLP`
+directly (no self-imports). Only cross-module import `from nanochat.mamba2
+import Mamba2Layer` retained.
+
+**Bug #18 FIXED**: `from nanochat.gpt import norm` removed from GPT.forward.
+`norm()` used directly as module-level function.
+
+**Bug #20 FIXED**: Trapezoidal `prev_B` initialized at group level
+`(B, ngroups, d_state)` via `torch.zeros_like(B_ssm)` BEFORE repeat_interleave.
+Expanded dynamically to head level only for the step computation. Memory
+savings confirmed: 4.5KB/layer (Strategy B) vs 54KB/layer (old).
+
+**Minor observation**: `prev_x` remains at `(B, nheads, headdim)` since x_ssm
+is inherently head-level — this is correct, no waste.
+
+#### Final Bug Status: 20/20 FIXED
+
+| # | Severity | Description | Fixed |
+|---|----------|-------------|-------|
+| 1-11 | CRITICAL-LOW | Iterations 5-8 bugs | ✅ |
+| 12 | CRITICAL | Triton state shape transposed | ✅ Iter 10 |
+| 13 | CRITICAL | fp32 lost at prefill→decode | ✅ Iter 10 |
+| 14 | LOW | Block self-imports | ✅ **Iter 13** |
+| 15 | MODERATE | Muon LR scaling | ✅ Iter 10 |
+| 16 | LOW | Window sizes (addressed by Idea C) | ✅ Iter 12 |
+| 17 | LOW | init_weights per-head params | ✅ Iter 11 |
+| 18 | MODERATE | norm self-import in forward | ✅ **Iter 13** |
+| 19 | LOW | config mtp_lambda access | ✅ Iter 11 |
+| 20 | MODERATE | Trapezoidal prev_B memory waste | ✅ **Iter 13** |
+
+---
+
+### Patch Bundle Review (External Implementation)
+
+**Date**: 2026-02-13
+**Source**: Pre-built patch at `/home/dave/Downloads/nanochat_mamba_patch/`
+**Files**: mamba2.py (634 lines), gpt.py (658 lines, truncated), engine.py,
+checkpoint_manager.py, mtp.py, base_train.py
+
+#### Status: DO NOT ADOPT wholesale — 7 bugs found. 1 excellent idea extracted.
+
+**Bugs in the patch**:
+1. `mamba2.py:105`: `self.qk_norm` should be `self.qknorm` — typo crashes at init
+2. `gpt.py:624`: `get_ddp()` does not exist — should be `get_dist_info()`
+3. `gpt.py`: File truncated at line 658 — missing `GPT.forward()`, rotary, generate
+4. `base_train.py`: New CLI args defined but NOT wired into `model_config_kwargs`
+5. `base_train.py:606`: Passes `adam_betas` to changed signature that doesn't accept it
+6. `base_train.py:609`: Destructuring `adamw, muon = optimizers` reversed from return order
+7. `sparse_attention.py`: Included but identical to original — advance() NOT removed
+
+**Idea G: Dual-Scan Trapezoidal Decomposition** (ADOPT — Phase 3)
+
+The patch decomposes trapezoidal discretization into TWO chunked SSD scans
+instead of an O(T) Python loop. This is the key insight we were missing for
+making Phase 3 training efficient.
+
+**How it works**: The trapezoidal update is:
+```
+h_t = alpha_t * h_{t-1} + beta_t * B_{t-1}*x_{t-1} + gamma_t * B_t*x_t
+```
+
+This can be decomposed as two independent SSD scans:
+```python
+# 1. Current term: standard SSD with dt_input = gamma * dt
+y_curr, state_curr = _ssd_scan_ref(x_ssm, dt_decay=dt_soft, dt_input=gamma_dt, ...)
+
+# 2. Previous term: SSD on shifted inputs with dt_input = beta * dt
+x_prev = F.pad(x_ssm, (0,0, 0,0, 1,0))[:, :-1]  # shift right by 1
+B_prev = F.pad(B_ssm, (0,0, 0,0, 1,0))[:, :-1]
+y_prev, state_prev = _ssd_scan_ref(x_prev, dt_decay=dt_soft, dt_input=beta_dt, ...)
+
+# 3. Combine
+y = y_curr + y_prev + x_ssm * D
+final_state = state_curr + state_prev
+```
+
+**Why this matters**: Instead of an O(T) Python loop (2048 iterations per
+layer), this uses two O(chunk_size) chunked scans (~8 iterations each).
+The total cost is 2x a standard Mamba-2 scan — still 128x faster than
+the naive Python loop.
+
+**Implementation change needed in `_ssd_scan_ref`**: Split the `dt`
+parameter into `dt_decay` (used for exp(dt*A) decay computation) and
+`dt_input` (used for scaling B*x before accumulation). In standard
+Mamba-2, both are identical. In trapezoidal mode, `dt_decay` stays as
+dt_soft while `dt_input` becomes gamma*dt or beta*dt.
+
+```python
+def _ssd_scan_ref(self, x, dt_decay, dt_input, A, B, C, D):
+    # dt_decay: used for exp(dt*A) state decay
+    # dt_input: used for scaling the B*x input term
+    # For Mamba-2: dt_decay == dt_input == dt_soft
+    # For trapezoidal current: dt_input = gamma * dt
+    # For trapezoidal previous: dt_input = beta * dt
+
+    # ... chunking unchanged ...
+
+    dA_c = dt_decay_c * A.view(1, 1, 1, H)  # decay uses dt_decay
+    x_dt = x_c * dt_input_c.unsqueeze(-1)   # input scaling uses dt_input
+
+    # ... rest of scan unchanged ...
+```
+
+**Other minor ideas noted but NOT adopted**:
+- String-keyed state dict (`f'mamba_{layer_idx}'` vs integer) — no benefit
+- `_InferParamsProxy` fallback — defensive but adds complexity
+- `_get_or_create_causal_mask()` caching — minor optimization
+- `exp/clamp_min` instead of `exp(diff)` for decay — numerically equivalent
+- `conv1d.reset_parameters()` call — our meta-init in init_weights is cleaner
+- `attn_long_window`/`attn_short_window` naming — we already have
+  `window_long`/`window_short` (Idea C)
+
+---
+
+## Implementation Plan
+
+The iteration 13 proposal with all 6 adopted ideas, all 20 bugs
+fixed, plus Idea G (dual-scan trapezoidal) forms the complete
+implementation specification.
+
+**Files to create/modify (final)**:
 
 | File | Action |
 |------|--------|
-| `nanochat/mamba2.py` | **Create** — Mamba2Layer class |
-| `nanochat/gpt.py` | **Modify** — GPTConfig, Block dispatch, init_weights, setup_optimizers, estimate_flops, _compute_window_sizes |
-| `nanochat/engine.py` | **Modify** — KVCache (add MambaInferenceParams), move advance() |
+| `nanochat/mamba2.py` | **Create** — Mamba2Layer class (Phase 1-2 + XLA scan + Phase 3 trapezoidal decode) |
+| `nanochat/gpt.py` | **Modify** — GPTConfig (mamba + window_long/short + trapezoidal + rope_theta), Block dispatch, init_weights (meta-init safe), setup_optimizers, estimate_flops, _compute_window_sizes, forward |
+| `nanochat/engine.py` | **Modify** — KVCache (add MambaInferenceParams), Engine.generate (has_mamba) |
+| `nanochat/sparse_attention.py` | **Modify** — Remove advance() from _full_attention |
 | `nanochat/mtp.py` | **Modify** — Add mamba_enabled=False to plain_config |
-| `nanochat/checkpoint_manager.py` | **Modify** — Add mamba config defaults to compat patching |
-| `base_train.py` | **Modify** — CLI args for mamba |
+| `nanochat/checkpoint_manager.py` | **Modify** — Add mamba + window + trapezoidal + rope_theta defaults |
+| `scripts/base_train.py` | **Modify** — CLI args for mamba + window + rope_theta, scan_layers safety check |
+| `tests/test_mamba_integration.py` | **Create** — Composability tests for all phase/module combinations |

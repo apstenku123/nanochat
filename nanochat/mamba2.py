@@ -201,11 +201,7 @@ class Mamba2Layer(nn.Module):
         A = -torch.exp(self.A_log)  # (H,) negative
 
         # --- Choose scan backend ---
-        # xla_scan backward with SPMD requires torchax which pulls incompatible
-        # jax versions.  Fall back to chunked reference scan on TPU for now.
-        # The reference scan loops over nchunks (= L/256 ≈ 8) not L, so XLA
-        # unrolls it into a manageable HLO graph.
-        use_xla = False  # disabled: SPMD backward needs torchax (jax 0.9+)
+        use_xla = (x.device.type == 'xla') and _HAVE_XLA_SCAN
         use_triton = (mamba_chunk_scan_combined is not None and x.device.type == "cuda"
                       and not self.mamba3_trapezoidal)
 

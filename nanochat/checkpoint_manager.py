@@ -39,6 +39,23 @@ def _patch_missing_config_keys(model_config_kwargs):
     model_config_kwargs.setdefault("mhc_epsilon", 1e-6)
     model_config_kwargs.setdefault("mhc_blend_alpha", 1.0)
     model_config_kwargs.setdefault("aux_loss_weight", 0.0)
+    # Mamba-2/3 hybrid integration
+    model_config_kwargs.setdefault("mamba_enabled", False)
+    model_config_kwargs.setdefault("mamba_pattern", "")
+    model_config_kwargs.setdefault("mamba_d_state", 64)
+    model_config_kwargs.setdefault("mamba_d_conv", 4)
+    model_config_kwargs.setdefault("mamba_expand", 2)
+    model_config_kwargs.setdefault("mamba_headdim", 128)
+    model_config_kwargs.setdefault("mamba_ngroups", 1)
+    model_config_kwargs.setdefault("mamba_chunk_size", 256)
+    model_config_kwargs.setdefault("mamba3_qknorm", False)
+    model_config_kwargs.setdefault("mamba3_bias", False)
+    model_config_kwargs.setdefault("mamba3_complex_rope", False)
+    model_config_kwargs.setdefault("mamba3_trapezoidal", False)
+    # Attention window decoupling + RoPE
+    model_config_kwargs.setdefault("window_long", 0)
+    model_config_kwargs.setdefault("window_short", 0)
+    model_config_kwargs.setdefault("rope_theta", 10000.0)
 
 
 def _build_gpt_config(model_config_kwargs):
@@ -131,7 +148,7 @@ def _download_from_gcs(local_path, gcs_bucket=None):
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     try:
         logger.info(f"Downloading from GCS: {gcs_path}")
-        result = subprocess.run(["gsutil", "-m", "cp", gcs_path, local_path],
+        result = subprocess.run(["gcloud", "storage", "cp", gcs_path, local_path],
                                capture_output=True, text=True, timeout=600)
         if result.returncode == 0:
             logger.info(f"Downloaded from GCS: {local_path}")

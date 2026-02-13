@@ -42,7 +42,7 @@ case "$PROFILE" in
             --xla_flash_attn
             --data_dir=/home/dave/data/parquet
             --streaming_data
-            --run=d16_400M_v6e4_65k_flash_cppeval
+            --run=dummy
             --core_metric_every=5000
             --save_every=5000
             --sample_every=5000
@@ -67,7 +67,7 @@ case "$PROFILE" in
             --xla_flash_attn
             --data_dir=/home/dave/data/parquet
             --streaming_data
-            --run=d16_400M_v6e4_longctx_16k
+            --run=dummy
             --core_metric_every=2500
             --save_every=2500
             --sample_every=2500
@@ -91,7 +91,7 @@ case "$PROFILE" in
             --no_compile
             --data_dir=/home/dave/data/parquet
             --streaming_data
-            --run=d16_400M_v5e8_65k
+            --run=dummy
             --core_metric_every=5000
             --save_every=5000
             --sample_every=5000
@@ -109,14 +109,14 @@ case "$PROFILE" in
         TRAIN_ARGS=(
             --depth=16
             --num_iterations=50000
-            --device_batch_size=2
+            --device_batch_size=1
             --max_seq_len=16384
             --kernel=current
             --no_compile
             --xla_flash_attn
             --data_dir=/home/dave/data/parquet
             --streaming_data
-            --run=d16_400M_v6e4_mhc_16k
+            --run=dummy
             --mhc
             --core_metric_every=2500
             --save_every=2500
@@ -142,7 +142,7 @@ case "$PROFILE" in
             --xla_flash_attn
             --data_dir=/home/dave/data/parquet
             --streaming_data
-            --run=d16_400M_v6e4_engram_16k
+            --run=dummy
             --engram
             --engram_layers=2,6
             --core_metric_every=2500
@@ -169,7 +169,7 @@ case "$PROFILE" in
             --xla_flash_attn
             --data_dir=/home/dave/data/parquet
             --streaming_data
-            --run=d16_400M_v6e4_mhc_engram_16k
+            --run=dummy
             --mhc
             --engram
             --engram_layers=2,6

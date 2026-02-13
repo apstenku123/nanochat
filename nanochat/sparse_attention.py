@@ -139,8 +139,7 @@ class DeepSeekSparseAttention(nn.Module):
                 causal=True,
                 window_size=window_size,
             )
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
+            # kv_cache.advance() is now centralized in GPT.forward
 
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
