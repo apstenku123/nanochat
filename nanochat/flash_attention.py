@@ -303,6 +303,10 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     # Note: does not support sliding window, use window_pattern=L for long context
     if _use_xla_flash(q.device):
         # XLA flash expects (B, H, T, D), our input is (B, T, H, D)
+        # Ensure matching dtypes: QK-norm (rms_norm) may upcast q,k to float32
+        # while v stays in bfloat16, causing a dtype mismatch error in Pallas FA.
+        if q.dtype != v.dtype:
+            q, k = q.to(v.dtype), k.to(v.dtype)
         q_t = q.transpose(1, 2)
         k_t = k.transpose(1, 2)
         v_t = v.transpose(1, 2)
@@ -369,6 +373,11 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     T_total = pos + T_new
     k_full = k_cache[:, :T_total]
     v_full = v_cache[:, :T_total]
+
+    # Ensure matching dtypes (QK-norm may upcast q to float32)
+    target_dtype = v_full.dtype
+    if q.dtype != target_dtype:
+        q = q.to(target_dtype)
 
     # Transpose for SDPA: (B, T, H, D) -> (B, H, T, D)
     q_t = q.transpose(1, 2)
