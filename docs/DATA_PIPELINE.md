@@ -180,15 +180,20 @@ python -m scripts.base_train \
 
 ```
 gs://nanochat-training-data-2026/
-├── data/                          # Raw source data (compressed)
+├── data/                          # Raw source data + processed parquet
 │   ├── cpp_combined_10b_v3.jsonl.gz   # 4.5M+ C++ files
 │   ├── ms_src.jsonl.gz                # Microsoft C++ source
 │   ├── cpp_clean_v4.jsonl             # Cleaned subset
 │   ├── combined_sft.jsonl             # SFT training data
 │   ├── diff_sft.jsonl                 # Diff-based SFT data
 │   ├── docstring_pairs_full.jsonl     # Docstring extraction pairs
-│   └── gspo_prompts.jsonl             # GSPO prompts
-├── parquet/                       # Processed training data
+│   ├── gspo_prompts.jsonl             # GSPO prompts
+│   ├── cpp_crossfile_16k/             # 8.1M docs, 23 GB (tree-sitter cross-file)
+│   ├── cpp_project_crossfile_16k/     # 1.0M docs, 8 GB (project-aware)
+│   ├── cpp_clang_crossfile_16k/       # 794K docs, 883 MB (clang semantic)
+│   ├── cpp_compilable_16k/            # 1.0M docs, 7.25 GB (compilable, RECOMMENDED)
+│   └── cpp_compilable_64k/            # 394K docs, 3.33 GB (compilable, long-context)
+├── parquet/                       # Processed training data (legacy)
 │   ├── base_data_v3/                  # 105 shards, standard training
 │   └── cpp_chunked_16k/              # 140+ shards, 16K context
 ├── tokenizer_65k/                 # 65K C++ tokenizer
@@ -222,6 +227,138 @@ python -u -m scripts.data.chunk_cpp_data \
 gcloud storage cp -r data/cpp_chunked_parquet_new/ \
     gs://nanochat-training-data-2026/parquet/cpp_chunked_<NEW_VALUE>/
 ```
+
+## Rust cpp-chunker (Advanced Pipeline)
+
+The Rust-based `cpp-chunker` tool at `tools/cpp_chunker/` provides high-performance, dependency-aware C++ chunking with multiple modes. It processes raw C++ project directories directly (no JSONL intermediate).
+
+### Source Code
+
+```
+tools/cpp_chunker/
+├── src/
+│   ├── main.rs           # CLI entry point, batch/project/cross-file modes
+│   ├── chunker.rs         # Tree-sitter AST parsing (functions, classes, structs, enums)
+│   ├── deps.rs            # Call graph analysis, dependency levels, cross-file resolution
+│   ├── compilable.rs      # Compilable chunk mode (types before functions, bottom-up)
+│   ├── global_index.rs    # Global function index for cross-file dependency resolution
+│   └── project_graph.rs   # Project dependency DAG, topological ordering
+└── Cargo.toml
+```
+
+### Building
+
+```bash
+cd tools/cpp_chunker
+cargo build --release
+# Binary: target/release/cpp-chunker
+```
+
+### Processing Modes
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| Basic | (default) | Tree-sitter chunking, function-boundary splitting |
+| Dep-aware | `--dep-aware` | Bottom-up function ordering within each file |
+| Cross-file | `--cross-file` | Two-pass: global function index + cross-file deps |
+| **Project-aware** | `--project-dirs` | Reads raw project dirs, dependency DAG ordering |
+| **Compilable** | `--project-dirs --compilable` | Near-compilable chunks: preamble → types → functions |
+
+### Compilable Mode (Recommended)
+
+The `--compilable` flag produces training documents structured as near-compilable C++ units:
+
+1. **Preamble** — `#include` directives, `using` declarations, forward declarations
+2. **Type definitions** — structs, classes, enums in topological dependency order (e.g., `Base` before `Derived`)
+3. **Functions** — bottom-up call order (leaf callees first, root callers last)
+
+This ensures the model sees every definition before its usage.
+
+### Running on build3
+
+**Prerequisites:** 93 C++ open-source projects in `~/data/cpp_raw/` on build3 (c4-highmem-48-lssd, IP 35.242.211.80).
+
+```bash
+# Generate 16K compilable chunks
+./cpp-chunker \
+    --project-dirs ~/data/cpp_raw \
+    --output ~/data/cpp_compilable_16k.jsonl \
+    --max-tokens 16384 \
+    --cross-depth 3 \
+    --compilable \
+    --max-file-bytes 500000
+
+# Generate 64K compilable chunks
+./cpp-chunker \
+    --project-dirs ~/data/cpp_raw \
+    --output ~/data/cpp_compilable_64k.jsonl \
+    --max-tokens 65536 \
+    --cross-depth 3 \
+    --compilable \
+    --max-file-bytes 500000
+```
+
+### Parquet Conversion
+
+After generating JSONL, convert to parquet for training:
+
+```python
+import json, os, random
+import pyarrow as pa, pyarrow.parquet as pq
+
+texts = [json.loads(l)["text"] for l in open("output.jsonl") if l.strip()]
+random.Random(42).shuffle(texts)
+val_count = max(1, int(len(texts) * 0.01))
+train, val = texts[:-val_count], texts[-val_count:]
+
+os.makedirs("parquet_dir", exist_ok=True)
+for i in range(0, len(train), 50000):
+    batch = train[i:i+50000]
+    pq.write_table(pa.table({"text": batch}), f"parquet_dir/shard_{i//50000:05d}.parquet")
+pq.write_table(pa.table({"text": val}), "parquet_dir/val_shard.parquet")
+```
+
+### All Datasets on GCS
+
+All at `gs://nanochat-training-data-2026/data/`:
+
+| Dataset | Docs | Parquet Size | Shards | Mode | Token Limit |
+|---------|------|-------------|--------|------|-------------|
+| `cpp_crossfile_16k` | 8,092,541 | 23 GB | 162+val | Cross-file (JSONL) | 16K |
+| `cpp_project_crossfile_16k` | 1,015,901 | 8.0 GB | 21+val | Project-aware | 16K |
+| `cpp_clang_crossfile_16k` | 794,028 | 883 MB | 16+val | Clang semantic | 16K |
+| **`cpp_compilable_16k`** | **1,012,293** | **7.25 GB** | **21+val** | **Compilable** | **16K** |
+| **`cpp_compilable_64k`** | **393,782** | **3.33 GB** | **8+val** | **Compilable** | **64K** |
+
+### Training Commands
+
+```bash
+# 16K compilable (standard context)
+python -m scripts.base_train \
+    --data_dir=<local_path>/cpp_compilable_16k \
+    --streaming_data \
+    --max_seq_len=1024 --device_batch_size=8 \
+    --depth=16 --num_iterations=50000
+
+# 64K compilable (long context, TPU v6e)
+python -m scripts.base_train \
+    --data_dir=<local_path>/cpp_compilable_64k \
+    --streaming_data \
+    --max_seq_len=16384 --device_batch_size=1 \
+    --depth=16 --xla_flash_attn --no_compile
+```
+
+### 93 Source Projects
+
+The raw C++ projects (641K files, 29GB) were downloaded from GitHub and are stored at `~/data/cpp_raw/` on build3. Projects include: boost, llvm-project, linux, gcc-mirror, opencv, tensorflow, protobuf, grpc, rocksdb, clickhouse, godot, qemu, freebsd-src, and 80 more.
+
+### Pipeline Performance
+
+| Pipeline | Time | Rate | Notes |
+|----------|------|------|-------|
+| Project discovery + DAG | ~5s | — | 93 projects, symlink-safe |
+| Compilable 16K generation | 237s | 1,225 files/sec | 290K source files |
+| Compilable 64K generation | 200s | 1,447 files/sec | Fewer docs (more per file) |
 
 ## SFT Data
 

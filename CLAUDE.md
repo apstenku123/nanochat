@@ -198,6 +198,79 @@ The `--xla_flash_attn` flag calls `enable_xla_flash_attention()` in `nanochat/fl
 - **First XLA compilation** takes 30-60+ minutes — this is normal
 - **Spot instances** can be preempted — always use `NANOCHAT_GCS_CHECKPOINT_BUCKET` for cloud checkpoints
 
+## C++ Data Pipeline (Rust cpp-chunker)
+
+For full details see [docs/DATA_PIPELINE.md](docs/DATA_PIPELINE.md).
+
+### Tool Location and Build
+
+```bash
+# Source: tools/cpp_chunker/src/{main,chunker,deps,compilable,global_index,project_graph}.rs
+cd tools/cpp_chunker && cargo build --release
+# Binary: tools/cpp_chunker/target/release/cpp-chunker
+```
+
+### Processing Modes
+
+| Mode | Flags | Use Case |
+|------|-------|----------|
+| Project-aware | `--project-dirs <dir>` | Process raw project dirs with dependency DAG |
+| **Compilable** | `--project-dirs <dir> --compilable` | **Best quality** — types before functions, bottom-up |
+| Cross-file | `--cross-file --inputs <jsonl>` | Two-pass JSONL mode with global function index |
+
+### Quick Commands (build3: 35.242.211.80)
+
+```bash
+# Compilable 16K chunks (recommended for training)
+./cpp-chunker --project-dirs ~/data/cpp_raw --output out.jsonl \
+    --max-tokens 16384 --cross-depth 3 --compilable --max-file-bytes 500000
+
+# Compilable 64K chunks (for long-context training)
+./cpp-chunker --project-dirs ~/data/cpp_raw --output out.jsonl \
+    --max-tokens 65536 --cross-depth 3 --compilable --max-file-bytes 500000
+```
+
+### Datasets on GCS (gs://nanochat-training-data-2026/data/)
+
+| Dataset | Docs | Size | Token Limit | Description |
+|---------|------|------|-------------|-------------|
+| `cpp_crossfile_16k` | 8.1M | 23 GB | 16K | Tree-sitter cross-file (JSONL input) |
+| `cpp_project_crossfile_16k` | 1.0M | 8.0 GB | 16K | Project-aware cross-file |
+| `cpp_clang_crossfile_16k` | 794K | 883 MB | 16K | Clang semantic indexer |
+| **`cpp_compilable_16k`** | **1.0M** | **7.25 GB** | **16K** | **Compilable: types→functions (bottom-up)** |
+| **`cpp_compilable_64k`** | **394K** | **3.33 GB** | **64K** | **Compilable: types→functions (bottom-up)** |
+
+### Training with Compilable Data
+
+```bash
+# Download from GCS
+gsutil -m cp -r gs://nanochat-training-data-2026/data/cpp_compilable_16k/ /path/to/data/
+
+# Train (GPU)
+python -m scripts.base_train --data_dir=/path/to/data/cpp_compilable_16k \
+    --streaming_data --depth=16 --max_seq_len=1024 --device_batch_size=8
+
+# Train (TPU v6e, long context with 64K data)
+python -m scripts.base_train --data_dir=/path/to/data/cpp_compilable_64k \
+    --streaming_data --depth=16 --max_seq_len=16384 --device_batch_size=1 \
+    --xla_flash_attn --no_compile
+```
+
+### What "Compilable" Means
+
+Each training document is ordered as a near-compilable C++ unit:
+1. **Preamble** — `#include`, `using`, forward declarations
+2. **Type definitions** — structs/classes/enums in topological order (`Base` before `Derived`)
+3. **Functions** — bottom-up (leaf callees first, callers last)
+
+Source: `tools/cpp_chunker/src/compilable.rs` (280 lines, 3 tests)
+
+### Raw Projects (build3)
+
+93 C++ open-source projects at `~/data/cpp_raw/` (641K files, 29GB). Includes: boost, linux, llvm-project, opencv, tensorflow, protobuf, grpc, rocksdb, clickhouse, godot, qemu, freebsd-src, etc.
+
+Clang indexer: `tools/clang_indexer/index_project.py` (Python, libclang-based semantic extraction)
+
 ---
 
 This project uses **beads (bd)** for issue tracking with Jira synchronization.
