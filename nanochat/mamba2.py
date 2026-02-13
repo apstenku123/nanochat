@@ -201,7 +201,10 @@ class Mamba2Layer(nn.Module):
         A = -torch.exp(self.A_log)  # (H,) negative
 
         # --- Choose scan backend ---
-        use_xla = (x.device.type == 'xla') and _HAVE_XLA_SCAN
+        # Use chunked reference scan on all backends: the SSD "dual" form uses
+        # O(nchunks) dense matmuls instead of O(T) recurrence. The cross-chunk
+        # state pass uses xla_scan when available (only ~64 iterations for 16K).
+        use_xla = False
         use_triton = (mamba_chunk_scan_combined is not None and x.device.type == "cuda"
                       and not self.mamba3_trapezoidal)
 
@@ -341,7 +344,13 @@ class Mamba2Layer(nn.Module):
     # XLA Scan (TPU-optimized, no Python loops)
     # -------------------------------------------------------------------------
     def _ssd_scan_xla(self, x_ssm, dt, A, B_ssm, C_ssm, D):
-        """Native XLA scan for TPU: O(T) with no Python loop overhead."""
+        """Native XLA scan for TPU: O(T) with no Python loop overhead.
+
+        Optimized for minimal scan body HLO: alpha and dtB are pre-computed
+        outside the scan; D skip-connection is added after the scan.  This
+        keeps the While-loop body small to stay under the 2GB protobuf limit
+        when stacking 16+ layers with gradient checkpointing.
+        """
         B_sz, T, H, D_head = x_ssm.shape
         G, N = self.ngroups, self.d_state
         Hpg = self.heads_per_group
@@ -349,38 +358,36 @@ class Mamba2Layer(nn.Module):
         # Reshape to grouped form to avoid repeat_interleave inside scan body
         x_g = x_ssm.view(B_sz, T, G, Hpg, D_head)
         dt_g = dt.view(B_sz, T, G, Hpg)
-        A_g = A.view(G, Hpg)
-        D_g = D.view(G, Hpg)
 
         state0 = torch.zeros(B_sz, G, Hpg, N, D_head, device=x_ssm.device, dtype=torch.float32)
 
-        # Broadcast A_g and D_g to time-major tensors so they're traced as scan
-        # inputs rather than captured closures (functorch requires FakeTensors).
-        A_g_t = A_g.unsqueeze(0).expand(T, -1, -1).contiguous().float()   # (T, G, Hpg)
-        D_g_t = D_g.unsqueeze(0).expand(T, -1, -1).contiguous().float()   # (T, G, Hpg)
+        # Pre-compute outside the scan: alpha = exp(dt * A), dtB = dt * B
+        # This reduces the scan body from 8 ops to 4, halving HLO size.
+        alpha = torch.exp(dt_g * A.view(1, 1, G, Hpg)).float()       # (B, T, G, Hpg)
+        dtB = (dt_g.unsqueeze(-1) * B_ssm.unsqueeze(-2)).float()     # (B, T, G, Hpg, N)
 
         # Time-major for scan: leading dim is T
         xs = (
-            x_g.transpose(0, 1).float(),
-            dt_g.transpose(0, 1).float(),
-            B_ssm.transpose(0, 1).float(),
-            C_ssm.transpose(0, 1).float(),
-            A_g_t,
-            D_g_t,
+            x_g.transpose(0, 1).float(),          # (T, B, G, Hpg, D)
+            alpha.transpose(0, 1),                 # (T, B, G, Hpg)
+            dtB.transpose(0, 1),                   # (T, B, G, Hpg, N)
+            C_ssm.transpose(0, 1).float(),         # (T, B, G, N)
         )
 
         def body(carry, inp):
-            x_t, dt_t, B_t, C_t, A_t, D_t = inp
-            alpha = torch.exp(dt_t * A_t.unsqueeze(0))
-            dtB = dt_t.unsqueeze(-1) * B_t.unsqueeze(-2)       # (B,G,Hpg,N)
-            dBx = dtB.unsqueeze(-1) * x_t.unsqueeze(-2)         # (B,G,Hpg,N,D)
-            new_carry = carry * alpha.unsqueeze(-1).unsqueeze(-1) + dBx
-            y_t = (C_t.unsqueeze(-2).unsqueeze(-1) * new_carry).sum(dim=-2)  # (B,G,Hpg,D)
-            y_t = y_t + D_t.unsqueeze(0).unsqueeze(-1) * x_t
+            x_t, alpha_t, dtB_t, C_t = inp
+            dBx = dtB_t.unsqueeze(-1) * x_t.unsqueeze(-2)          # (B,G,Hpg,N,D)
+            new_carry = carry * alpha_t.unsqueeze(-1).unsqueeze(-1) + dBx
+            y_t = (C_t.unsqueeze(-2).unsqueeze(-1) * new_carry).sum(dim=-2)
             return new_carry, y_t
 
         stateT, ys = xla_scan(body, state0, xs)
-        y = ys.transpose(0, 1).reshape(B_sz, T, H, D_head).to(x_ssm.dtype)
+
+        # Add D skip-connection outside the scan (doesn't depend on carry)
+        D_g = D.view(1, 1, G, Hpg, 1).float()
+        ys_with_d = ys + D_g * x_g.transpose(0, 1).float()
+
+        y = ys_with_d.transpose(0, 1).reshape(B_sz, T, H, D_head).to(x_ssm.dtype)
         final_state = stateT.reshape(B_sz, H, N, D_head).to(torch.float32)
         return y, final_state
 
@@ -424,20 +431,36 @@ class Mamba2Layer(nn.Module):
         x_dt = x_c * dt_c.unsqueeze(-1)
         chunk_states = torch.einsum('bclhn,bclhd->bchnd', B_h * decay_to_end.unsqueeze(-1), x_dt)
 
-        chunk_decay = torch.exp(dA_cumsum[:, :, -1])
+        # --- Cross-chunk: parallel matmul scan (no Python loop) ---
+        # The recurrence state[c] = decay[c]*state[c-1] + chunk_states[c] is linear
+        # and can be expressed as a matrix multiply over the chunk dimension.
+        # For nchunks=64 at 16K seq, this is a tiny 64x64 matmul, replacing a
+        # Python for-loop that would unroll 64 ops per layer into the XLA HLO graph.
+        log_chunk_decay = dA_cumsum[:, :, -1]  # (B, nchunks, H) - already in log-space
+        cum_log = torch.cumsum(log_chunk_decay, dim=1)  # (B, nchunks, H)
 
-        # FP32 state accumulation for numerical stability
-        running_state = torch.zeros(B_sz, H, N, D_head, device=x.device, dtype=torch.float32)
-        chunk_decay_f32 = chunk_decay.to(torch.float32)
+        # Decay matrix: M[c,j] = exp(cum[c] - cum[j]) for j <= c, else 0
+        # M[c,j] represents the total state decay from chunk j through chunk c
+        # IMPORTANT: mask BEFORE exp to avoid inf in upper triangle (cum[c]-cum[j] > 0
+        # when j > c since cum is monotonically decreasing). exp(inf) = inf causes NaN
+        # in autograd even though torch.where masks it out.
+        decay_diff = cum_log.unsqueeze(2) - cum_log.unsqueeze(1)  # (B, nchunks, nchunks, H)
+        chunk_causal = torch.tril(torch.ones(nchunks, nchunks, device=x.device, dtype=torch.bool))
+        decay_diff = decay_diff.float().masked_fill(
+            ~chunk_causal.unsqueeze(0).unsqueeze(-1), float('-inf')
+        )
+        decay_matrix = torch.exp(decay_diff)  # (B, nchunks, nchunks, H) - upper tri is 0
+
         chunk_states_f32 = chunk_states.to(torch.float32)
+        # running_states[c] = sum_{j<=c} M[c,j] * chunk_states[j]
+        running_states = torch.einsum('bcjh,bjhnd->bchnd', decay_matrix, chunk_states_f32)
 
-        all_prev_states = []
-        for c in range(nchunks):
-            all_prev_states.append(running_state)
-            # running_state = running_state * ... + ... creates new tensor (safe without .clone())
-            running_state = running_state * chunk_decay_f32[:, c].view(B_sz, H, 1, 1) + chunk_states_f32[:, c]
+        # prev_states[c] = state BEFORE chunk c = running[c-1] for c>0, zeros for c=0
+        zeros_state = torch.zeros(B_sz, 1, H, N, D_head, device=x.device, dtype=torch.float32)
+        prev_states = torch.cat([zeros_state, running_states[:, :-1]], dim=1).to(x.dtype)
 
-        prev_states = torch.stack(all_prev_states, dim=1).to(x.dtype)
+        # Final state (for inference continuation)
+        running_state = running_states[:, -1]  # (B, H, N, D_head) fp32
 
         # y_cross: contribution from previous chunks
         cross_decay = torch.exp(dA_cumsum).unsqueeze(-1)
