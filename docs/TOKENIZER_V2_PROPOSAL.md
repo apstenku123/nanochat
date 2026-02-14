@@ -54,9 +54,39 @@ Based on vocabulary scaling law research (NeurIPS 2024): mainstream LLMs are und
 | 7000-7199 | 200 | Reserved | Expansion room |
 | 7200-65535 | 58,336 | **Morpheme-aware BPE** | Learned merges |
 
+### Empirical Validation (Feb 14, 2026)
+
+The domain-specific token ranges (5300-6999) were validated against the actual training corpus.
+See **[docs/VOCAB_FREQUENCY_ANALYSIS.md](VOCAB_FREQUENCY_ANALYSIS.md)** for full results.
+
+**Key findings from 150K document analysis (3 shards of cpp_compilable_16k)**:
+
+| Original Range | Original Count | Empirical Recommendation | Reason |
+|---------------|---------------|-------------------------|--------|
+| 5300-5799 GPU | 500 | **~35** | CUDA qualifiers/runtime/cuBLAS keep ~33. Drop ROCm (40 hits), XLA (45 hits), NCCL (11 hits), atomics (7 hits) entirely |
+| 5800-6299 SQL | 500 | **~70** | MySQL API (18) + SQLite3 (20) + SQL keywords (30) keep. Drop ODBC (82 hits) |
+| 6300-6599 Query/DB | 300 | **~35** | Protobuf compound names (15) + Redis (12) + MongoDB C++ (3) + gRPC compound (5). Drop proto_keywords (generic words), GraphQL (generic), MongoDB $ops (395 hits), ORMs (121 hits) |
+| 6600-6799 C++23/26 | 200 | **~25** | Keep compound names only (source_location, flat_map, etc.). Skip generic words (expected, chunk, just) |
+| 6800-6999 Testing | 200 | **~51** | GTest (36) + Catch/Boost (7) + CMake vars (8). All well-validated |
+| **Total domain** | **1,700** | **~216** | **87% reduction** — freed slots go to BPE merges |
+
+**The "generic word" problem**: 209 of 473 found tokens (`returns`, `map`, `enum`, `just`, `query`, `Status`)
+are common C++ identifiers appearing in 2-30% of documents. BPE will learn these naturally — fixed
+vocab slots are wasted on them. Only tokens with special naming patterns (`__double_underscore__`,
+`SCREAMING_CASE_MACROS`, `api_prefix_names`) genuinely need fixed slots.
+
+**Revised architecture** (reflecting empirical budget):
+
+| Range | Count | Category | Change from above |
+|-------|-------|----------|-------------------|
+| 5300-5534 | 235 | **Domain-specific tokens** | Consolidated, data-validated |
+| 5535-5799 | 265 | Reserved | Freed for expansion |
+| 5800-6999 | 1,200 | Reserved | Freed for expansion |
+| **Net effect** | **+1,465** | **More BPE merges** | 59,801 BPE tokens instead of 58,336 |
+
 ### v2: 48K Tokenizer (49,152 tokens) — FALLBACK
 
-Same fixed structure (7,200 fixed), with 41,952 morpheme-aware BPE tokens.
+Same fixed structure (5,535 fixed), with 43,617 morpheme-aware BPE tokens.
 
 ---
 
@@ -1148,3 +1178,8 @@ If budget is constrained, add in this order:
 - [Realm C++ SDK](https://github.com/realm/realm-cpp) -- MongoDB Realm object database
 - [SQLite C/C++ Interface](https://sqlite.org/cintro.html) -- SQLite3 C API (225+ functions)
 - [ODBC API Reference](https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/odbc-api-reference) -- Microsoft ODBC specification
+
+### Empirical Analysis
+- [Vocabulary Frequency Analysis](VOCAB_FREQUENCY_ANALYSIS.md) -- Corpus validation of proposed tokens (150K C++ documents)
+- Analysis tool: `scripts/data/analyze_vocab_frequency.py`
+- Raw results: `/tmp/vocab_frequency_results.json`
