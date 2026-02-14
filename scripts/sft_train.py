@@ -202,10 +202,10 @@ if args.resume:
     model_config_kwargs = meta["model_config"]
     model_config = GPTConfig(**model_config_kwargs)
     model = GPT(model_config)
-    model.to(device)
     model.init_weights()
     model.load_state_dict(model_state, strict=True, assign=True)
     del model_state
+    model.to(device)  # must be AFTER load_state_dict(assign=True) for XLA
     resume_step = meta.get("step", 0)
     resume_epoch = meta.get("epoch", 0)
     if optim_states:
@@ -219,10 +219,10 @@ elif args.checkpoint_path:
     model_config_kwargs = meta["model_config"]
     model_config = GPTConfig(**model_config_kwargs)
     model = GPT(model_config)
-    model.to(device)
     model.init_weights()
     model.load_state_dict(model_state, strict=True, assign=True)
     del model_state
+    model.to(device)  # must be AFTER load_state_dict(assign=True) for XLA
     print0(f"Loaded checkpoint from step {meta.get('step', '?')}")
 else:
     # Train from scratch

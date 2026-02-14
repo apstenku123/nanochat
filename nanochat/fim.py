@@ -22,10 +22,10 @@ from typing import Optional
 
 
 # Default token IDs matching our C++ tokenizer (scripts/tok_train_cpp.py)
-FIM_PREFIX_ID = 4   # <FIM_PREFIX>
-FIM_MIDDLE_ID = 5   # <FIM_MIDDLE>
-FIM_SUFFIX_ID = 6   # <FIM_SUFFIX>
-EOT_ID = 3          # <EOS> used as end-of-turn
+FIM_PREFIX_ID = 4  # <FIM_PREFIX>
+FIM_MIDDLE_ID = 5  # <FIM_MIDDLE>
+FIM_SUFFIX_ID = 6  # <FIM_SUFFIX>
+EOT_ID = 3  # <EOS> used as end-of-turn
 
 
 def apply_fim(
@@ -81,10 +81,144 @@ def apply_fim(
     if rng.random() < spm_rate:
         # SPM: suffix-prefix-middle (suffix comes right after sentinel, then
         # prefix+middle are contiguous so the model learns to continue from prefix)
-        return [fim_prefix_id, fim_suffix_id] + suffix + [fim_middle_id] + prefix + middle + [eot_id]
+        return (
+            [fim_prefix_id, fim_suffix_id]
+            + suffix
+            + [fim_middle_id]
+            + prefix
+            + middle
+            + [eot_id]
+        )
     else:
         # PSM: prefix-suffix-middle
-        return [fim_prefix_id] + prefix + [fim_suffix_id] + suffix + [fim_middle_id] + middle + [eot_id]
+        return (
+            [fim_prefix_id]
+            + prefix
+            + [fim_suffix_id]
+            + suffix
+            + [fim_middle_id]
+            + middle
+            + [eot_id]
+        )
+
+
+def apply_fim_function_level(
+    token_ids: list[int],
+    tokenizer,
+    fim_rate: float = 0.5,
+    spm_rate: float = 0.5,
+    fim_prefix_id: int = FIM_PREFIX_ID,
+    fim_middle_id: int = FIM_MIDDLE_ID,
+    fim_suffix_id: int = FIM_SUFFIX_ID,
+    eot_id: int = EOT_ID,
+    rng: random.Random | None = None,
+) -> list[int]:
+    """Apply FIM at C++ function boundaries instead of random positions.
+
+    Finds function bodies (matched { } blocks) in the token stream and uses
+    them as the "middle" region. This teaches the model to complete entire
+    function bodies given surrounding context.
+
+    Falls back to random FIM if no suitable function boundary is found.
+    """
+    if rng is None:
+        rng = random
+
+    if rng.random() > fim_rate:
+        return token_ids
+
+    n = len(token_ids)
+    if n < 10:
+        return token_ids
+
+    # Find { } block boundaries by scanning token strings
+    # We look for matched brace pairs that likely represent function bodies
+    open_brace_id = None
+    close_brace_id = None
+    try:
+        open_brace_id = (
+            tokenizer.encode("{")[0] if hasattr(tokenizer, "encode") else None
+        )
+        close_brace_id = (
+            tokenizer.encode("}")[0] if hasattr(tokenizer, "encode") else None
+        )
+    except (IndexError, TypeError):
+        pass
+
+    if open_brace_id is None or close_brace_id is None:
+        # Can't find brace tokens, fall back to random FIM
+        return apply_fim(
+            token_ids,
+            1.0,
+            spm_rate,
+            fim_prefix_id,
+            fim_middle_id,
+            fim_suffix_id,
+            eot_id,
+            rng,
+        )
+
+    # Find all top-level { } blocks (depth tracking)
+    # These are candidate function bodies
+    blocks = []  # list of (open_idx, close_idx)
+    depth = 0
+    block_start = -1
+    for i, tid in enumerate(token_ids):
+        if tid == open_brace_id:
+            if depth == 0:
+                block_start = i
+            depth += 1
+        elif tid == close_brace_id:
+            depth -= 1
+            if depth == 0 and block_start >= 0:
+                # Only keep blocks with reasonable size (4-500 tokens)
+                body_len = i - block_start - 1
+                if 4 <= body_len <= 500:
+                    blocks.append((block_start, i))
+                block_start = -1
+            if depth < 0:
+                depth = 0  # reset on malformed input
+
+    if not blocks:
+        # No suitable blocks found, fall back to random FIM
+        return apply_fim(
+            token_ids,
+            1.0,
+            spm_rate,
+            fim_prefix_id,
+            fim_middle_id,
+            fim_suffix_id,
+            eot_id,
+            rng,
+        )
+
+    # Pick a random function body block
+    open_idx, close_idx = rng.choice(blocks)
+
+    # Split: prefix = everything before {, middle = body inside braces, suffix = } and after
+    prefix = token_ids[: open_idx + 1]  # includes the opening {
+    middle = token_ids[open_idx + 1 : close_idx]  # function body
+    suffix = token_ids[close_idx:]  # includes the closing } and everything after
+
+    if rng.random() < spm_rate:
+        return (
+            [fim_prefix_id, fim_suffix_id]
+            + suffix
+            + [fim_middle_id]
+            + prefix
+            + middle
+            + [eot_id]
+        )
+    else:
+        return (
+            [fim_prefix_id]
+            + prefix
+            + [fim_suffix_id]
+            + suffix
+            + [fim_middle_id]
+            + middle
+            + [eot_id]
+        )
 
 
 def apply_fim_batch(
@@ -125,6 +259,7 @@ def apply_fim_batch(
 # Structured FIM: Docstring → Function Body completion
 # -----------------------------------------------------------------------------
 
+
 class StructuredFIMDataset:
     """
     Provides structured FIM examples from pre-extracted docstring pairs.
@@ -148,7 +283,7 @@ class StructuredFIMDataset:
             print(f"Warning: Structured FIM dataset not found: {pairs_path}")
             return
 
-        with open(pairs_path, 'r') as f:
+        with open(pairs_path, "r") as f:
             for i, line in enumerate(f):
                 if max_examples > 0 and i >= max_examples:
                     break
@@ -189,9 +324,9 @@ class StructuredFIMDataset:
 
         Format: <FIM_PREFIX> /* docstring */ signature { <FIM_SUFFIX> } <FIM_MIDDLE> body <EOT>
         """
-        docstring = pair.get('docstring', '')
-        signature = pair.get('signature', '')
-        body = pair.get('body', '')
+        docstring = pair.get("docstring", "")
+        signature = pair.get("signature", "")
+        body = pair.get("body", "")
 
         # Build prefix: /* docstring */ signature {
         prefix_text = f"/*\n{docstring}\n*/\n{signature} {{"
@@ -206,13 +341,13 @@ class StructuredFIMDataset:
 
         # PSM format: <FIM_PREFIX> prefix <FIM_SUFFIX> suffix <FIM_MIDDLE> middle <EOT>
         return (
-            [fim_prefix_id] +
-            prefix_tokens +
-            [fim_suffix_id] +
-            suffix_tokens +
-            [fim_middle_id] +
-            body_tokens +
-            [eot_id]
+            [fim_prefix_id]
+            + prefix_tokens
+            + [fim_suffix_id]
+            + suffix_tokens
+            + [fim_middle_id]
+            + body_tokens
+            + [eot_id]
         )
 
 
@@ -221,7 +356,9 @@ def apply_fim_mixed(
     structured_dataset: Optional[StructuredFIMDataset],
     fim_rate: float = 0.4,
     structured_rate: float = 0.2,
+    function_fim_rate: float = 0.0,
     spm_rate: float = 0.5,
+    tokenizer=None,
     fim_prefix_id: int = FIM_PREFIX_ID,
     fim_middle_id: int = FIM_MIDDLE_ID,
     fim_suffix_id: int = FIM_SUFFIX_ID,
@@ -229,18 +366,21 @@ def apply_fim_mixed(
     rng: random.Random = None,
 ) -> list[int]:
     """
-    Apply mixed FIM: either random FIM, structured FIM, or no FIM.
+    Apply mixed FIM: function-level, random, structured, or no FIM.
 
-    Probabilities:
+    Probabilities (checked in order):
     - structured_rate: Use structured FIM (docstring→body)
+    - function_fim_rate: Use function-level FIM (split at { } boundaries)
     - fim_rate: Use random FIM
-    - (1 - structured_rate - fim_rate): No FIM (standard next-token)
+    - remainder: No FIM (standard next-token)
 
     Args:
         token_ids: Original token sequence
         structured_dataset: StructuredFIMDataset instance (can be None)
         fim_rate: Probability of random FIM
         structured_rate: Probability of structured FIM
+        function_fim_rate: Probability of function-level FIM (requires tokenizer)
+        tokenizer: Tokenizer instance (needed for function-level FIM)
         Other args: same as apply_fim
 
     Returns:
@@ -256,10 +396,24 @@ def apply_fim_mixed(
         example = structured_dataset.get_random_example(rng)
         if example is not None:
             return example
-        # Fall through to random FIM if no structured examples
+        # Fall through if no structured examples
+
+    # Function-level FIM
+    if roll < structured_rate + function_fim_rate and tokenizer is not None:
+        return apply_fim_function_level(
+            token_ids,
+            tokenizer,
+            fim_rate=1.0,
+            spm_rate=spm_rate,
+            fim_prefix_id=fim_prefix_id,
+            fim_middle_id=fim_middle_id,
+            fim_suffix_id=fim_suffix_id,
+            eot_id=eot_id,
+            rng=rng,
+        )
 
     # Random FIM
-    if roll < structured_rate + fim_rate:
+    if roll < structured_rate + function_fim_rate + fim_rate:
         return apply_fim(
             token_ids,
             fim_rate=1.0,  # Always apply since we already rolled
@@ -280,7 +434,9 @@ def apply_fim_mixed_batch(
     structured_dataset: Optional[StructuredFIMDataset],
     fim_rate: float = 0.4,
     structured_rate: float = 0.2,
+    function_fim_rate: float = 0.0,
     spm_rate: float = 0.5,
+    tokenizer=None,
     fim_prefix_id: int = FIM_PREFIX_ID,
     fim_middle_id: int = FIM_MIDDLE_ID,
     fim_suffix_id: int = FIM_SUFFIX_ID,
@@ -294,7 +450,9 @@ def apply_fim_mixed_batch(
             structured_dataset,
             fim_rate=fim_rate,
             structured_rate=structured_rate,
+            function_fim_rate=function_fim_rate,
             spm_rate=spm_rate,
+            tokenizer=tokenizer,
             fim_prefix_id=fim_prefix_id,
             fim_middle_id=fim_middle_id,
             fim_suffix_id=fim_suffix_id,
@@ -303,3 +461,98 @@ def apply_fim_mixed_batch(
         )
         for toks in token_lists
     ]
+
+
+# ---------------------------------------------------------------------------
+# Token healing for FIM inference
+# ---------------------------------------------------------------------------
+
+
+def heal_fim_tokens(
+    prefix_ids: list[int],
+    suffix_ids: list[int],
+    tokenizer,
+) -> tuple[list[int], list[int], int]:
+    """Token healing: fix split-token artifacts at FIM boundaries.
+
+    When a FIM split lands inside a BPE token, the last token of the prefix
+    and first token of the suffix may be "wrong" — they're fragments that
+    wouldn't appear in normal tokenization. Token healing backs off these
+    boundary tokens and re-tokenizes the overlap region.
+
+    Example:
+        "std::vect" | "or<int>" split inside "vector"
+        prefix ends with [..."vect"], suffix starts with ["or"...]
+        After healing: prefix ends with [..."std", "::"] and the model
+        regenerates "vector<int>..."
+
+    Args:
+        prefix_ids: Token IDs for the prefix (before the cursor)
+        suffix_ids: Token IDs for the suffix (after the cursor)
+        tokenizer: Tokenizer with encode() and decode() methods
+
+    Returns:
+        (healed_prefix, healed_suffix, n_rollback) where n_rollback is the
+        number of tokens removed from the prefix end (the model should
+        regenerate these during inference).
+    """
+    if not prefix_ids or not suffix_ids:
+        return prefix_ids, suffix_ids, 0
+
+    # Decode the boundary tokens
+    last_prefix_text = tokenizer.decode([prefix_ids[-1]])
+    first_suffix_text = tokenizer.decode([suffix_ids[0]])
+
+    # Re-tokenize the combined boundary
+    combined = last_prefix_text + first_suffix_text
+    retokenized = tokenizer.encode(combined)
+
+    # If re-tokenizing produces the same tokens, no healing needed
+    if retokenized == [prefix_ids[-1], suffix_ids[0]]:
+        return prefix_ids, suffix_ids, 0
+
+    # Healing needed: the boundary was split inside a BPE token.
+    # Back off the last prefix token so the model regenerates it.
+    healed_prefix = prefix_ids[:-1]
+    return healed_prefix, suffix_ids, 1
+
+
+def prepare_fim_inference(
+    prompt: str,
+    suffix: str,
+    tokenizer,
+    heal: bool = True,
+    fim_prefix_id: int = FIM_PREFIX_ID,
+    fim_middle_id: int = FIM_MIDDLE_ID,
+    fim_suffix_id: int = FIM_SUFFIX_ID,
+) -> tuple[list[int], int]:
+    """Prepare token sequence for FIM inference with optional token healing.
+
+    Builds the SPM format: <FIM_PREFIX> <FIM_SUFFIX> suffix <FIM_MIDDLE> prefix
+    and applies token healing to fix boundary artifacts.
+
+    Args:
+        prompt: The prefix text (code before cursor)
+        suffix: The suffix text (code after cursor)
+        tokenizer: Tokenizer instance
+        heal: Whether to apply token healing
+
+    Returns:
+        (input_ids, n_rollback) where input_ids is the token sequence to feed
+        to the model and n_rollback is how many prefix tokens were rolled back.
+    """
+    prefix_ids = tokenizer.encode(prompt)
+    suffix_ids = tokenizer.encode(suffix)
+
+    n_rollback = 0
+    if heal and prefix_ids and suffix_ids:
+        prefix_ids, suffix_ids, n_rollback = heal_fim_tokens(
+            prefix_ids, suffix_ids, tokenizer
+        )
+
+    # Build SPM format: <FIM_PREFIX><FIM_SUFFIX> suffix <FIM_MIDDLE> prefix
+    input_ids = (
+        [fim_prefix_id, fim_suffix_id] + suffix_ids + [fim_middle_id] + prefix_ids
+    )
+
+    return input_ids, n_rollback

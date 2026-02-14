@@ -442,10 +442,23 @@ parser.add_argument(
     help="Structured FIM rate for docstring->code completion (0.0=disabled)",
 )
 parser.add_argument(
+    "--function_fim_rate",
+    type=float,
+    default=0.0,
+    help="Function-level FIM rate: splits at { } boundaries for function body completion (0.0=disabled)",
+)
+parser.add_argument(
     "--structured_fim_path",
     type=str,
     default="data/docstring_pairs_full.jsonl",
     help="Path to structured FIM pairs dataset",
+)
+# Gradient clipping
+parser.add_argument(
+    "--max_grad_norm",
+    type=float,
+    default=0.0,
+    help="Max gradient norm for clipping (0.0=disabled). Typical values: 1.0 or 0.5",
 )
 # Output
 parser.add_argument(
@@ -701,11 +714,14 @@ def train():
         import torch_xla.core.xla_model as xm
 
         synchronize = xm.mark_step
+
         def get_max_memory():
             return 0  # XLA doesn't expose memory stats the same way
     else:
+
         def synchronize():
             return None
+
         def get_max_memory():
             return 0
 
@@ -719,9 +735,9 @@ def train():
 
     # Tokenizer will be useful for evaluation, also we need the vocab size
     tokenizer = get_tokenizer()
-    token_bytes = get_token_bytes(device=device)
+    token_bytes = get_token_bytes(device=device, tokenizer=tokenizer)
     vocab_size = tokenizer.get_vocab_size()
-    print0(f"Vocab size: {vocab_size:,}")
+    print0(f"Vocab size: {vocab_size:,} (token_bytes: {token_bytes.shape[0]:,})")
 
     # Verify C++ tokenizer is active (pre-scan check)
     is_cpp_tokenizer = verify_cpp_tokenizer(tokenizer)
@@ -1098,12 +1114,13 @@ def train():
     )
     fim_rate = args.fim_rate
     structured_fim_rate = args.structured_fim_rate
+    function_fim_rate = args.function_fim_rate
     structured_fim_path = os.path.join(
         os.path.dirname(__file__), "..", args.structured_fim_path
     )
-    if fim_rate > 0 or structured_fim_rate > 0:
+    if fim_rate > 0 or structured_fim_rate > 0 or function_fim_rate > 0:
         print0(
-            f"FIM enabled: fim_rate={fim_rate}, structured_fim_rate={structured_fim_rate}"
+            f"FIM enabled: fim_rate={fim_rate}, structured_fim_rate={structured_fim_rate}, function_fim_rate={function_fim_rate}"
         )
 
     # SPMD: single process loads full batches, then shards across devices.
@@ -1125,6 +1142,7 @@ def train():
         resume_state_dict=dataloader_resume_state_dict,
         fim_rate=fim_rate,
         structured_fim_rate=structured_fim_rate,
+        function_fim_rate=function_fim_rate,
         structured_fim_path=structured_fim_path if structured_fim_rate > 0 else None,
         data_dir=data_dir,
         streaming=args.streaming_data,
@@ -1404,6 +1422,10 @@ def train():
                     loss = loss / grad_accum_steps
                     loss.backward()
                 xla_all_reduce_gradients(model, ddp_world_size)
+                if args.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), args.max_grad_norm
+                    )
                 for opt in optimizers:
                     opt.step()
                 model.zero_grad(set_to_none=True)
@@ -1434,6 +1456,8 @@ def train():
                     group["lr"] = group["initial_lr"] * lrm
             if device_type == "xla" and ddp_world_size > 1:
                 xla_all_reduce_gradients(model, ddp_world_size)
+            if args.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             muon_momentum = get_muon_momentum(step)
             muon_weight_decay = get_weight_decay(step)
             for group in muon_optimizer.param_groups:

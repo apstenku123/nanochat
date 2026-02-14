@@ -26,12 +26,12 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
 
 @dataclass
 class CompileResult:
     """Result of compiling and running a C++ program."""
+
     compiled: bool
     passed: bool
     compiler_output: str = ""
@@ -43,6 +43,7 @@ class CompileResult:
 @dataclass
 class ProblemResult:
     """Result of evaluating a single problem."""
+
     name: str
     difficulty: str
     num_samples: int
@@ -57,15 +58,21 @@ class ProblemResult:
 class CppBenchmark:
     """Run HumanEval-style C++ problems against a nanochat model."""
 
-    def __init__(self, model, tokenizer, device='cuda'):
+    def __init__(self, model, tokenizer, device="cuda"):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
 
     @torch.no_grad()
-    def generate(self, prompt: str, max_tokens: int = 512,
-                 temperature: float = 0.8, top_k: int = 50,
-                 num_samples: int = 1, stop_tokens: Optional[list] = None) -> list[str]:
+    def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 512,
+        temperature: float = 0.8,
+        top_k: int = 50,
+        num_samples: int = 1,
+        stop_tokens: Optional[list] = None,
+    ) -> list[str]:
         """Generate code completions for a given prompt.
 
         Returns a list of completion strings (just the generated part, not the prompt).
@@ -77,38 +84,41 @@ class CppBenchmark:
             generated_ids = []
             seed = 42 + i  # different seed per sample
             for token in self.model.generate(
-                list(prompt_ids), max_tokens=max_tokens,
-                temperature=temperature, top_k=top_k, seed=seed
+                list(prompt_ids),
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                seed=seed,
             ):
                 generated_ids.append(token)
                 # Stop on common C++ function-end heuristics
                 text_so_far = self.tokenizer.decode(generated_ids)
                 # Stop if we see a second function definition or main()
-                if '\nint main(' in text_so_far or '\nvoid main(' in text_so_far:
+                if "\nint main(" in text_so_far or "\nvoid main(" in text_so_far:
                     # Trim to before main
-                    idx = text_so_far.find('\nint main(')
+                    idx = text_so_far.find("\nint main(")
                     if idx == -1:
-                        idx = text_so_far.find('\nvoid main(')
+                        idx = text_so_far.find("\nvoid main(")
                     text_so_far = text_so_far[:idx]
                     completions.append(text_so_far)
                     break
                 # Stop if we see a class definition after a function body
-                if text_so_far.count('\n}') >= 2 and len(text_so_far) > 50:
+                if text_so_far.count("\n}") >= 2 and len(text_so_far) > 50:
                     # Multiple top-level closing braces likely means we went past the function
                     # Keep up to and including the first closing brace at column 0
-                    lines = text_so_far.split('\n')
+                    lines = text_so_far.split("\n")
                     result_lines = []
                     brace_count = 0
                     found_end = False
                     for line in lines:
                         result_lines.append(line)
-                        if line.strip() == '}':
+                        if line.strip() == "}":
                             brace_count += 1
                             if brace_count >= 1:
                                 found_end = True
                                 break
                     if found_end:
-                        completions.append('\n'.join(result_lines))
+                        completions.append("\n".join(result_lines))
                         break
             else:
                 # Didn't break early, use full generation
@@ -131,44 +141,132 @@ class CppBenchmark:
             src_path = os.path.join(tmpdir, "solution.cpp")
             bin_path = os.path.join(tmpdir, "solution")
 
-            with open(src_path, 'w') as f:
+            with open(src_path, "w") as f:
                 f.write(full_source)
 
             # Compile
             try:
                 compile_proc = subprocess.run(
                     ["g++", "-std=c++17", "-O1", "-o", bin_path, src_path],
-                    capture_output=True, text=True, timeout=timeout
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
                 )
             except subprocess.TimeoutExpired:
                 return CompileResult(
-                    compiled=False, passed=False,
-                    error="Compilation timed out", timeout=True
+                    compiled=False,
+                    passed=False,
+                    error="Compilation timed out",
+                    timeout=True,
                 )
 
             if compile_proc.returncode != 0:
                 return CompileResult(
-                    compiled=False, passed=False,
-                    compiler_output=compile_proc.stderr
+                    compiled=False, passed=False, compiler_output=compile_proc.stderr
                 )
 
             # Run
             try:
                 run_proc = subprocess.run(
-                    [bin_path],
-                    capture_output=True, text=True, timeout=timeout
+                    [bin_path], capture_output=True, text=True, timeout=timeout
                 )
             except subprocess.TimeoutExpired:
                 return CompileResult(
-                    compiled=True, passed=False,
-                    error="Execution timed out", timeout=True
+                    compiled=True,
+                    passed=False,
+                    error="Execution timed out",
+                    timeout=True,
                 )
 
             passed = run_proc.returncode == 0
             return CompileResult(
-                compiled=True, passed=passed,
+                compiled=True,
+                passed=passed,
                 runtime_output=run_proc.stdout,
-                error=run_proc.stderr if not passed else ""
+                error=run_proc.stderr if not passed else "",
+            )
+
+    @staticmethod
+    def compile_and_run_multifile(
+        files: dict[str, str],
+        main_file: str = "main.cpp",
+        timeout: float = 10.0,
+        extra_flags: list[str] | None = None,
+    ) -> CompileResult:
+        """Compile multiple C++ source files and run the resulting binary.
+
+        Args:
+            files: dict mapping filename -> source code content
+                   e.g. {"utils.h": "#pragma once...", "utils.cpp": "...", "main.cpp": "..."}
+            main_file: Which file contains main() (all .cpp files are compiled)
+            timeout: Max seconds for compilation + execution
+            extra_flags: Additional g++ flags (e.g. ["-std=c++20", "-O2"])
+
+        Returns:
+            CompileResult with compilation and execution status
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Write all files
+            for filename, content in files.items():
+                filepath = os.path.join(tmpdir, filename)
+                os.makedirs(
+                    os.path.dirname(filepath), exist_ok=True
+                ) if os.path.dirname(filename) else None
+                with open(filepath, "w") as f:
+                    f.write(content)
+
+            # Collect all .cpp files for compilation
+            cpp_files = [
+                os.path.join(tmpdir, f)
+                for f in files
+                if f.endswith((".cpp", ".cc", ".cxx"))
+            ]
+            if not cpp_files:
+                return CompileResult(
+                    compiled=False, passed=False, error="No .cpp files to compile"
+                )
+
+            bin_path = os.path.join(tmpdir, "solution")
+            flags = extra_flags or ["-std=c++17", "-O1"]
+            cmd = ["g++"] + flags + [f"-I{tmpdir}", "-o", bin_path] + cpp_files
+
+            # Compile
+            try:
+                compile_proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=timeout
+                )
+            except subprocess.TimeoutExpired:
+                return CompileResult(
+                    compiled=False,
+                    passed=False,
+                    error="Compilation timed out",
+                    timeout=True,
+                )
+
+            if compile_proc.returncode != 0:
+                return CompileResult(
+                    compiled=False, passed=False, compiler_output=compile_proc.stderr
+                )
+
+            # Run
+            try:
+                run_proc = subprocess.run(
+                    [bin_path], capture_output=True, text=True, timeout=timeout
+                )
+            except subprocess.TimeoutExpired:
+                return CompileResult(
+                    compiled=True,
+                    passed=False,
+                    error="Execution timed out",
+                    timeout=True,
+                )
+
+            passed = run_proc.returncode == 0
+            return CompileResult(
+                compiled=True,
+                passed=passed,
+                runtime_output=run_proc.stdout,
+                error=run_proc.stderr if not passed else "",
             )
 
     @staticmethod
@@ -189,9 +287,14 @@ class CppBenchmark:
             return 1.0
         return 1.0 - math.prod((n - c - i) / (n - i) for i in range(k))
 
-    def evaluate_problem(self, problem: dict, num_samples: int = 10,
-                         temperature: float = 0.8, max_tokens: int = 512,
-                         verbose: bool = False) -> ProblemResult:
+    def evaluate_problem(
+        self,
+        problem: dict,
+        num_samples: int = 10,
+        temperature: float = 0.8,
+        max_tokens: int = 512,
+        verbose: bool = False,
+    ) -> ProblemResult:
         """Evaluate a single C++ problem.
 
         Args:
@@ -204,15 +307,17 @@ class CppBenchmark:
         Returns:
             ProblemResult with pass@k metrics
         """
-        name = problem['name']
-        prompt = problem['prompt']
-        test_code = problem['test']
-        difficulty = problem.get('difficulty', 'unknown')
+        name = problem["name"]
+        prompt = problem["prompt"]
+        test_code = problem["test"]
+        difficulty = problem.get("difficulty", "unknown")
 
         # Generate completions
         completions = self.generate(
-            prompt, max_tokens=max_tokens,
-            temperature=temperature, num_samples=num_samples
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            num_samples=num_samples,
         )
 
         num_compiled = 0
@@ -231,20 +336,26 @@ class CppBenchmark:
                 num_passed += 1
 
             if verbose:
-                status = "PASS" if result.passed else ("COMPILE_FAIL" if not result.compiled else "RUNTIME_FAIL")
-                print(f"  Sample {i+1}/{num_samples}: {status}")
+                status = (
+                    "PASS"
+                    if result.passed
+                    else ("COMPILE_FAIL" if not result.compiled else "RUNTIME_FAIL")
+                )
+                print(f"  Sample {i + 1}/{num_samples}: {status}")
                 if not result.compiled:
                     # Show first 3 lines of compiler error
-                    err_lines = result.compiler_output.strip().split('\n')[:3]
+                    err_lines = result.compiler_output.strip().split("\n")[:3]
                     for line in err_lines:
                         print(f"    {line}")
 
-            completion_details.append({
-                'completion': completion[:200],  # truncate for storage
-                'compiled': result.compiled,
-                'passed': result.passed,
-                'error': result.error[:200] if result.error else '',
-            })
+            completion_details.append(
+                {
+                    "completion": completion[:200],  # truncate for storage
+                    "compiled": result.compiled,
+                    "passed": result.passed,
+                    "error": result.error[:200] if result.error else "",
+                }
+            )
 
         # Compute pass@k
         n = num_samples
@@ -265,9 +376,14 @@ class CppBenchmark:
             completions=completion_details,
         )
 
-    def run_benchmark(self, problems: list[dict], num_samples: int = 10,
-                      temperature: float = 0.8, max_tokens: int = 512,
-                      verbose: bool = False) -> dict:
+    def run_benchmark(
+        self,
+        problems: list[dict],
+        num_samples: int = 10,
+        temperature: float = 0.8,
+        max_tokens: int = 512,
+        verbose: bool = False,
+    ) -> dict:
         """Run the full benchmark over a list of problems.
 
         Args:
@@ -284,17 +400,23 @@ class CppBenchmark:
         t0 = time.time()
 
         for i, problem in enumerate(problems):
-            name = problem['name']
-            print(f"[{i+1}/{len(problems)}] Evaluating: {name} ({problem.get('difficulty', '?')})...")
+            name = problem["name"]
+            print(
+                f"[{i + 1}/{len(problems)}] Evaluating: {name} ({problem.get('difficulty', '?')})..."
+            )
             result = self.evaluate_problem(
-                problem, num_samples=num_samples,
-                temperature=temperature, max_tokens=max_tokens,
+                problem,
+                num_samples=num_samples,
+                temperature=temperature,
+                max_tokens=max_tokens,
                 verbose=verbose,
             )
             results.append(result)
-            print(f"  => compile_rate={result.compilation_rate:.0%}, "
-                  f"pass@1={result.pass_at_1:.3f}, "
-                  f"passed={result.num_passed}/{result.num_samples}")
+            print(
+                f"  => compile_rate={result.compilation_rate:.0%}, "
+                f"pass@1={result.pass_at_1:.3f}, "
+                f"passed={result.num_passed}/{result.num_samples}"
+            )
 
         elapsed = time.time() - t0
 
@@ -308,43 +430,50 @@ class CppBenchmark:
         for r in results:
             d = r.difficulty
             if d not in by_difficulty:
-                by_difficulty[d] = {'pass_at_1': [], 'compilation_rate': []}
-            by_difficulty[d]['pass_at_1'].append(r.pass_at_1)
-            by_difficulty[d]['compilation_rate'].append(r.compilation_rate)
+                by_difficulty[d] = {"pass_at_1": [], "compilation_rate": []}
+            by_difficulty[d]["pass_at_1"].append(r.pass_at_1)
+            by_difficulty[d]["compilation_rate"].append(r.compilation_rate)
 
         difficulty_summary = {}
         for d, vals in by_difficulty.items():
             difficulty_summary[d] = {
-                'mean_pass_at_1': sum(vals['pass_at_1']) / len(vals['pass_at_1']),
-                'mean_compilation_rate': sum(vals['compilation_rate']) / len(vals['compilation_rate']),
-                'num_problems': len(vals['pass_at_1']),
+                "mean_pass_at_1": sum(vals["pass_at_1"]) / len(vals["pass_at_1"]),
+                "mean_compilation_rate": sum(vals["compilation_rate"])
+                / len(vals["compilation_rate"]),
+                "num_problems": len(vals["pass_at_1"]),
             }
 
         return {
-            'problems': [
+            "problems": [
                 {
-                    'name': r.name,
-                    'difficulty': r.difficulty,
-                    'num_samples': r.num_samples,
-                    'num_compiled': r.num_compiled,
-                    'num_passed': r.num_passed,
-                    'pass_at_1': r.pass_at_1,
-                    'pass_at_10': r.pass_at_10,
-                    'compilation_rate': r.compilation_rate,
+                    "name": r.name,
+                    "difficulty": r.difficulty,
+                    "num_samples": r.num_samples,
+                    "num_compiled": r.num_compiled,
+                    "num_passed": r.num_passed,
+                    "pass_at_1": r.pass_at_1,
+                    "pass_at_10": r.pass_at_10,
+                    "compilation_rate": r.compilation_rate,
                 }
                 for r in results
             ],
-            'aggregate': {
-                'num_problems': len(results),
-                'total_samples': total_samples,
-                'total_compiled': total_compiled,
-                'total_passed': total_passed,
-                'overall_compilation_rate': total_compiled / total_samples if total_samples > 0 else 0,
-                'mean_pass_at_1': sum(r.pass_at_1 for r in results) / len(results) if results else 0,
-                'mean_pass_at_10': sum(r.pass_at_10 for r in results) / len(results) if results else 0,
+            "aggregate": {
+                "num_problems": len(results),
+                "total_samples": total_samples,
+                "total_compiled": total_compiled,
+                "total_passed": total_passed,
+                "overall_compilation_rate": total_compiled / total_samples
+                if total_samples > 0
+                else 0,
+                "mean_pass_at_1": sum(r.pass_at_1 for r in results) / len(results)
+                if results
+                else 0,
+                "mean_pass_at_10": sum(r.pass_at_10 for r in results) / len(results)
+                if results
+                else 0,
             },
-            'by_difficulty': difficulty_summary,
-            'elapsed_seconds': elapsed,
+            "by_difficulty": difficulty_summary,
+            "elapsed_seconds": elapsed,
         }
 
 
@@ -354,7 +483,7 @@ def verify_problems(problems_path: str) -> bool:
 
     Actually, we compile the test code with a trivial prompt to check the test harness compiles.
     """
-    with open(problems_path, 'r') as f:
+    with open(problems_path, "r") as f:
         problems = [json.loads(line) for line in f if line.strip()]
 
     print(f"Verifying {len(problems)} problems from {problems_path}")
@@ -363,15 +492,21 @@ def verify_problems(problems_path: str) -> bool:
         # Build a source that includes the prompt (signature) + a minimal body + test
         # We can't easily auto-generate correct solutions, so just check compilation
         # of the test harness with a stub
-        name = p['name']
-        full = p['prompt'] + p.get('reference_solution', '// stub\n') + "\n\n" + p['test']
+        name = p["name"]
+        full = (
+            p["prompt"] + p.get("reference_solution", "// stub\n") + "\n\n" + p["test"]
+        )
         result = CppBenchmark.compile_and_run(full)
-        status = "PASS" if result.passed else ("COMPILE_FAIL" if not result.compiled else "RUNTIME_FAIL")
+        status = (
+            "PASS"
+            if result.passed
+            else ("COMPILE_FAIL" if not result.compiled else "RUNTIME_FAIL")
+        )
         if not result.passed:
             all_ok = False
             print(f"  FAIL [{status}]: {name}")
             if result.compiler_output:
-                for line in result.compiler_output.strip().split('\n')[:5]:
+                for line in result.compiler_output.strip().split("\n")[:5]:
                     print(f"    {line}")
             if result.error:
                 print(f"    Runtime: {result.error[:200]}")
@@ -401,13 +536,18 @@ def _truncate_to_function_body(completion: str) -> str:
 
         # Track comments
         if not in_string and not in_block_comment and i + 1 < len(completion):
-            if c == '/' and completion[i + 1] == '/':
+            if c == "/" and completion[i + 1] == "/":
                 in_line_comment = True
-            elif c == '/' and completion[i + 1] == '*':
+            elif c == "/" and completion[i + 1] == "*":
                 in_block_comment = True
-        if in_line_comment and c == '\n':
+        if in_line_comment and c == "\n":
             in_line_comment = False
-        if in_block_comment and c == '*' and i + 1 < len(completion) and completion[i + 1] == '/':
+        if (
+            in_block_comment
+            and c == "*"
+            and i + 1 < len(completion)
+            and completion[i + 1] == "/"
+        ):
             in_block_comment = False
             result.append(c)
             i += 1
@@ -424,7 +564,7 @@ def _truncate_to_function_body(completion: str) -> str:
                 # Check for escape
                 num_backslashes = 0
                 j = len(result) - 1
-                while j >= 0 and result[j] == '\\':
+                while j >= 0 and result[j] == "\\":
                     num_backslashes += 1
                     j -= 1
                 if num_backslashes % 2 == 0:
@@ -432,25 +572,31 @@ def _truncate_to_function_body(completion: str) -> str:
 
         # Track braces (only outside strings and comments)
         if not in_string and not in_line_comment and not in_block_comment:
-            if c == '{':
+            if c == "{":
                 depth += 1
-            elif c == '}':
+            elif c == "}":
                 depth -= 1
                 if depth == 0:
                     result.append(c)
                     # Include any trailing newline
-                    if i + 1 < len(completion) and completion[i + 1] == '\n':
-                        result.append('\n')
-                    return ''.join(result)
+                    if i + 1 < len(completion) and completion[i + 1] == "\n":
+                        result.append("\n")
+                    return "".join(result)
 
         result.append(c)
         i += 1
 
-    return ''.join(result)
+    return "".join(result)
 
 
-def evaluate_cpp_model(model, tokenizer, device, problems_path="data/cpp_bench.jsonl",
-                       max_tokens=512, temperature=0.0):
+def evaluate_cpp_model(
+    model,
+    tokenizer,
+    device,
+    problems_path="data/cpp_bench.jsonl",
+    max_tokens=512,
+    temperature=0.0,
+):
     """Evaluate a model on C++ coding problems during training.
 
     Lightweight function designed for periodic evaluation in the training loop.
@@ -475,20 +621,22 @@ def evaluate_cpp_model(model, tokenizer, device, problems_path="data/cpp_bench.j
         print0(f"WARNING: C++ benchmark not found at {problems_path}, skipping eval")
         return {"cpp_metric": 0.0, "cpp_compile_rate": 0.0, "cpp_pass_rate": 0.0}
 
-    with open(problems_path, 'r') as f:
+    with open(problems_path, "r") as f:
         problems = [json.loads(line) for line in f if line.strip()]
 
-    print0(f"C++ eval: {len(problems)} problems, max_tokens={max_tokens}, temp={temperature}")
+    print0(
+        f"C++ eval: {len(problems)} problems, max_tokens={max_tokens}, temp={temperature}"
+    )
 
     engine = Engine(model, tokenizer)
     problem_results = []
     t0 = time.time()
 
     for i, problem in enumerate(problems):
-        name = problem['name']
-        prompt = problem['prompt']
-        test_code = problem['test']
-        difficulty = problem.get('difficulty', 'unknown')
+        name = problem["name"]
+        prompt = problem["prompt"]
+        test_code = problem["test"]
+        difficulty = problem.get("difficulty", "unknown")
 
         # Tokenize prompt and generate completion
         tokens = tokenizer(prompt, prepend="<|bos|>")
@@ -504,24 +652,37 @@ def evaluate_cpp_model(model, tokenizer, device, problems_path="data/cpp_bench.j
             # Truncate to just the function body to avoid duplicate definitions
             completion = _truncate_to_function_body(completion)
         except Exception as e:
-            print0(f"  [{i+1}/{len(problems)}] {name}: generation error: {e}")
-            problem_results.append({
-                "name": name, "difficulty": difficulty,
-                "compiled": False, "passed": False, "error": str(e)
-            })
+            print0(f"  [{i + 1}/{len(problems)}] {name}: generation error: {e}")
+            problem_results.append(
+                {
+                    "name": name,
+                    "difficulty": difficulty,
+                    "compiled": False,
+                    "passed": False,
+                    "error": str(e),
+                }
+            )
             continue
 
         # Assemble full source and compile+run
         full_source = prompt + completion + "\n\n" + test_code
         result = CppBenchmark.compile_and_run(full_source)
 
-        status = "PASS" if result.passed else ("COMPILE_FAIL" if not result.compiled else "RUNTIME_FAIL")
-        print0(f"  [{i+1}/{len(problems)}] {name} ({difficulty}): {status}")
+        status = (
+            "PASS"
+            if result.passed
+            else ("COMPILE_FAIL" if not result.compiled else "RUNTIME_FAIL")
+        )
+        print0(f"  [{i + 1}/{len(problems)}] {name} ({difficulty}): {status}")
 
-        problem_results.append({
-            "name": name, "difficulty": difficulty,
-            "compiled": result.compiled, "passed": result.passed,
-        })
+        problem_results.append(
+            {
+                "name": name,
+                "difficulty": difficulty,
+                "compiled": result.compiled,
+                "passed": result.passed,
+            }
+        )
 
     elapsed = time.time() - t0
 
@@ -552,11 +713,15 @@ def evaluate_cpp_model(model, tokenizer, device, problems_path="data/cpp_bench.j
             "n": vals["total"],
         }
 
-    print0(f"C++ eval done in {elapsed:.1f}s: compile={compile_rate:.1%}, pass={pass_rate:.1%}")
+    print0(
+        f"C++ eval done in {elapsed:.1f}s: compile={compile_rate:.1%}, pass={pass_rate:.1%}"
+    )
     for d in ["easy", "medium", "hard"]:
         if d in diff_summary:
             s = diff_summary[d]
-            print0(f"  {d}: compile={s['compile']:.1%}, pass={s['pass']:.1%} ({s['n']} problems)")
+            print0(
+                f"  {d}: compile={s['compile']:.1%}, pass={s['pass']:.1%} ({s['n']} problems)"
+            )
 
     return {
         "cpp_metric": pass_rate,
