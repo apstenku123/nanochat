@@ -5,7 +5,7 @@ February 2026
 
 ## What the paper does
 
-FIRE reinitializes weight matrices at phase boundaries during continual learning by projecting them to the nearest orthogonal matrix. The mechanism is Newton-Schulz iteration, the same iteration Muon uses, but applied to a different problem. Muon orthogonalizes the update; FIRE orthogonalizes the weights themselves.
+FIRE reinitializes weight matrices at phase boundaries during continual learning by projecting them to the nearest orthogonal matrix. The mechanism is Newton-Schulz iteration, the same iteration Muon uses, but applied to a different problem. Muon orthogonalizes the update and FIRE orthogonalizes the weights themselves.
 
 The math is clean. You frame it as constrained optimization: minimize Squared Frobenius Error between old and new weights (stability) subject to Deviation from Isometry = 0 (plasticity). The solution is the polar factor of the weight matrix. Newton-Schulz gets you there iteratively.
 
