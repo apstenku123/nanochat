@@ -252,7 +252,18 @@ def _apply_tensor_parallel_sharding(model, mesh):
         elif 'mlp.c_proj.weight' in name:
             xs.mark_sharding(param, mesh, (None, 'model'))
             n_sharded += 1
+        # Mamba in_proj: column-parallel (shard output dim = d_inner + conv_dim + nheads + ...)
+        # Weight shape: [d_in_proj, n_embd] -> shard dim 0 across 'model'
+        elif 'attn.in_proj.weight' in name:
+            xs.mark_sharding(param, mesh, ('model', None))
+            n_sharded += 1
+        # Mamba out_proj: row-parallel (shard input dim = d_inner)
+        # Weight shape: [n_embd, d_inner] -> shard dim 1 across 'model'
+        elif 'attn.out_proj.weight' in name:
+            xs.mark_sharding(param, mesh, (None, 'model'))
+            n_sharded += 1
         # MTP projection: replicated (it combines hidden states, not parallelizable easily)
+        # Mamba conv1d, A_log, dt_bias, D, B_bias, C_bias: replicated (per-head/group params)
         # Embedding and lm_head: replicated across model dim
         # Everything else: replicated (default)
 
@@ -557,15 +568,23 @@ def train():
     # This reduces XLA compilation from ~60min to ~20min for 16-layer models by avoiding
     # a 3.5M instruction HLO graph.
     if args.use_scan and device_type == "xla":
-        try:
-            # torch_xla >= 2.10: scan_layers wraps nn.ModuleList directly
-            from torch_xla.experimental.scan import scan_layers
-            model.transformer.h = scan_layers(model.transformer.h)
-            print0(f"Enabled XLA scan_layers for faster compilation ({num_layers} layers -> 1 compiled block)")
-        except (ImportError, AttributeError):
-            # torch_xla 2.9.x: scan_layers not available, lower-level scan() exists
-            # but requires manual wrapper. Skip for now.
-            print0("Warning: --use_scan requires torch_xla >= 2.10 (scan_layers not found in this version), ignoring")
+        # scan_layers assumes all blocks are identical (compiles one, reuses for all).
+        # Hybrid Mamba+Attention models have heterogeneous blocks, so scan_layers
+        # would trace one block type and misapply it to layers of the other type.
+        has_hybrid = getattr(model.config, 'mamba_enabled', False) and any(
+            getattr(b, 'is_mamba', False) != getattr(model.transformer.h[0], 'is_mamba', False)
+            for b in model.transformer.h
+        )
+        if has_hybrid:
+            print0("Warning: --use_scan disabled for hybrid Mamba+Attention model "
+                   "(scan_layers requires homogeneous blocks)")
+        else:
+            try:
+                from torch_xla.experimental.scan import scan_layers
+                model.transformer.h = scan_layers(model.transformer.h)
+                print0(f"Enabled XLA scan_layers for faster compilation ({num_layers} layers -> 1 compiled block)")
+            except (ImportError, AttributeError):
+                print0("Warning: --use_scan requires torch_xla >= 2.10 (scan_layers not found in this version), ignoring")
     elif args.use_scan:
         print0("Warning: --use_scan is only effective on XLA/TPU devices, ignoring")
 

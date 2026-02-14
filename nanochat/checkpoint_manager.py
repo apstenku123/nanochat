@@ -113,6 +113,112 @@ def _upload_to_gcs(local_path, gcs_bucket=None, max_retries=3):
             logger.warning(f"GCS upload attempt {attempt}/{max_retries} error for {local_path}: {e}")
     logger.error(f"GCS upload FAILED after {max_retries} attempts: {local_path} -> {gcs_path}")
 
+def _init_dist_cp():
+    """Lazily import distributed checkpoint components for SPMD-aware save/load."""
+    try:
+        import torch.distributed.checkpoint as dist_cp
+        from torch.distributed.checkpoint import SavePlanner, LoadPlanner
+        # SPMDSavePlanner/SPMDLoadPlanner are available in torch_xla
+        try:
+            from torch_xla.distributed.spmd import SPMDSavePlanner, SPMDLoadPlanner
+            return dist_cp, SPMDSavePlanner, SPMDLoadPlanner
+        except ImportError:
+            logger.debug("SPMDSavePlanner/SPMDLoadPlanner not available in torch_xla")
+            return dist_cp, None, None
+    except ImportError:
+        return None, None, None
+
+
+def save_checkpoint_distributed(checkpoint_dir, step, model, optimizers, meta_data, rank=0):
+    """Save checkpoint using torch.distributed.checkpoint for SPMD-sharded models.
+
+    Each rank saves its own shard directly — no gather to rank 0.
+    This is significantly faster for tensor-parallel models since it avoids
+    the all-gather of full model weights.
+
+    Args:
+        model: The nn.Module (not state_dict — dist_cp needs the live module)
+        optimizers: List of optimizers (not state_dicts)
+    """
+    dist_cp, SPMDSavePlanner, SPMDLoadPlanner = _init_dist_cp()
+    if dist_cp is None or SPMDSavePlanner is None:
+        logger.warning("Distributed checkpoint not available, falling back to standard save")
+        model_data = {k: v.cpu() for k, v in model.state_dict().items()}
+        optim_data = [opt.state_dict() for opt in optimizers] if optimizers else None
+        save_checkpoint(checkpoint_dir, step, model_data, optim_data, meta_data, rank)
+        return
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    ckpt_path = os.path.join(checkpoint_dir, f"dist_ckpt_{step:06d}")
+
+    state_dict = {"model": model.state_dict()}
+    if optimizers:
+        for i, opt in enumerate(optimizers):
+            state_dict[f"optimizer_{i}"] = opt.state_dict()
+
+    dist_cp.save(
+        state_dict=state_dict,
+        storage_writer=dist_cp.FileSystemWriter(ckpt_path),
+        planner=SPMDSavePlanner(),
+    )
+    logger.info(f"Saved distributed checkpoint to: {ckpt_path}")
+
+    # Metadata saved by rank 0 only (small JSON, not sharded)
+    if rank == 0:
+        meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta_data, f, indent=2)
+        logger.info(f"Saved metadata to: {meta_path}")
+        _upload_to_gcs(meta_path)
+    # Upload the distributed checkpoint directory
+    # Note: dist_cp creates multiple files in ckpt_path/, uploading requires
+    # recursive GCS copy which is outside current _upload_to_gcs scope.
+
+
+def load_checkpoint_distributed(checkpoint_dir, step, model, optimizers=None):
+    """Load checkpoint using torch.distributed.checkpoint for SPMD-sharded models.
+
+    Each rank loads only its own shard — no broadcast from rank 0.
+    Model must already be constructed with the correct config and on the correct device.
+
+    Args:
+        model: The nn.Module (already on device, with correct architecture)
+        optimizers: Optional list of optimizers (must be primed via one fake step first)
+    """
+    dist_cp, _, SPMDLoadPlanner = _init_dist_cp()
+    if dist_cp is None or SPMDLoadPlanner is None:
+        raise RuntimeError("Distributed checkpoint load requires torch.distributed.checkpoint "
+                          "and torch_xla with SPMDLoadPlanner")
+
+    ckpt_path = os.path.join(checkpoint_dir, f"dist_ckpt_{step:06d}")
+
+    state_dict = {"model": model.state_dict()}
+    if optimizers:
+        for i, opt in enumerate(optimizers):
+            state_dict[f"optimizer_{i}"] = opt.state_dict()
+
+    dist_cp.load(
+        state_dict=state_dict,
+        storage_reader=dist_cp.FileSystemReader(ckpt_path),
+        planner=SPMDLoadPlanner(),
+    )
+
+    # Apply loaded state back to model and optimizers
+    model.load_state_dict(state_dict["model"])
+    if optimizers:
+        for i, opt in enumerate(optimizers):
+            opt.load_state_dict(state_dict[f"optimizer_{i}"])
+
+    logger.info(f"Loaded distributed checkpoint from: {ckpt_path}")
+
+    # Load metadata
+    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+    _download_from_gcs(meta_path)
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta_data = json.load(f)
+    return meta_data
+
+
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
