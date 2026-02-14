@@ -489,6 +489,80 @@ Clang indexer: `tools/clang_indexer/index_project.py` (Python, libclang-based se
 
 ---
 
+## Cloud Infrastructure & Resources
+
+**IMPORTANT**: Always track all cloud resources (TPU/GPU/VM) in beads issues. When creating or destroying resources, update this section AND create/close a beads issue. Idle resources cost money — check for idle machines at session start.
+
+### GCP Project
+
+- **Project**: `alpine-aspect-459819-m4` (codebot)
+- **Billing**: Check idle resources regularly — TPU v6e-4 costs ~$12.88/hr, v6e-8 ~$25.76/hr
+
+### TPU VMs
+
+Scan all zones with:
+```bash
+for zone in us-central1-f us-east1-c us-east5-a europe-west4-a asia-northeast1-b; do
+  gcloud compute tpus tpu-vm list --zone=$zone --project=alpine-aspect-459819-m4 2>/dev/null
+done
+```
+
+| Name | Zone | Type | Chips | Status | Purpose |
+|------|------|------|-------|--------|---------|
+| nanochat-v6e-engram | asia-northeast1-b | v6e-4 | 4 | READY (idle) | Engram pretraining (50K steps complete) |
+| nanochat-v6e-longctx | asia-northeast1-b | v6e-4 | 4 | READY (idle) | Long-context training |
+| nanochat-v6e-mhc | asia-northeast1-b | v6e-4 | 4 | READY (idle) | MHC experiments |
+| nanochat-v6e-small | asia-northeast1-b | v6e-4 | 4 | PREEMPTED | Spot instance (dead) |
+| nanochat-v6e-mhc-engram | europe-west4-a | v6e-4 | 4 | READY | SFT training (tool_call_sft) |
+| nanochat-v6e8-hybrid-eu | europe-west4-a | v6e-8 | 8 | READY | d24 hybrid Mamba+Attn+Engram+MHC+MTP+DSA, 64K ctx, TP=4 |
+| nanochat-v6e8-mtp | europe-west4-a | v6e-8 | 8 | READY | d16 MTP+DSA+Engram+MHC, 64K ctx, 50K steps |
+
+### GPU VMs
+
+| Name | Zone | Type | GPU | Status | Purpose |
+|------|------|------|-----|--------|---------|
+| small-a100-40gb | us-central1-f | a2-highgpu-1g | A100 40GB | RUNNING | Dev/testing |
+
+### Build / CI VMs
+
+| Name | Zone | Type | Status | Purpose |
+|------|------|------|--------|---------|
+| build3 | europe-west3-c | c4-highmem-48-lssd | RUNNING | Primary data pipeline (2.9TB NVMe, 48 CPUs) |
+| build2 | europe-west3-c | c4-highmem-32-lssd | RUNNING | Secondary build |
+| build1 | europe-west3-b | c4-highmem-32-lssd | RUNNING | Build |
+| github-runner-16c-64g-1tb-2 | us-east5-a | c2-standard-60 | RUNNING | GitHub Actions runner |
+| github-runner-16c-64g-512ssd | us-east5-a | custom n2-16-78GB | RUNNING | GitHub Actions runner |
+
+### Other VMs (non-nanochat)
+
+| Name | Zone | Status | Purpose |
+|------|------|--------|---------|
+| azaycev-codepush-contazer | us-central1-c | RUNNING | Codepush container |
+| instance-20250829-* (x2) | us-central1-c | RUNNING | Legacy e2-medium |
+| instance-20250829-212121 | europe-west3-c | RUNNING | Legacy e2-medium |
+| colab-1-vm | us-west1-b | RUNNING | Colab |
+| rescue-vm | europe-west3-b | RUNNING | Rescue/recovery |
+| rdavlets | me-west1-b | RUNNING | e2-micro |
+| azaycev-img-downloader | us-central1-f | TERMINATED | Image processing |
+| azaycev-img-receiver | us-central1-f | TERMINATED | Image processing |
+
+### GCS Buckets
+
+- `gs://nanochat-training-data-2026/data/` — Training data (JSONL + parquet)
+- `gs://nanochat-training-data-2026/checkpoints/` — Model checkpoints
+  - `v6e-engram/` — Engram pretrain checkpoints (d16, 50K steps)
+  - `v6e-longctx/` — Long-context checkpoints
+
+### Resource Management Rules
+
+1. **At session start**: Check what's running on all TPUs/GPUs — idle resources waste money
+2. **When creating resources**: Add a beads issue with `bd create --title="Resource: <name>" --type=task --priority=1`
+3. **When destroying resources**: Close the beads issue and update this table
+4. **TPU zones to check**: `asia-northeast1-b`, `europe-west4-a` (and any new zones used)
+5. **Always scan all zones** — don't assume resources are only in one zone
+
+---
+
 This project uses **beads (bd)** for issue tracking with Jira synchronization.
 
 ## Issue Tracking with bd + Jira
