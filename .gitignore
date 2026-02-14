@@ -22,3 +22,5 @@ wheels/*
 wheels/__MACOSX/release/._torch-2.9.1a0+gitd38164a-cp312-cp312-linux_aarch64.whl
 .cache/*
 .cache/torchinductor/pk/cpkovt5o3kh5zoexsfktjcs76bxeinp4nju5ov2bftbwrnll4dr2.py
+tools/vocab_analyzer/target/*
+tools/comment_extractor/target/*
