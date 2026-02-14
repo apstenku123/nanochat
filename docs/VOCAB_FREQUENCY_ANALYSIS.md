@@ -1,345 +1,330 @@
-# Vocabulary Frequency Analysis — Empirical Results
+# Vocabulary Frequency Analysis — Empirical Results (Full Corpus)
 
 **Date**: 2026-02-14
-**Corpus**: cpp_compilable_16k (3 shards, 150,000 documents, ~1.17 GB)
-**Source**: 93 C++ open-source projects (boost, linux, llvm, opencv, tensorflow, protobuf, gRPC, rocksdb, clickhouse, godot, qemu, freebsd, etc.)
-**Tool**: `scripts/data/analyze_vocab_frequency.py`
-**Results**: `/tmp/vocab_frequency_results.json`
+**Corpus**: `/home/dave/data/cpp_raw/` — 1,435,084 C++ source files, 22.3 GB
+**Source**: 333 C++ open-source projects (boost, linux, llvm, opencv, tensorflow, protobuf, gRPC, rocksdb, clickhouse, godot, qemu, freebsd, Qt, LLDB, Eigen, Kokkos, cutlass, folly, etc.)
+**Tool**: `tools/vocab_analyzer` (Rust, rayon parallel, 48 cores, 27,919 files/sec)
+**Results**: `build3:/home/dave/vocab_analysis_full.json` (full JSON), `build3:/home/dave/vocab_analysis_raw.json` (initial run)
+**Runtime**: 51.4s on c4-highmem-48 (48 vCPUs)
 
 ## Executive Summary
 
-Of 697 proposed fixed vocabulary tokens across 30 categories, **473 (68%)** were found in the corpus. However, a critical finding: **209 of those 473 are generic English/C++ words** (e.g., `returns`, `map`, `message`, `query`, `just`) whose high counts reflect general usage, not domain-specific patterns. BPE will learn these efficiently — they don't need fixed vocab slots.
+Of 697 proposed fixed vocabulary tokens across 30 categories, **647 (93%)** were found in the full 1.43M-file corpus — up from 68% on the smaller 150K-doc sample. Total hits: **6.94 million**. Key findings:
 
-Only **~160 tokens** are both genuinely domain-specific AND appear frequently enough to justify fixed vocabulary allocation.
-
-### The Generic Word Problem
-
-Many proposed categories had tokens that are common C++ identifiers:
-
-| Token | Claimed Category | Raw Count | Doc% | Reality |
-|-------|-----------------|-----------|------|---------|
-| `returns` | proto_keywords | 249,417 | 28.5% | Common C++ identifier |
-| `map` | proto_keywords | 216,483 | 18.3% | `std::map` usage |
-| `enum` | proto_keywords | 140,338 | 23.0% | C++ keyword |
-| `just` | cpp26_features | 113,616 | 28.8% | Variable/comment word |
-| `query` | graphql | 85,274 | 7.9% | General DB variable name |
-| `Status` | grpc | 24,938 | 3.7% | Generic class name |
-| `predicate` | cpp20_concepts | 21,519 | 4.0% | Common STL parameter name |
-
-**Conclusion**: Tokens appearing in >2% of documents without special character patterns (underscores, `$`, SCREAMING_CASE) are general C++ and will be learned by BPE. Don't waste fixed vocab slots on them.
+1. **93% coverage** — virtually all proposed domain tokens appear in real C++ code
+2. **Morphemes are king** — 88.3M morpheme hits dwarf the 6.9M domain token hits (12.7x ratio)
+3. **Comments are 24.2% of the corpus** — significant, needs proper tokenization
+4. **Unicode is minimal** — only 0.020% non-ASCII bytes, 3.4% of files have non-English comments
+5. **4-space indent dominates** (31%) but tabs are close behind (26%) — both need tokens
+6. **Multi-spaces are 7.5%** of all space occurrences — needs a few multi-space BPE tokens
 
 ---
 
-## Tier Classification
+## Content Analysis for BPE Design
 
-### TIER 1: MUST INCLUDE — High frequency, truly domain-specific
+### Byte Distribution (22.3 GB total)
 
-These tokens have special naming patterns (double underscores, API prefixes, SCREAMING_CASE macros) that BPE typically splits poorly.
+| Content Type | Bytes | % of Total |
+|-------------|-------|-----------|
+| Code (approx) | 15.97 GB | 71.6% |
+| Comments | 5.39 GB | **24.2%** |
+| String literals | 0.94 GB | 4.2% |
 
-#### Compiler Attributes & Intrinsics (20 tokens, 186K hits, 100% coverage)
+**BPE Implication**: Comments are nearly a quarter of the training corpus. Comment tokenization quality directly affects model loss. Design BPE tokens for common comment patterns.
 
-| Token | Count | Docs | Doc% |
-|-------|-------|------|------|
-| `__func__` | 49,050 | 9,864 | 6.6% |
-| `unlikely` | 38,370 | 10,270 | 6.8% |
-| `likely` | 21,808 | 11,697 | 7.8% |
-| `__attribute__` | 21,002 | 7,280 | 4.9% |
-| `__LINE__` | 13,878 | 2,820 | 1.9% |
-| `deprecated` | 10,292 | 4,780 | 3.2% |
-| `fallthrough` | 7,721 | 3,526 | 2.4% |
-| `__cplusplus` | 6,344 | 2,163 | 1.4% |
-| `__FILE__` | 4,423 | 1,588 | 1.1% |
-| `__asm__` | 3,457 | 874 | 0.6% |
-| `nodiscard` | 2,824 | 429 | 0.3% |
-| `maybe_unused` | 2,682 | 1,190 | 0.8% |
-| `__FUNCTION__` | 2,571 | 647 | 0.4% |
-| `__declspec` | 862 | 604 | 0.4% |
-| `__stdcall` | 450 | 246 | 0.2% |
-| `no_unique_address` | 382 | 181 | 0.1% |
-| `__forceinline` | 351 | 245 | 0.2% |
-| `__cdecl` | 259 | 139 | 0.1% |
-| `__fastcall` | 28 | 27 | 0.0% |
-| `carries_dependency` | 24 | 15 | 0.0% |
+### Line Statistics (507M lines)
 
-**Verdict: INCLUDE ALL 20.** BPE splits `__attribute__` into `__` + `attribute` + `__`. These need single tokens.
+| Metric | Count | % |
+|--------|-------|---|
+| Total lines | 506,696,380 | — |
+| Blank lines | 66,139,848 | 13.1% |
+| Line comments (`//`) | 34,509,252 | 6.8% |
+| Block comments (`/* */`) | 43,041,990 | 8.5% |
+| Total comments | 77,551,242 | 15.3% |
 
-#### GTest Macros (27 tokens with MODERATE+, 96K hits, 100% coverage)
+### Whitespace Patterns (BPE-critical)
 
-| Token | Count | Docs | Doc% |
-|-------|-------|------|------|
-| `ASSERT_FALSE` | 19,760 | 436 | 0.3% |
-| `ASSERT_EQ` | 17,400 | 1,098 | 0.7% |
-| `EXPECT_EQ` | 17,057 | 886 | 0.6% |
-| `ASSERT_TRUE` | 12,964 | 881 | 0.6% |
-| `TEST` | 8,727 | 1,851 | 1.2% |
-| `EXPECT_TRUE` | 5,084 | 605 | 0.4% |
-| `EXPECT_FALSE` | 3,683 | 410 | 0.3% |
-| `TEST_F` | 3,593 | 892 | 0.6% |
-| `EXPECT_THAT` | 1,882 | 157 | 0.1% |
-| `ASSERT_NE` | 862 | 282 | 0.2% |
-| `TEST_P` | 804 | 296 | 0.2% |
-| `EXPECT_NE` | 570 | 184 | 0.1% |
-| `EXPECT_CALL` | 471 | 38 | 0.0% |
-| `EXPECT_DEATH` | 401 | 93 | 0.1% |
-| `TYPED_TEST` | 356 | 75 | 0.1% |
-| `ASSERT_THAT` | 306 | 52 | 0.0% |
-| `ASSERT_GT` | 280 | 110 | 0.1% |
-| `SetUp` | 279 | 227 | 0.2% |
-| `EXPECT_GT` | 278 | 63 | 0.0% |
-| `ASSERT_GE` | 210 | 89 | 0.1% |
-| `ASSERT_LT` | 203 | 82 | 0.1% |
-| `EXPECT_LT` | 151 | 42 | 0.0% |
-| `TearDown` | 138 | 109 | 0.1% |
-| `ASSERT_LE` | 128 | 60 | 0.0% |
-| `ON_CALL` | 128 | 18 | 0.0% |
-| `EXPECT_LE` | 122 | 41 | 0.0% |
-| `EXPECT_GE` | 111 | 41 | 0.0% |
+| Pattern | Count | BPE Design Action |
+|---------|-------|-------------------|
+| Single spaces | 871,590,859 | Standard BPE token |
+| Multi-space runs (2+) | 70,875,313 | **Add 2-space, 4-space, 8-space tokens** |
+| Single tabs | 5,733,081 | Standard BPE token |
+| Multi-tab runs (2+) | 5,086,292 | Add 2-tab token |
+| Mixed indent (space+tab) | 9,630,280 | Handle naturally |
 
-**Verdict: INCLUDE TOP 27.** `ASSERT_EQ` → BPE: `ASS`+`ERT`+`_`+`EQ`. These are critical for test code generation.
+**Multi-space ratio: 7.5%** of all space occurrences are multi-space runs. This justifies adding a few dedicated multi-space tokens (SP×2, SP×4, SP×8) to BPE vocabulary.
 
-Also include 9 lower-frequency GTest tokens (TYPED_TEST_SUITE, MOCK_METHOD, EXPECT_NO_THROW, SetUpTestSuite, ASSERT_DEATH, TearDownTestSuite, ASSERT_NO_THROW, EXPECT_THROW, ASSERT_THROW) for completeness = **36 total**.
+### Indentation Style
 
-#### MySQL C API (18 tokens, 4.2K hits, 100% coverage)
+| Style | Lines | % of Indented |
+|-------|-------|---------------|
+| 4-space | 87,059,103 | **31%** (dominant) |
+| 2-space | 86,746,923 | 31% |
+| Tab | 74,576,886 | 26% |
+| 8-space | 35,071,760 | 12% |
 
-All 18 tokens found. `mysql_errno` (843), `mysql_query` (466), `mysql_close` (413) are top.
+**BPE Implication**: All three major indent styles (2-space, 4-space, tab) are nearly equal. The tokenizer must handle all three efficiently. Dedicate BPE tokens for `"  "` (2-space), `"    "` (4-space), `"        "` (8-space), and `"\t"`.
 
-**Verdict: INCLUDE ALL 18.** The `mysql_` prefix pattern is consistently split by BPE.
+### Unicode / Non-English Content
 
-#### SQLite3 C API (29 tokens, 673 hits, 97% coverage)
+| Metric | Value | % |
+|--------|-------|---|
+| Non-ASCII bytes | 4,481,732 | **0.020%** of total |
+| UTF-8 multi-byte chars | 6,594 | Negligible |
+| Docs with non-ASCII comments | 48,157 | **3.4%** of files |
 
-All but `sqlite3_prepare_v3` found. Individual counts are low (1-157) but the `sqlite3_` prefix is a consistent BPE-unfriendly pattern.
+**BPE Implication**: Corpus is >99.98% ASCII. Non-English content is negligible (3.4% of files, mostly accented names like `Michał Górny` and Unicode math symbols `×`, `²`, `–`). **No need for unicode-to-English normalization or translation.** Standard UTF-8 BPE fallback is sufficient.
 
-**Verdict: INCLUDE TOP 20** (those with count >= 2). Drop 9 single-occurrence tokens and `sqlite3_prepare_v3`.
-
-#### Protobuf API (21 tokens with MODERATE+, 19.6K hits)
-
-| Token | Count | Note |
-|-------|-------|------|
-| `Message` | 10,118 | Generic but also protobuf-specific class |
-| `Descriptor` | 5,729 | Domain-specific |
-| `Arena` | 1,173 | Domain-specific |
-| `DebugString` | 515 | Domain-specific |
-| `FieldDescriptor` | 324 | Domain-specific |
-| `MergeFrom` | 266 | Domain-specific |
-| `FileDescriptor` | 253 | Domain-specific |
-| `EnumDescriptor` | 212 | Domain-specific |
-| `ServiceDescriptor` | 167 | Domain-specific |
-| `OneofDescriptor` | 166 | Domain-specific |
-| `DescriptorPool` | 134 | Domain-specific |
-
-**Verdict: INCLUDE TOP 15** compound names (`FieldDescriptor`, `MergeFrom`, `DebugString`, etc.) that BPE splits. Skip single generic words (`Message`, `Arena`) that BPE handles fine.
+**Non-English comment samples** (from 48K files):
+- Author names with accents: `Michał Górny`
+- Japanese punctuation: `。`, `．`, `｡`
+- Unicode math: `2^32 – 2`, `2'b01`
+- Bullet points: `•`, `…`
 
 ---
 
-### TIER 2: INCLUDE SELECTIVELY — Moderate frequency, domain-specific
+## Identifier Analysis (848M identifiers)
 
-#### SQL Keywords in String Literals (58 tokens, 31K hits, 100% coverage)
+### Naming Style Distribution
 
-SQL keywords appear in `"SELECT ... FROM ..."` string contexts. Top keywords:
-- `SELECT` (5,071), `FROM` (3,081), `WHERE` (2,088), `TABLE` (1,701), `CREATE` (1,257)
-- All 58 found, but these are UPPERCASE words that BPE handles reasonably well
-- Most are short single words (SELECT, FROM, WHERE) that BPE won't split
+| Style | Count | % |
+|-------|-------|---|
+| other/mixed | 490,476,023 | 57.8% |
+| snake_case | 144,841,425 | **17.1%** |
+| SCREAMING_CASE | 79,673,971 | **9.4%** |
+| PascalCase | 76,670,183 | **9.0%** |
+| camelCase | 56,932,523 | **6.7%** |
 
-**Verdict: INCLUDE TOP 30** (those with HIGH+ status: SELECT through DROP). Skip 28 lower-frequency keywords. BPE handles short uppercase words well, but having fixed tokens for common SQL ensures consistent tokenization in string contexts.
+- **Mean identifier length**: 7.5 chars
+- **Mean unique identifiers per doc**: 110
 
-#### CUDA Qualifiers (13 found, 801 hits)
+**BPE Implication**: The morpheme splitter should handle all four major naming conventions. snake_case dominates named identifiers (17.1%), but PascalCase and camelCase together are 15.7%. SCREAMING_CASE (9.4%) confirms the importance of macro tokens.
 
-| Token | Count | BPE Issue |
-|-------|-------|-----------|
-| `__restrict__` | 364 | Double-underscore pattern |
-| `blockIdx` | 139 | camelCase compound |
-| `__device__` | 62 | Double-underscore pattern |
-| `blockDim` | 54 | camelCase compound |
-| `__host__` | 39 | Double-underscore pattern |
-| `__global__` | 32 | Double-underscore pattern |
-| `dim3` | 30 | Short, unlikely to be split |
-| `gridDim` | 23 | camelCase compound |
-| `__shared__` | 21 | Double-underscore pattern |
-| `warpSize` | 13 | camelCase compound |
-| `threadIdx` | 12 | camelCase compound |
-| `__constant__` | 10 | Double-underscore pattern |
+### Top Namespaces (28.2M namespace-qualified references)
 
-**Verdict: INCLUDE TOP 12.** Low counts but these `__double_underscore__` patterns are consistently mangled by BPE. Essential for CUDA code generation.
+| Namespace | Refs | Notes |
+|-----------|------|-------|
+| `std` | 6,818,050 | Standard library dominates |
+| `llvm` | 552,842 | LLVM project |
+| `boost` | 517,791 | Boost libraries |
+| `detail` | 495,313 | Implementation namespaces |
+| `cutlass` | 443,931 | NVIDIA CUTLASS |
+| `absl` | 322,751 | Google Abseil |
+| `proto` | 311,843 | Protobuf |
+| `Kokkos` | 166,879 | Performance portability |
+| `testing` | 134,409 | Google Test |
+| `mlir` | 112,912 | MLIR compiler |
+| `ImGui` | 105,905 | Dear ImGui |
+| `Qt` | 95,394 | Qt framework |
+| `Eigen` | 51,321 | Linear algebra |
+| `cuda` | 47,696 | CUDA runtime |
+| `torch` | 25,732 | PyTorch C++ |
+| `folly` | 25,979 | Facebook Folly |
 
-#### CUDA Runtime (top 10 of 32 found, 322 total hits)
-
-| Token | Count |
-|-------|-------|
-| `cudaStream_t` | 75 |
-| `cudaDeviceProp` | 34 |
-| `cudaMemcpyAsync` | 22 |
-| `cudaSuccess` | 21 |
-| `cudaStreamSynchronize` | 19 |
-| `cudaSetDevice` | 17 |
-| `cudaDeviceGetAttribute` | 12 |
-| `cudaMemcpy` | 11 |
-| `cudaMemcpyHostToDevice` | 10 |
-| `cudaGetDeviceProperties` | 9 |
-
-**Verdict: INCLUDE TOP 15** (count >= 5). The `cuda` prefix is well-known but long compound names like `cudaMemcpyHostToDevice` and `cudaStreamSynchronize` benefit from single tokens.
-
-#### cuBLAS (top 6, 187 total hits)
-
-`cublasOperation_t` (62), `cublasHandle_t` (47), `cublasStatus_t` (21), `cublasLtMatmul` (17), `cublasSetStream` (15), `cublasCreate` (6).
-
-**Verdict: INCLUDE TOP 6.** Low frequency but consistent API patterns.
-
-#### Redis Commands (top 12, 1.2K hits)
-
-`hiredis` (293), `PUBLISH` (262), `XADD` (239), `XREADGROUP` (122), `XREAD` (61), `ZRANGE` (60), `SUBSCRIBE` (54), `UNSUBSCRIBE` (44), `ZADD` (30), `PSUBSCRIBE` (24), `SREM` (16), `HDEL` (12).
-
-**Verdict: INCLUDE TOP 12.** Short uppercase commands are fine for BPE, but `hiredis`, `XREADGROUP`, `PSUBSCRIBE` benefit.
-
-#### CMake Functions (top 10, 5.2K hits)
-
-`install` (5,049) dominates — generic word, skip. Remaining: `CMAKE_BUILD_TYPE` (36), `CMAKE_INSTALL_PREFIX` (20), `find_path` (19), etc.
-
-**Verdict: INCLUDE 8 CMAKE_* variables only.** Skip function names that BPE handles fine.
-
-#### Catch/Boost.Test (top 5, 26.9K hits)
-
-`CHECK` (10,813) — already C++ generic. `SECTION` (7,798), `THEN` (5,941), `WHEN` (1,035) — generic words. `REQUIRE` (786), `TEST_CASE` (511).
-
-**Verdict: INCLUDE `TEST_CASE`, `BOOST_AUTO_TEST_CASE`, `BOOST_AUTO_TEST_SUITE`, `BOOST_CHECK`, `BOOST_REQUIRE`, `SCENARIO`, `GIVEN`** = 7 tokens with distinctive naming. Skip generic words.
+**BPE Implication**: `std::` appears 6.8M times — the `std::` prefix should be a highly efficient BPE merge. Consider ensuring `std::` is learned early in BPE training.
 
 ---
 
-### TIER 3: SKIP — Generic words that BPE handles well
+## Domain Token Analysis (697 proposed → 647 found, 93% coverage)
 
-These tokens appear in the proposal but are common English/C++ words. BPE will learn them as whole tokens because they appear so frequently. Fixed vocab slots are wasted on them.
+### Category Summary
 
-| Category | Skip Count | Examples |
-|----------|-----------|---------|
-| proto_keywords | 18 | `returns`, `map`, `enum`, `message`, `required`, `stream`, `option`, `reserved`, `optional`, `service`, `syntax`, `package`, `import`, `extend` |
-| cpp26_features | 8 | `just`, `transfer`, `schedule`, `scheduler`, `receiver`, `sender`, `substitute` |
-| cpp23_types | 5 | `expected`, `unexpected`, `generator`, `unreachable`, `stacktrace` |
-| cpp23_ranges | 5 | `chunk`, `stride`, `zip`, `adjacent`, `enumerate` |
-| cpp20_concepts | 6 | `predicate`, `regular`, `integral`, `movable`, `copyable`, `destructible` |
-| graphql | 7 | `query`, `Field`, `fragment`, `Argument`, `Document`, `mutation`, `subscription` |
-| grpc | 8 | `Status`, `Channel`, `Server`, `Service`, `NOT_FOUND`, `UNIMPLEMENTED`, `ABORTED` |
-| catch_boost_test | 4 | `CHECK`, `SECTION`, `THEN`, `WHEN` |
+| Category | Proposed | Found | Coverage | Total Hits |
+|----------|----------|-------|----------|-----------|
+| proto_keywords | 18 | 18 | 100% | 1,932,142 |
+| attributes | 20 | 20 | 100% | 763,121 |
+| gtest | 36 | 36 | 100% | 2,047,563 |
+| catch_boost_test | 16 | 16 | 100% | 439,453 |
+| grpc | 32 | 32 | 100% | 365,260 |
+| protobuf | 32 | 32 | 100% | 215,480 |
+| cpp23_ranges | 10 | 10 | 100% | 206,104 |
+| cpp23_types | 22 | 22 | 100% | 205,904 |
+| sql_keywords | 58 | 58 | 100% | 149,427 |
+| cuda_qualifiers | 18 | 18 | 100% | 147,730 |
+| graphql | 16 | 13 | 81% | 143,845 |
+| cpp20_concepts | 29 | 29 | 100% | 77,235 |
+| cpp26_features | 21 | 18 | 86% | 66,288 |
+| cuda_runtime | 47 | 46 | 98% | 54,543 |
+| xla_ops | 15 | 13 | 87% | 46,748 |
+| sqlite3_api | 30 | 30 | 100% | 32,756 |
+| thrust_cub | 12 | 12 | 100% | 11,502 |
+| cuda_atomics | 21 | 21 | 100% | 10,256 |
+| mysql_api | 18 | 18 | 100% | 9,972 |
+| mongodb_cpp | 11 | 11 | 100% | 5,444 |
+| hip_runtime | 28 | 28 | 100% | 3,248 |
+| cublas | 20 | 20 | 100% | 2,711 |
+| cmake | 22 | 13 | 59% | 2,356 |
+| cudnn | 16 | 16 | 100% | 1,949 |
+| odbc_api | 20 | 20 | 100% | 1,184 |
+| nccl | 17 | 17 | 100% | 930 |
+| redis_commands | 26 | 25 | 96% | 987 |
+| cpp_orms | 13 | 9 | 69% | 488 |
+| mongodb_dollar | 39 | 12 | 31% | 194 |
+| rocblas_miopen | 14 | 14 | 100% | 154 |
+| **TOTAL** | **697** | **647** | **93%** | **6,944,974** |
 
-**Total: ~61 generic tokens to REMOVE from fixed vocab.**
+### Key observation from full corpus vs. sample
 
-These words appear in 1-30% of all documents and will naturally become whole BPE tokens during training. Dedicating fixed vocab slots to them wastes space that could go to more BPE merges.
-
----
-
-### TIER 4: DROP ENTIRELY — Near-zero corpus presence
-
-| Category | Proposed | Found | Total Hits | Verdict |
-|----------|----------|-------|------------|---------|
-| cuda_atomics | 21 | 2 | 7 | DROP ALL — atomicAdd (4), atomicMin (3) only |
-| nccl | 17 | 2 | 11 | DROP ALL — ncclComm_t (9) and ncclUniqueId (2) only |
-| rocblas_miopen | 14 | 1 | 10 | DROP ALL — hipblasStatus_t (10) only |
-| xla_ops | 15 | 2 | 45 | DROP ALL — XlaOp (42), XlaBuilder (3) only |
-| hip_runtime | 28 | 9 | 40 | DROP ALL — hipStream_t (17), hipError_t (13) top |
-| mongodb_dollar | 39 | 11 | 395 | DROP ALL — $count (132), $match (111) top |
-| cpp_orms | 13 | 5 | 121 | DROP ALL — rowset (61), got_data (34) top |
-| odbc_api | 20 | 12 | 82 | DROP ALL — SQLBindParameter (18) top |
-| cudnn | 16 | 8 | 46 | DROP ALL — cudnnHandle_t (27) top |
-| thrust_cub | 12 | 3 | 238 | KEEP 2 — device_vector (111), host_vector (97) |
-
-**Total: ~193 tokens to DROP.** These APIs are virtually absent from the 93-project corpus. Even the top tokens in each category appear in <0.02% of documents.
-
-**Exception**: Keep `device_vector` (111 hits) and `host_vector` (97 hits) from thrust_cub.
-
----
-
-## Morpheme Analysis Results
-
-All morpheme categories show extremely high corpus presence:
-
-| Category | Proposed | Found | Total Occurrences |
-|----------|----------|-------|-------------------|
-| Prefixes | 24 | 24 (100%) | 1,268,358 |
-| Suffixes | 23 | 22 (96%) | 350,550 |
-| C++ Stems | 30 | 30 (100%) | 6,806,956 |
-| Common Components | 52 | 52 (100%) | 15,882,542 |
-
-### Top Morpheme Components (appearing as identifier sub-parts)
-
-**C++ Stems** (top 15):
-`lock` (685K), `read` (670K), `write` (569K), `start` (511K), `init` (500K), `create` (424K), `format` (336K), `end` (277K), `parse` (249K), `find` (243K), `load` (243K), `open` (236K), `alloc` (198K), `remove` (187K), `push` (169K)
-
-**Common Components** (top 15):
-`value` (1.73M), `list` (1.0M), `param` (858K), `node` (855K), `index` (763K), `offset` (714K), `context` (712K), `buffer` (694K), `count` (594K), `event` (579K), `length` (480K), `config` (479K), `ptr` (451K), `tree` (443K), `next` (412K)
-
-**Verdict: STRONG SUPPORT for morpheme-aware BPE.** These stems and components are the building blocks of C++ identifiers. A morpheme-aware BPE that preferentially learns `init` + `ialize`, `alloc` + `ate`, `de` + `init` would produce better tokenization than pure byte-level BPE.
+The full 1.43M-file corpus (333 projects) shows dramatically higher coverage than the 150K-doc sample (93% vs 68%). Low-frequency domain tokens (CUDA, HIP, ROCm) that were absent from the sample now have significant counts because the full corpus includes specialized GPU libraries (CUTLASS: 444K namespace refs, CUDA: 148K qualifier hits).
 
 ---
 
-## Revised Token Budget
+## Morpheme Analysis (88.3M total hits)
 
-Based on empirical data, the fixed vocabulary should be restructured:
+Morpheme analysis shows the strongest signal for BPE design:
 
-### Current Proposal (697 domain-specific tokens across IDs 5300-6999)
+### Summary
 
-| Range | Proposed Count | Category |
-|-------|---------------|----------|
-| 5300-5799 | 500 | GPU/Accelerator tokens |
-| 5800-6299 | 500 | SQL domain tokens |
-| 6300-6599 | 300 | Query/DB tokens |
-| 6600-6799 | 200 | C++23/26 additions |
-| 6800-6999 | 200 | Testing/build framework |
-| **Total** | **1,700** | |
+| Category | Found/Proposed | Total Hits | Coverage |
+|----------|---------------|-----------|---------|
+| Common Components | 52/52 | **59,903,189** | 100% |
+| C++ Stems | 30/30 | **22,949,545** | 100% |
+| Prefixes | 24/24 | **4,185,596** | 100% |
+| Suffixes | 22/23 | **1,254,255** | 96% |
+| **TOTAL** | **128/129** | **88,292,585** | **99%** |
 
-### Revised Recommendation (data-driven, ~340 tokens)
+### Top C++ Stems (building blocks of identifiers)
 
-| Category | Count | Tokens |
-|----------|-------|--------|
-| Compiler attributes | 20 | `__func__`, `__attribute__`, `__LINE__`, etc. |
-| GTest macros | 36 | `ASSERT_EQ`, `EXPECT_EQ`, `TEST_F`, etc. |
-| MySQL C API | 18 | `mysql_errno`, `mysql_query`, etc. |
-| SQLite3 C API | 20 | `sqlite3_free`, `sqlite3_exec`, etc. |
-| SQL keywords (top) | 30 | `SELECT`, `FROM`, `WHERE`, etc. |
-| CUDA qualifiers | 12 | `__device__`, `__global__`, `__shared__`, etc. |
-| CUDA runtime (top) | 15 | `cudaStream_t`, `cudaMemcpy`, etc. |
-| cuBLAS (top) | 6 | `cublasHandle_t`, `cublasOperation_t`, etc. |
-| Protobuf API (compound) | 15 | `FieldDescriptor`, `MergeFrom`, `DebugString`, etc. |
-| Redis (top) | 12 | `hiredis`, `XREADGROUP`, `PSUBSCRIBE`, etc. |
-| Catch/Boost.Test | 7 | `TEST_CASE`, `BOOST_AUTO_TEST_CASE`, etc. |
-| CMake variables | 8 | `CMAKE_BUILD_TYPE`, `CMAKE_INSTALL_PREFIX`, etc. |
-| gRPC (compound only) | 5 | `ClientContext`, `ServerContext`, `CompletionQueue`, etc. |
-| MongoDB C++ | 3 | `mongocxx`, `bsoncxx`, `aggregate` |
-| Thrust | 2 | `device_vector`, `host_vector` |
-| C++23/26 (compound only) | 15 | `source_location`, `flat_map`, `flat_set`, `move_only_function`, etc. |
-| C++20 concepts (compound) | 10 | `forward_iterator`, `equality_comparable`, `input_range`, etc. |
-| HIP (top 2) | 2 | `hipStream_t`, `hipError_t` |
-| **TOTAL** | **~236** | |
+| Stem | Hits | Example Identifiers |
+|------|------|-------------------|
+| `init` | 2,191,060 | initialize, initBuffer, deinit |
+| `read` | 1,888,838 | readFile, readBuffer, readOnly |
+| `write` | 1,795,113 | writeData, writeBuffer, writeBack |
+| `create` | 1,758,587 | createHandler, createBuffer |
+| `start` | 1,689,929 | startTimer, startProcess |
+| `format` | 1,508,143 | formatString, formatOutput |
+| `end` | 1,364,319 | endBlock, endTransaction |
+| `lock` | 1,162,779 | lockMutex, unlock, readLock |
+| `begin` | 1,057,396 | beginTransaction, beginBlock |
+| `load` | 909,964 | loadConfig, loadData |
+| `push` | 835,909 | pushBack, pushFront |
+| `parse` | 802,442 | parseJSON, parseConfig |
+| `find` | 685,086 | findFirst, findByName |
+| `alloc` | 682,877 | allocBuffer, dealloc |
+| `insert` | 582,370 | insertNode, insertRow |
 
-**Savings: ~460 fewer fixed tokens** → more room for BPE merges (which learn the generic words better than fixed tokens anyway).
+### Top Common Components (the nouns of C++ identifiers)
 
-The remaining ~100 slots (to round to ~340) should be allocated to additional compound identifiers discovered during BPE training analysis or reserved for future expansion.
+| Component | Hits | Example Identifiers |
+|-----------|------|-------------------|
+| `value` | 6,188,458 | getValue, setValue, defaultValue |
+| `index` | 3,319,836 | getIndex, indexBuffer |
+| `offset` | 3,314,628 | byteOffset, fileOffset |
+| `node` | 2,966,716 | treeNode, childNode |
+| `ptr` | 2,840,443 | dataPtr, sharedPtr |
+| `buffer` | 2,730,513 | readBuffer, ringBuffer |
+| `count` | 2,722,740 | refCount, itemCount |
+| `context` | 2,526,817 | renderContext, execContext |
+| `list` | 2,507,437 | nodeList, fileList |
+| `tree` | 1,822,536 | parseTree, binaryTree |
+
+### Top Prefixes
+
+| Prefix | Hits | Example |
+|--------|------|---------|
+| `proto` | 757,214 | prototype, protocol |
+| `sub` | 592,008 | subClass, subTree |
+| `non` | 385,989 | nonNull, nonEmpty |
+| `multi` | 347,615 | multiThread, multiLine |
+| `meta` | 272,370 | metadata, metaClass |
+| `mono` | 265,752 | monomorphic, monoState |
+
+**BPE Design Conclusion**: Morpheme-aware BPE is strongly validated. The tokenizer should learn these stems and components as BPE merges, ensuring `initialize` → `init` + `ialize` rather than `in` + `iti` + `ali` + `ze`.
 
 ---
 
-## Methodology Notes
+## C++ Keyword Frequency (169M total)
 
-### What was measured
-- **Identifier extraction**: `[a-zA-Z_]\w*(?:::\w+)*` regex on full document text
-- **$-operator extraction**: `\$[a-zA-Z_]\w*` for MongoDB operators
-- **SQL keyword extraction**: Keywords searched inside string literals (`"..."`)
-- **Morpheme analysis**: Identifiers split on `_` and camelCase boundaries, components counted
+The top 20 C++ keywords account for the vast majority of keyword occurrences:
 
-### Limitations
-1. **No context disambiguation**: `Status` counted whether it's `grpc::Status` or `enum Status` or variable name
-2. **String literal SQL**: Only SQL keywords in `"..."` strings counted; might miss raw identifiers used in SQL builders
-3. **3 of 21 shards**: Analysis covers ~15% of cpp_compilable_16k. Results are representative but not exhaustive
-4. **Morpheme Doc%=0**: The morpheme analysis counts component occurrences but doesn't track unique documents (by design — focuses on frequency)
+| Keyword | Count | Doc% |
+|---------|-------|------|
+| `if` | 20,058,320 | 42.6% |
+| `const` | 18,529,109 | 56.8% |
+| `return` | 16,622,711 | 57.8% |
+| `int` | 13,127,390 | 54.6% |
+| `void` | 10,879,929 | 60.5% |
+| `struct` | 8,718,210 | 36.6% |
+| `static` | 6,684,701 | 33.2% |
+| `case` | 5,103,770 | 12.0% |
+| `char` | 4,820,932 | 32.6% |
+| `typename` | 4,292,020 | 11.1% |
+| `else` | 4,086,961 | 26.2% |
+| `unsigned` | 3,986,714 | 20.4% |
+| `bool` | 3,930,633 | 30.2% |
+| `break` | 3,163,346 | 15.2% |
+| `for` | 3,074,496 | 26.6% |
+| `false` | 2,870,273 | 20.1% |
+| `auto` | 2,850,877 | 13.5% |
+| `true` | 2,271,015 | 20.0% |
+| `template` | 2,081,518 | 14.9% |
+| `nullptr` | 1,414,505 | 10.8% |
 
-### Reproducibility
+**BPE Implication**: All C++ keywords will naturally become whole BPE tokens due to extreme frequency. No fixed vocab slots needed for keywords — BPE learns them in the first few merges.
+
+---
+
+## BPE Tokenizer Design Recommendations
+
+Based on the full 22.3 GB corpus analysis:
+
+### 1. Whitespace Tokenization
+- **Single space**: Standard BPE token (872M occurrences)
+- **Multi-space tokens**: Add `SP×2`, `SP×4`, `SP×8` (71M multi-space runs = 7.5% of spaces)
+- **Tab**: Standard BPE token (5.7M)
+- **Newline**: Standard `\n` token (507M lines)
+- **No need for**: multi-tab tokens (only 5M), mixed indent handling (BPE handles naturally)
+
+### 2. Comment Tokenization
+- Comments are **24.2% of corpus** — substantial
+- `//` and `/*` `*/` should be efficient BPE tokens
+- Comment content is >99.98% ASCII — no special unicode handling needed
+- Common comment starters: `// `, `/* `, ` * ` (Doxygen)
+
+### 3. Unicode Handling
+- **Skip unicode-to-English normalization** — only 0.020% non-ASCII bytes
+- **Skip comment translation** — only 3.4% of files have non-English comments
+- Standard UTF-8 byte fallback is sufficient
+- The non-English content is mostly author names and Unicode math symbols
+
+### 4. Fixed Vocabulary (domain-specific tokens that BPE splits poorly)
+- **~340 tokens** from Tier 1-2 analysis (compiler attrs, GTest macros, CUDA, SQL APIs)
+- Focus on tokens with `__double_underscore__`, `SCREAMING_CASE`, or long compound names
+- Skip generic English words — BPE learns them naturally
+
+### 5. Morpheme-Aware BPE Training
+- Seed BPE with morpheme stems as initial merges: `init`, `read`, `write`, `create`, etc.
+- Common components (`value`, `index`, `offset`, `node`, `ptr`, `buffer`) should be early merges
+- Prefixes (`sub`, `non`, `multi`, `meta`, `proto`) and suffixes (`or`, `ic`, `al`, `less`) as merge hints
+
+### 6. Separator Tokens for C/C++
+- **Command separator**: `;` followed by newline or space
+- **Block delimiters**: `{`, `}` with surrounding whitespace patterns
+- **Include guard**: `#ifndef`, `#define`, `#endif` (high frequency: >200K each as preprocessor directives)
+- **Namespace**: `::` (28.2M namespace-qualified refs, `std::` alone is 6.8M)
+
+---
+
+## Reproducibility
+
+### Rust Tool (full corpus, 48-core)
 ```bash
-# Run full analysis
-.venv/bin/python3 -m scripts.data.analyze_vocab_frequency \
-    /tmp/shard_00000.parquet /tmp/shard_00001.parquet /tmp/shard_00002.parquet \
-    --morphemes -o /tmp/vocab_frequency_results.json
+# Build
+cd tools/vocab_analyzer && cargo build --release
 
-# View specific category
-.venv/bin/python3 -m scripts.data.analyze_vocab_frequency \
-    /tmp/shard_00000.parquet -c gtest
+# Full analysis (all modes, 22.3 GB, ~50s on 48 cores)
+./target/release/vocab-analyzer /path/to/cpp_raw/ --all --content \
+    -o results.json > report.txt 2>&1
 
-# JSON output for programmatic analysis
+# Quick test (100 files)
+./target/release/vocab-analyzer /path/to/cpp_raw/ --all --content --max-files 100
+
+# Category filter
+./target/release/vocab-analyzer /path/to/cpp_raw/ -c cuda --top 20
+```
+
+### Python Tool (smaller samples)
+```bash
 .venv/bin/python3 -m scripts.data.analyze_vocab_frequency \
-    /tmp/shard_00000.parquet --json
+    /path/to/shard.parquet --morphemes -o results.json
 ```
