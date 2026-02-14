@@ -214,6 +214,105 @@ If you find nanochat helpful in your research cite simply as:
 }
 ```
 
+---
+
+## C++ Code Model Training (Fork Extensions)
+
+This fork extends nanochat for **C++ code generation** with custom architectures and TPU training.
+
+### Current Training Run
+
+**Machine**: Google Cloud TPU v6e-8 (8 Trillium chips, 31.25 GB HBM each)
+
+| Parameter | Value |
+|-----------|-------|
+| **Model** | d=24, 877M params, AAM hybrid (Attention-Attention-Mamba) |
+| **Context** | 65,536 tokens (64K) |
+| **Parallelism** | TP=4 (tensor), DP=2 (data) via XLA SPMD 2D mesh |
+| **Batch** | 524K tokens/step, 4 grad accum steps |
+| **Training tokens** | 26.2B (30:1 token:param ratio, 50K iterations) |
+| **Throughput** | ~200K tok/sec, ~2.5s/step |
+| **ETA** | ~36 hours |
+
+**Features**: Mamba-3 (QK-norm, bias, complex RoPE, trapezoidal), Engram (layers 0,3,6),
+mHC, DSA (layers 7-23), MTP (lambda=0.3), FIM (50%), gradient checkpointing, XLA flash attention.
+
+### Training Data
+
+Dataset: **cpp_compilable_64k** — compilable-ordered C++ training documents.
+
+| Dataset | Docs | Size | Tokens | Description |
+|---------|------|------|--------|-------------|
+| cpp_crossfile_16k | 8.1M | 23 GB | 16K | Tree-sitter cross-file (JSONL) |
+| cpp_project_crossfile_16k | 1.0M | 8.0 GB | 16K | Project-aware cross-file |
+| cpp_clang_crossfile_16k | 794K | 883 MB | 16K | Clang semantic indexer |
+| cpp_compilable_16k | 1.0M | 7.3 GB | 16K | Compilable: types->functions |
+| **cpp_compilable_64k** | **394K** | **3.4 GB** | **64K** | **Compilable: types->functions (active)** |
+
+All datasets at `gs://nanochat-training-data-2026/data/`. Generated from 93 C++ open-source
+projects (641K files, 29 GB raw) using `tools/cpp_chunker` (Rust).
+
+**Compilable ordering**: Each document is structured as a near-compilable C++ translation unit:
+1. Preamble: `#include`, `using`, forward declarations
+2. Type definitions: structs/classes/enums in topological order (Base before Derived)
+3. Functions: bottom-up order (leaf callees first, callers last)
+
+### Architecture Extensions
+
+| Component | Description |
+|-----------|-------------|
+| **Mamba-3 Hybrid** | SSM layers interleaved with attention (AAM pattern). Adds QK-norm, learnable B/C bias, complex RoPE, and trapezoidal discretization to Mamba-2. |
+| **Engram** | N-gram prediction branches at early layers for local pattern learning. |
+| **mHC** | Multi-Head Collaboration via Sinkhorn transport for cross-head information mixing. |
+| **DSA** | DeepSeek Sparse Attention — top-k token selection for O(n*k) attention in upper layers. |
+| **MTP** | Multi-Token Prediction (DeepSeek-V3 style) — predicts token i+2 as auxiliary loss. |
+| **FIM** | Fill-in-the-Middle — 50% of documents randomly rearranged for infilling capability. |
+
+### Tensor Parallelism
+
+Model weights are split across TPU chips using Megatron-style SPMD sharding.
+`num_heads` must be divisible by `tp_degree`:
+
+| Depth | Params | Heads | TP=2 | TP=4 | TP=8 |
+|-------|--------|-------|------|------|------|
+| 16 | 270M | 8 | OK | OK | OK |
+| **24** | **877M** | **12** | OK | **OK** | NO |
+| 32 | 1.5B | 16 | OK | OK | OK |
+| 48 | 3.4B | 24 | OK | OK | OK |
+
+See [docs/TENSOR_PARALLELISM.md](docs/TENSOR_PARALLELISM.md) for full details.
+
+### Launch Command
+
+```bash
+source ~/venv311/bin/activate && source ~/.tpu_env
+cd ~/nanochat && export NANOCHAT_BASE_DIR=/home/dave/data
+
+python3 -u -m scripts.base_train \
+    --depth=24 --num_iterations=50000 \
+    --tensor_parallel=4 \
+    --device_batch_size=1 --max_seq_len=65536 --total_batch_size=524288 \
+    --kernel=current --no_compile --xla_flash_attn \
+    --window_pattern=L \
+    --mamba --mamba_pattern=AAM \
+    --mamba3_qknorm --mamba3_bias --mamba3_complex_rope --mamba3_trapezoidal \
+    --engram --engram_layers=0,3,6 \
+    --mhc --mtp --mtp_lambda=0.3 \
+    --dsa --dsa_start_layer=7 \
+    --gradient_checkpointing \
+    --fim_rate=0.5 \
+    --data_dir=/home/dave/data/parquet --streaming_data \
+    --run=dummy \
+    --core_metric_every=5000 --save_every=5000 --sample_every=5000
+```
+
+### Documentation
+
+- [CLAUDE.md](CLAUDE.md) — Full development guide (GPU benchmarks, TPU setup, data pipeline)
+- [docs/TPU_SETUP.md](docs/TPU_SETUP.md) — TPU environment setup and version matrix
+- [docs/TENSOR_PARALLELISM.md](docs/TENSOR_PARALLELISM.md) — TP sharding details and dimension tables
+- [docs/DATA_PIPELINE.md](docs/DATA_PIPELINE.md) — C++ data processing pipeline
+
 ## License
 
 MIT

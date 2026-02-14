@@ -193,6 +193,24 @@ The PJRT_ExecuteOptions struct size changed from 80→112 bytes between libtpu 0
 Note: basic TPU init (`xm.xla_device()`) passes with all versions due to XLA's lazy execution,
 but actual computation (`xm.mark_step()`) fails on 0.0.24+.
 
+### JAX Version Compatibility (tested Feb 14, 2026)
+
+With libtpu 0.0.23.1 + torch_xla 2.9.0, all JAX versions from 0.7.0 through 0.9.0 pass
+flash attention tests:
+
+| JAX    | jaxlib | Flash Attention | Status |
+| ------ | ------ | --------------- | ------ |
+| 0.7.0  | 0.7.0  | PASSED          | Minimum compatible |
+| 0.7.1  | 0.7.1  | PASSED          | Compatible |
+| 0.7.2  | 0.7.2  | PASSED          | Compatible |
+| 0.8.0  | 0.8.0  | PASSED          | Compatible |
+| 0.8.3  | 0.8.3  | PASSED          | Compatible |
+| **0.9.0** | **0.9.0** | **PASSED** | **Recommended (latest stable)** |
+
+A/B performance test (20-step training, v6e-4, 16K seq_len, flash attention) confirmed
+**zero performance regression**: jax 0.9.0 + libtpu 0.0.23.1 matches jax 0.7.0 + libtpu 0.0.21
+within noise (both ~350-430K tok/sec steady state).
+
 ### Setup: v6e TPU from Scratch
 
 ```bash
@@ -252,7 +270,112 @@ nohup python3 -u -m scripts.base_train \
 | mhc          | --mhc                     | 1         | ~1.02         | ~35%    |
 | mhc+engram   | --mhc --engram            | 2         | **~0.91**     | ~49%    |
 
-v6e-8 full pipeline (64K context): `--mhc --engram --mtp --dsa --fim_rate=0.5 --gradient_checkpointing`
+### v6e-8 Full Pipeline (64K context, d24/877M, TP=4)
+
+**Active run** (Feb 14, 2026): d=24 AAM hybrid with all features on v6e-8 using tensor parallelism.
+
+```bash
+source ~/venv311/bin/activate && source ~/.tpu_env
+cd ~/nanochat
+export NANOCHAT_BASE_DIR=/home/dave/data
+
+nohup python3 -u -m scripts.base_train \
+    --depth=24 --num_iterations=50000 \
+    --tensor_parallel=4 \
+    --device_batch_size=1 --max_seq_len=65536 --total_batch_size=524288 \
+    --kernel=current --no_compile --xla_flash_attn \
+    --window_pattern=L \
+    --mamba --mamba_pattern=AAM \
+    --mamba3_qknorm --mamba3_bias --mamba3_complex_rope --mamba3_trapezoidal \
+    --engram --engram_layers=0,3,6 \
+    --mhc --mtp --mtp_lambda=0.3 \
+    --dsa --dsa_start_layer=7 \
+    --gradient_checkpointing \
+    --fim_rate=0.5 \
+    --data_dir=/home/dave/data/parquet --streaming_data \
+    --run=dummy \
+    --core_metric_every=5000 --save_every=5000 --sample_every=5000 \
+    > ~/train_d24_aam_64k_tp4.log 2>&1 &
+```
+
+**Run config**:
+
+| Parameter | Value |
+|-----------|-------|
+| Model | d=24, model_dim=1536, 12 heads, head_dim=128 |
+| Parameters | 877M (AAM hybrid: Attention-Attention-Mamba pattern) |
+| Sequence length | 65,536 (64K) |
+| Parallelism | 2-way data × 4-way tensor (SPMD 2D mesh) |
+| Batch size | 524,288 tokens per optimizer step |
+| Grad accumulation | 4 steps (131K tokens per fwd/bwd) |
+| Training tokens | 26.2B (30:1 token:param ratio) |
+| Iterations | 50,000 |
+| Throughput | ~200K tok/sec, ~2.5s per step |
+| ETA | ~36 hours |
+
+**Training data**: `cpp_compilable_64k` — 393,782 documents, 3.4 GB (8 shards + val)
+- Source: 93 C++ open-source projects processed by `tools/cpp_chunker` in compilable mode
+- Each document is a near-compilable C++ unit: preamble → types (topological) → functions (bottom-up)
+- Max 65,536 tokens per document, FIM at 50%
+- GCS: `gs://nanochat-training-data-2026/data/cpp_compilable_64k/`
+
+**All features enabled**:
+- Mamba-3 hybrid (AAM pattern): QK-norm, bias, complex RoPE, trapezoidal discretization
+- Engram branches at layers 0, 3, 6
+- mHC (multi-Head Collaboration) branch mixing
+- DSA (DeepSeek Sparse Attention) on layers 7-23
+- MTP (Multi-Token Prediction) with lambda=0.3
+- FIM (Fill-in-the-Middle) at 50% rate
+- Gradient checkpointing
+- XLA Pallas flash attention (window_pattern=L, no sliding window)
+
+### Tensor Parallelism on TPU (SPMD 2D Mesh)
+
+The `--tensor_parallel=N` flag enables Megatron-style tensor parallelism via XLA SPMD.
+With 8 chips and `--tensor_parallel=4`, the mesh is `(dp=2, tp=4)` — 2-way data, 4-way model.
+
+**How it works**: Weight matrices are sharded across the `'model'` mesh axis:
+- Attention Q/K/V: column-parallel `('model', None)` — each chip gets `n_heads/tp` heads
+- Attention c_proj: row-parallel `(None, 'model')` — XLA inserts all-reduce
+- MLP c_fc: column-parallel `('model', None)` — each chip gets `4*n_embd/tp` columns
+- MLP c_proj: row-parallel `(None, 'model')` — XLA inserts all-reduce
+- Mamba in_proj/out_proj: same column/row-parallel pattern
+- Embeddings, lm_head, layer norms: replicated (not sharded)
+
+**Constraint: `num_heads` must be divisible by `tp_degree`.**
+
+#### TP Dimension Compatibility Table
+
+| Depth | model_dim | num_heads (head_dim=128) | TP=2 | TP=4 | TP=8 |
+|-------|-----------|--------------------------|------|------|------|
+| 12    | 768       | 6                        | OK   | NO   | NO   |
+| 16    | 1024      | 8                        | OK   | OK   | OK   |
+| 20    | 1280      | 10                       | OK   | NO   | NO   |
+| **24**| **1536**  | **12**                   | **OK** | **OK** | **NO** |
+| 32    | 2048      | 16                       | OK   | OK   | OK   |
+| 48    | 3072      | 24                       | OK   | OK   | OK   |
+
+**Why TP=8 fails for d=24**: 12 heads / 8 chips = 1.5 — not integer. The Q/K/V weight
+sharding creates tensors with incompatible dimensions for the attention head reshape.
+
+#### Memory & Throughput Scaling
+
+| Config (d=24, 877M) | Per-chip HBM | Seq Len | Grad Accum | Status |
+|---------------------|-------------|---------|------------|--------|
+| TP=1, dp=8          | 45.5 GB     | 65536   | 1          | OOM (31.25 GB limit) |
+| TP=4, dp=2          | ~12 GB      | 65536   | 4          | **WORKING** (~200K tok/s) |
+| TP=1, dp=8          | ~6 GB       | 2048    | 32         | OK (sanity test only) |
+
+#### Grad Accum Calculation
+
+```
+tokens_per_fwdbwd = device_batch_size × max_seq_len = 1 × 65536 = 65,536
+dp_degree = num_devices / tp_degree = 8 / 4 = 2
+world_tokens = tokens_per_fwdbwd × dp_degree = 65,536 × 2 = 131,072
+grad_accum = total_batch_size / world_tokens = 524,288 / 131,072 = 4
+```
+
+For grad_accum=8: set `--total_batch_size=1048576` (1M tokens per step).
 
 ### Flash Attention Integration
 

@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 mod chunker;
+mod commit;
 mod compilable;
 mod deps;
 mod global_index;
@@ -73,6 +74,16 @@ struct Args {
     /// Use with --project_dirs for best results.
     #[arg(long, default_value = "false")]
     compilable: bool,
+
+    /// Commit mode: process JSONL with {old_content, new_content, diff, subject, body, filepath, repo}.
+    /// Extracts function/class chains affected by each commit using tree-sitter.
+    #[arg(long, default_value = "false")]
+    commit_mode: bool,
+
+    /// Output format for commit mode: "chain" (pre/post function chains),
+    /// "diff" (context + applicable diff), or "both".
+    #[arg(long, default_value = "both")]
+    commit_format: String,
 }
 
 #[derive(Deserialize)]
@@ -337,6 +348,16 @@ fn main() {
     }
 
     let num_threads = rayon::current_num_threads();
+
+    // Commit mode: process git commit diffs with function/class chain extraction
+    if args.commit_mode {
+        eprintln!(
+            "cpp-chunker: {} threads, max_tokens={}, commit_mode=true, format={}",
+            num_threads, args.max_tokens, args.commit_format
+        );
+        run_commit_mode(&args, num_threads);
+        return;
+    }
 
     // Project-aware mode: reads raw project directories with dependency ordering
     if let Some(ref proj_dir) = args.project_dirs {
@@ -1053,6 +1074,158 @@ fn process_batch_cross_file(
     }
 
     all_docs
+}
+
+/// Commit mode: read JSONL with commit diffs, extract function/class chains,
+/// produce training documents.
+fn run_commit_mode(args: &Args, num_threads: usize) {
+    let t0 = Instant::now();
+
+    let output_file = std::fs::File::create(&args.output).expect("Failed to create output file");
+    let writer = Mutex::new(BufWriter::with_capacity(64 * 1024 * 1024, output_file));
+    let total_records = AtomicU64::new(0);
+    let total_docs = AtomicU64::new(0);
+    let total_dedup = AtomicU64::new(0);
+    let seen_hashes: Mutex<HashSet<[u8; 16]>> = Mutex::new(HashSet::new());
+
+    for input_path in &args.inputs {
+        let file_size = std::fs::metadata(input_path)
+            .map(|m| m.len() as f64 / 1e9)
+            .unwrap_or(0.0);
+        eprintln!("\nProcessing: {} ({:.1} GB)", input_path, file_size);
+
+        let file = std::fs::File::open(input_path).expect("Failed to open input file");
+        let reader = io::BufReader::with_capacity(16 * 1024 * 1024, file);
+        let mut batch: Vec<commit::CommitRecord> = Vec::with_capacity(args.batch_size);
+        let mut line_count: u64 = 0;
+        let input_t0 = Instant::now();
+
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.is_empty() {
+                continue;
+            }
+
+            let record: commit::CommitRecord = match serde_json::from_str(&line) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            batch.push(record);
+            line_count += 1;
+
+            if args.max_records > 0 && line_count >= args.max_records as u64 {
+                break;
+            }
+
+            if batch.len() >= args.batch_size {
+                let chunk_size = std::cmp::max(1, batch.len() / num_threads);
+                let max_tokens = args.max_tokens;
+                let max_file_bytes = args.max_file_bytes;
+                let format = args.commit_format.clone();
+                let batch_docs: Vec<Vec<String>> = batch
+                    .par_chunks(chunk_size)
+                    .map(|sub_batch| {
+                        commit::process_commit_batch(sub_batch, max_tokens, max_file_bytes, &format)
+                    })
+                    .collect();
+
+                let mut w = writer.lock().unwrap();
+                let mut seen = seen_hashes.lock().unwrap();
+                for docs in batch_docs {
+                    for doc in docs {
+                        let hash: [u8; 16] = md5::compute(doc.as_bytes()).into();
+                        if seen.contains(&hash) {
+                            total_dedup.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        seen.insert(hash);
+                        let out = OutputRecord { text: &doc };
+                        serde_json::to_writer(&mut *w, &out).unwrap();
+                        w.write_all(b"\n").unwrap();
+                        total_docs.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                drop(w);
+                drop(seen);
+
+                total_records.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                batch.clear();
+
+                if line_count % 50_000 < args.batch_size as u64 {
+                    let elapsed = input_t0.elapsed().as_secs_f64();
+                    let rate = line_count as f64 / elapsed;
+                    eprintln!(
+                        "  {}: {:>10} records → {:>12} docs ({:.0} rec/sec)",
+                        input_path,
+                        format_num(line_count),
+                        format_num(total_docs.load(Ordering::Relaxed)),
+                        rate
+                    );
+                }
+            }
+        }
+
+        // Process remaining batch
+        if !batch.is_empty() {
+            let chunk_size = std::cmp::max(1, batch.len() / num_threads);
+            let max_tokens = args.max_tokens;
+            let max_file_bytes = args.max_file_bytes;
+            let format = args.commit_format.clone();
+            let batch_docs: Vec<Vec<String>> = batch
+                .par_chunks(chunk_size)
+                .map(|sub_batch| {
+                    commit::process_commit_batch(sub_batch, max_tokens, max_file_bytes, &format)
+                })
+                .collect();
+
+            let mut w = writer.lock().unwrap();
+            let mut seen = seen_hashes.lock().unwrap();
+            for docs in batch_docs {
+                for doc in docs {
+                    let hash: [u8; 16] = md5::compute(doc.as_bytes()).into();
+                    if seen.contains(&hash) {
+                        total_dedup.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    seen.insert(hash);
+                    let out = OutputRecord { text: &doc };
+                    serde_json::to_writer(&mut *w, &out).unwrap();
+                    w.write_all(b"\n").unwrap();
+                    total_docs.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            total_records.fetch_add(batch.len() as u64, Ordering::Relaxed);
+        }
+
+        let elapsed = input_t0.elapsed().as_secs_f64();
+        eprintln!(
+            "  {}: {} records processed in {:.0}s",
+            input_path, format_num(line_count), elapsed
+        );
+    }
+
+    writer.lock().unwrap().flush().unwrap();
+
+    let total_time = t0.elapsed().as_secs_f64();
+    let records = total_records.load(Ordering::Relaxed);
+    let docs = total_docs.load(Ordering::Relaxed);
+    let dedup = total_dedup.load(Ordering::Relaxed);
+    let output_size = std::fs::metadata(&args.output)
+        .map(|m| m.len() as f64 / 1e9)
+        .unwrap_or(0.0);
+
+    eprintln!("\n{}", "=".repeat(60));
+    eprintln!("RESULTS (commit mode):");
+    eprintln!("  Records processed: {}", format_num(records));
+    eprintln!("  Documents output: {}", format_num(docs));
+    eprintln!("  Deduplicated: {}", format_num(dedup));
+    eprintln!("  Output: {} ({:.2} GB)", args.output, output_size);
+    eprintln!("  Total time: {:.1}s ({:.0} rec/sec)", total_time, records as f64 / total_time);
+    eprintln!("{}", "=".repeat(60));
 }
 
 fn format_num(n: u64) -> String {
