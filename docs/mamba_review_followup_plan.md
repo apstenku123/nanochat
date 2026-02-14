@@ -1,8 +1,8 @@
-# Mamba-3 Follow-up Plan v3
+# Mamba-3 Follow-up Plan v4
 
 Consolidated review of `nanochat/mamba2.py`, `docs/mamba_integration_log.md`,
-and an alternative "dual-scan" proposal. This document captures all findings,
-concrete fixes with code, and implementation status.
+an alternative "dual-scan" proposal, and PyTorch/XLA SPMD documentation.
+All findings, fixes, and implementation status.
 
 ---
 
@@ -51,10 +51,7 @@ of chunk `c` to first token of chunk `c+1`. Affects 1/256 tokens.
 cross-chunk state decay. Comment added to code.
 
 **Note**: With Idea G dual-scan now implemented in `forward()`, this inline
-trapezoidal path in `_ssd_scan_ref` is only used when `forward()` calls
-`_ssd_scan_ref` with `lam` directly (which no longer happens for the main
-trapezoidal training path). The `_ssd_scan_ref` trapezoidal code is retained
-as a reference implementation and for direct testing.
+trapezoidal path in `_ssd_scan_ref` is only used as a reference implementation.
 
 **Verification**: `tests/test_mamba_bugs.py::TestBug23CrossChunkBoundary`
 
@@ -64,9 +61,6 @@ as a reference implementation and for direct testing.
 
 ### Mathematical Proof
 
-The alternative proposal's claim is **correct**. I was wrong about "Bug A"
-(double-decay). Here's the proof:
-
 The standard scan computes: `h_t = exp(dt_t*A) * h_{t-1} + dt_t * B_t * x_t`
 
 The decay `exp(dt_t*A)` applies ONLY to the past state `h_{t-1}`. The new
@@ -74,77 +68,100 @@ input `dt_t * B_t * x_t` is injected WITHOUT any decay at step t. It only
 experiences its first decay at step t+1.
 
 Therefore, constructing `x_prev_mod = (1-lam) * exp(dt*A) * x_{t-1}` and
-passing it as input at step t results in:
-
-```
-h_prev_t = exp(dt_t*A) * h_prev_{t-1} + dt_t * B_t * [(1-lam_t) * exp(dt_t*A) * x_{t-1}]
-```
-
-This correctly computes the `beta` trapezoidal term without double-decay.
-The `exp(dt_t*A)` in `x_prev_mod` is the decay from `t-1` to `t` (the
-trapezoidal coupling), while the scan's `exp(dt_t*A)` on `h_{t-1}` is the
-state propagation — these are independent and don't interact.
+passing it as input at step t correctly computes the trapezoidal term without
+double-decay. The mathematical proof and computational test confirm the
+decomposition is exact.
 
 **Verified computationally**: `tests/test_idea_g_math.py` proves the
 decomposition is exact to fp64 precision over 32 steps.
 
 ### Implementation
 
-The dual-scan trapezoidal is implemented in `forward()` at lines 267-297:
-
-```python
-if self.mamba3_trapezoidal:
-    # Build shifted previous-step tensors (sequence-level shift)
-    x_prev = F.pad(x_ssm, (0,0, 0,0, 1,0))[:, :-1]
-    B_prev = F.pad(B_ssm, (0,0, 0,0, 1,0))[:, :-1]
-
-    # Inject cached state from prior prefill/decode
-    if inference_params is not None:
-        if "prev_x" in states: x_prev[:, 0] = states["prev_x"].to(x.dtype)
-        if "prev_B" in states: B_prev[:, 0] = states["prev_B"].to(x.dtype)
-
-    # Embed trapezoidal weights into modified inputs
-    x_curr_mod = x_ssm * lam.unsqueeze(-1)
-    dA = torch.exp(dt_soft * A.view(1, 1, self.nheads))
-    x_prev_mod = x_prev * ((1.0 - lam) * dA).unsqueeze(-1)
-
-    # Two parallel standard SSD scans (enables Triton/XLA natively!)
-    y_curr, st_curr = self._run_scan(x_curr_mod, dt_soft, A, B_ssm, C_ssm, D=None)
-    y_prev, st_prev = self._run_scan(x_prev_mod, dt_soft, A, B_prev, C_ssm, D=None)
-
-    y = y_curr + y_prev + x_ssm * self.D.view(1, 1, self.nheads, 1)
-    final_state = st_curr + st_prev  # valid: linear superposition
-```
-
-**Key insight**: Both scans are standard Euler SSD scans — no modified kernels
-needed. This means Triton `mamba_chunk_scan_combined` and XLA `xla_scan` can
-compute trapezoidal math natively, eliminating the previous restriction that
-gated Triton off for trapezoidal mode.
-
-### What remains of the old trapezoidal code
-
-The inline trapezoidal in `_ssd_scan_ref` (dt_eff / beta_next / diagonal
-correction) is retained but no longer called by `forward()` for the main
-training path. It serves as:
-1. Reference implementation for numerical parity testing
-2. Backward compatibility for any code calling `_ssd_scan_ref` directly
+The dual-scan trapezoidal is implemented in `forward()`. Two parallel standard
+SSD scans compute trapezoidal math, enabling Triton and XLA backends natively
+for Phase 3 training without custom kernels.
 
 ---
 
 ## Structural Improvements — IMPLEMENTED
 
-### `_run_scan` Abstraction (lines 159-195)
+### `_run_scan` Abstraction
 
-Centralizes backend dispatch: XLA > Triton > ref. Handles:
-- fp32 state conversion
-- Triton final-state transpose (`Bug #12`)
-- XLA availability warning
-- `D=None` support for dual-scan
+Centralizes backend dispatch: XLA > Triton > ref. Handles fp32 state
+conversion, Triton final-state transpose (Bug #12), XLA availability
+warning, and `D=None` support for dual-scan.
 
 ### `D=None` Support
 
 Added to both `_ssd_scan_ref` and `_ssd_scan_xla`. Required for Idea G
 dual-scan where D skip-connection is applied outside the scans.
+
+### XLA Scan Config Wiring
+
+`mamba_xla_scan` config flag wired through `GPTConfig`, `checkpoint_manager.py`
+compat defaults, and `scripts/base_train.py` CLI (`--mamba_xla_scan`).
+
+### CLI Surfacing
+
+`--rope_theta`, `--window_long`, `--window_short`, `--mamba_xla_scan` all
+exposed in `scripts/base_train.py` and wired into model config.
+
+---
+
+## SPMD and Distributed Features — IMPLEMENTED
+
+### Existing SPMD Infrastructure (already in codebase)
+
+The project has extensive SPMD support:
+- 1D/2D device mesh via `torch_xla.distributed.spmd.Mesh`
+- Megatron-style tensor parallelism for attention Q/K/V/proj and MLP
+- SPMD partition specs for Pallas flash attention
+- Data-parallel input sharding via `xs.mark_sharding`
+- `torch_xla.compile()` context for whole-graph XLA compilation
+- `scan_layers` for single-block XLA compilation of transformer stack
+- `torch.compile` deliberately avoided on TPU (causes OOM)
+
+### What was added
+
+**1. Mamba SPMD Sharding** (`scripts/base_train.py` `_apply_tensor_parallel_sharding`)
+
+Mamba `in_proj` and `out_proj` were not covered by existing sharding annotations.
+Added:
+- `attn.in_proj.weight` -> `('model', None)` column-parallel
+- `attn.out_proj.weight` -> `(None, 'model')` row-parallel
+
+This matches the Megatron-style sharding used for attention layers. The conv1d
+is left replicated (depthwise conv with `groups=conv_dim` doesn't benefit from
+tensor parallelism — each channel is independent).
+
+**2. scan_layers Hybrid Guard** (`scripts/base_train.py`)
+
+`scan_layers` assumes all layers in the `nn.ModuleList` are identical. With
+hybrid AAM pattern (alternating Attention and Mamba), layers are heterogeneous.
+Added a guard that detects `is_mamba` heterogeneity across blocks and falls
+back with a warning instead of silently producing wrong results.
+
+**3. Distributed Checkpointing** (`nanochat/checkpoint_manager.py`)
+
+Added `save_checkpoint_distributed()` and `load_checkpoint_distributed()` using
+`torch.distributed.checkpoint` with `SPMDSavePlanner`/`SPMDLoadPlanner` from
+torch_xla. Benefits:
+- Save sharded model weights directly (no gather to rank 0)
+- Load sharded weights directly (no broadcast)
+- Resharding support when changing TP degree
+
+Gated behind availability check — falls back to standard `torch.save`/`torch.load`
+if `torch.distributed.checkpoint` or XLA planners are unavailable. Fully
+backward-compatible with existing checkpoint format.
+
+### What was NOT added (and why)
+
+| Feature | Reason |
+| --- | --- |
+| `torch.compile(backend='openxla')` | Deliberately avoided in project — causes OOM during compilation on TPU. Project uses `torch_xla.compile()` context instead. |
+| `XLAShardedTensor` explicit usage | SPMD sharding via `mark_sharding` is simpler and equivalent for this use case. |
+| `HybridMesh` | Only needed for multi-pod TPU training (ICI + DCN). Single-pod v6e-4 uses standard `Mesh`. |
+| Auto-sharding (`XLA_AUTO_SPMD_MESH`) | Manual sharding annotations give more control and are already comprehensive. |
 
 ---
 
@@ -152,73 +169,80 @@ dual-scan where D skip-connection is applied outside the scans.
 
 ### Adopted
 
-| Feature                     | Description                                       | Status      |
-| --------------------------- | ------------------------------------------------- | ----------- |
-| `_run_scan` abstraction     | Centralize backend dispatch                       | IMPLEMENTED |
-| `D=None` support            | Allow D outside scan for dual-scan                | IMPLEMENTED |
-| Global sequence shift       | `F.pad(x, (0,0, 0,0, 1,0))[:, :-1]`               | IMPLEMENTED |
+| Feature | Description | Status |
+| --- | --- | --- |
+| `_run_scan` abstraction | Centralize backend dispatch | IMPLEMENTED |
+| `D=None` support | Allow D outside scan for dual-scan | IMPLEMENTED |
+| Global sequence shift | `F.pad(x, (0,0, 0,0, 1,0))[:, :-1]` | IMPLEMENTED |
 | `prev_x`/`prev_B` injection | Set `x_prev[:, 0]` from cache at prefill boundary | IMPLEMENTED |
-| Idea G dual-scan            | Two standard scans compute trapezoidal            | IMPLEMENTED |
-| `ngroups` assertion         | Assert nheads % ngroups == 0                      | IMPLEMENTED |
-| `heads_per_group` attribute | Store instead of recomputing                      | IMPLEMENTED |
-| `conv_dim` attribute        | Store instead of recomputing                      | ALREADY HAD |
-| fp32 output contraction     | `C.float() * state` before downcast               | ALREADY HAD |
+| Idea G dual-scan | Two standard scans compute trapezoidal | IMPLEMENTED |
+| `ngroups` assertion | Assert nheads % ngroups == 0 | IMPLEMENTED |
+| `heads_per_group` attribute | Store instead of recomputing | IMPLEMENTED |
+| fp32 output contraction | `C.float() * state` before downcast | ALREADY HAD |
 
 ### Rejected
 
-| Feature                           | Reason                                                 |
-| --------------------------------- | ------------------------------------------------------ |
-| Python loop in `_ssd_scan_ref`    | Regression from parallel matmul; unrolls into XLA HLO  |
-| bf16 `prev_B`/`prev_x` storage    | Precision loss over decode sequences                   |
-| `ssm_state.to(x.dtype)` in output | Loses fp32 precision in C*state contraction            |
-| `getattr(self, "D", None)`        | D is always created in `__init__`; dead defensive code |
+| Feature | Reason |
+| --- | --- |
+| Python loop in `_ssd_scan_ref` | Regression from parallel matmul; unrolls into XLA HLO |
+| bf16 `prev_B`/`prev_x` storage | Precision loss over decode sequences |
+| `ssm_state.to(x.dtype)` in output | Loses fp32 precision in C*state contraction |
+| `getattr(self, "D", None)` | D is always created in `__init__`; dead defensive code |
 
-### My earlier objection retracted
+### Earlier objection retracted
 
 I claimed the dual-scan `x_prev_mod * dA` embedding caused double-decay.
 This was wrong. The scan's decay applies to `h_{t-1}`, not to the new input
-at step `t`. The mathematical proof and computational test confirm the
-decomposition is exact.
+at step `t`. Verified computationally to fp64 precision.
 
 ---
 
-## Remaining Roadmap
+## Test Results
 
-### Phase 2: Integration polish
+### Local (CPU)
 
-| Step | Task                                                             | File                                               | Status |
-| ---- | ---------------------------------------------------------------- | -------------------------------------------------- | ------ |
-| 1    | Wire XLA scan via config flag                                    | `gpt.py`, `base_train.py`, `checkpoint_manager.py` | TODO   |
-| 2    | Add backend parity tests (ref vs Triton)                         | `tests/test_mamba_parity.py`                       | TODO   |
-| 3    | Add prefill/decode drift smoke test                              | `tests/test_mamba_parity.py`                       | TODO   |
-| 4    | Surface `--rope_theta`, `--window_long`, `--window_short` in CLI | `scripts/base_train.py`                            | TODO   |
+| Test Suite | Passed | Skipped | Failed |
+| --- | --- | --- | --- |
+| `tests/test_mamba_bugs.py` | 8 | 0 | 0 |
+| `tests/test_mamba_integration.py` | 41 | 0 | 0 |
+| `tests/test_idea_g_math.py` | 3 | 0 | 0 |
+| `tests/test_mamba_parity.py` | 4 | 3 (CUDA) | 0 |
+| **Total** | **56** | **3** | **0** |
 
-### Phase 3: Performance validation
+### TPU v6e-4 (us-east5-a)
 
-| Step | Task                                    | File                              | Status |
-| ---- | --------------------------------------- | --------------------------------- | ------ |
-| 5    | Add benchmark harness (tok/s, peak mem) | `scripts/bench_mamba_backends.py` | TODO   |
-| 6    | Run small all-inclusive training        | (training script)                 | TODO   |
-| 7    | TPU v6e validation                      | (remote)                          | TODO   |
-
----
-
-## Definition of Done
-
-| Test Suite                        | Count        | Status       |
-| --------------------------------- | ------------ | ------------ |
-| `tests/test_mamba_bugs.py`        | 8 tests      | ALL PASS     |
-| `tests/test_mamba_integration.py` | 41 tests     | ALL PASS     |
-| `tests/test_idea_g_math.py`       | 3 tests      | ALL PASS     |
-| **Total**                         | **52 tests** | **ALL PASS** |
+| Test Suite | Passed | Skipped | Failed |
+| --- | --- | --- | --- |
+| `tests/test_mamba_bugs.py` | 8 | 0 | 0 |
+| `tests/test_mamba_integration.py` | 41 | 0 | 0 |
+| `tests/test_idea_g_math.py` | 3 | 0 | 0 |
+| `tests/test_mamba_parity.py` | 4 | 3 (CUDA) | 0 |
+| **Total** | **56** | **3** | **0** |
 
 ---
 
-## Files Modified in This Session
+## All Files Modified Across Sessions
 
-| File                                 | Changes|            ------------------------------------------------------------------------------------------------------------------------------- |
-| `nanochat/mamba2.py`                 | Bug #21 fix (RoPE split), Bug #22 fix (prev_x fp32), Bug #23 comment, `_run_scan` 
-|                                      | abstraction, D=None support, Idea G dual-scan  
-| `tests/test_mamba_bugs.py`           | NEW: 8 bug reproduction tests
-| `tests/test_idea_g_math.py`          | NEW: 3 mathematical verification tests 
-| `docs/mamba_review_followup_plan.md` | This document (v3) 
+| File | Changes |
+| --- | --- |
+| `nanochat/mamba2.py` | Bug #21/#22/#23 fixes, `_run_scan`, D=None, Idea G dual-scan |
+| `nanochat/gpt.py` | `mamba_xla_scan` config field |
+| `nanochat/checkpoint_manager.py` | `mamba_xla_scan` compat default, distributed checkpoint functions |
+| `scripts/base_train.py` | 4 CLI args, Mamba SPMD sharding, scan_layers hybrid guard |
+| `tests/test_mamba_bugs.py` | NEW: 8 bug reproduction tests |
+| `tests/test_mamba_parity.py` | NEW: 7 parity + streaming stability tests |
+| `tests/test_idea_g_math.py` | NEW: 3 mathematical verification tests |
+| `scripts/bench_mamba_backends.py` | NEW: throughput/memory benchmark harness |
+| `docs/mamba_review_followup_plan.md` | This document (v4) |
+
+---
+
+## Remaining Work
+
+| Task | Priority | Notes |
+| --- | --- | --- |
+| Run small all-inclusive training (mamba3 + mhc + mtp + dsa + engram) | High | Verify convergence with all features enabled |
+| CUDA Triton parity validation | Medium | Requires CUDA GPU to run skipped tests |
+| Benchmark on CUDA GPU | Medium | `scripts/bench_mamba_backends.py` ready |
+| Integrate distributed checkpoint into training loop | Low | Functions exist; need wiring in `base_train.py` |
+| scan_layers for Mamba-only models | Low | Works when all layers are Mamba; guard skips hybrid |
