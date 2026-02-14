@@ -52,11 +52,15 @@ pip install pyarrow tokenizers wandb tqdm datasets transformers \
     psutil tabulate scipy regex tiktoken rustbpe
 
 echo "=== Installing JAX for XLA Flash Attention (Pallas TPU kernels) ==="
-pip install 'jax==0.7.0' 'jaxlib==0.7.0' \
+# JAX 0.7.0 through 0.9.0 all work with libtpu 0.0.23.1.
+# Using 0.9.0 for latest Pallas kernel improvements.
+pip install 'jax==0.9.0' 'jaxlib==0.9.0' \
     -f https://storage.googleapis.com/libtpu-releases/index.html \
     -f https://storage.googleapis.com/libtpu-wheels/index.html
-# Pin libtpu to match torch_xla requirements
-pip install 'libtpu==0.0.21' \
+# Pin libtpu to match torch_xla requirements.
+# Compatible range: 0.0.21–0.0.23.1 (tested Feb 14, 2026).
+# libtpu >= 0.0.24 breaks with PJRT_ExecuteOptions size mismatch.
+pip install 'libtpu==0.0.23.1' \
     -f https://storage.googleapis.com/libtpu-releases/index.html \
     -f https://storage.googleapis.com/libtpu-wheels/index.html
 

@@ -146,3 +146,35 @@
 2026-02-13 18:53:10,790 - ptsearch - INFO - Stopping STDIO transport
 2026-02-13 18:53:10,891 - ptsearch - INFO - Received signal 15, shutting down
 2026-02-13 18:53:10,891 - ptsearch - INFO - Stopping STDIO transport
+2026-02-14 01:37:53,868 - ptsearch - INFO - Starting PyTorch Documentation Search MCP Server {"transport": "stdio", "python_version": "3.13.7 (main, Jan 22 2026, 20:15:57) [GCC 15.2.0]", "current_dir": "/home/dave/source/nanochat"}
+2026-02-14 01:37:53,868 - ptsearch - INFO - Starting PyTorch Documentation Search MCP Server with STDIO transport
+2026-02-14 01:37:53,868 - ptsearch - INFO - Initialized STDIOTransport
+2026-02-14 01:37:53,868 - ptsearch - INFO - Starting STDIO transport
+2026-02-14 01:37:53,868 - ptsearch - INFO - Received MCP message {"method": "initialize", "id": 0}
+2026-02-14 01:37:53,869 - ptsearch - INFO - Received MCP message {"method": "notifications/initialized", "id": null}
+2026-02-14 01:37:53,869 - ptsearch - INFO - Client initialized, ready for requests
+2026-02-14 01:37:53,869 - ptsearch - INFO - Received MCP message {"method": "tools/list", "id": 1}
+2026-02-14 04:21:46,392 - ptsearch - INFO - Received signal 2, shutting down
+2026-02-14 04:21:46,392 - ptsearch - INFO - Stopping STDIO transport
+2026-02-14 04:21:46,522 - ptsearch - INFO - Received signal 15, shutting down
+2026-02-14 04:21:46,522 - ptsearch - INFO - Stopping STDIO transport
+2026-02-14 04:21:57,699 - ptsearch - INFO - Starting PyTorch Documentation Search MCP Server {"transport": "stdio", "python_version": "3.13.7 (main, Jan 22 2026, 20:15:57) [GCC 15.2.0]", "current_dir": "/home/dave/source/nanochat"}
+2026-02-14 04:21:57,699 - ptsearch - INFO - Starting PyTorch Documentation Search MCP Server with STDIO transport
+2026-02-14 04:21:57,699 - ptsearch - INFO - Initialized STDIOTransport
+2026-02-14 04:21:57,699 - ptsearch - INFO - Starting STDIO transport
+2026-02-14 04:21:57,699 - ptsearch - INFO - Received MCP message {"method": "initialize", "id": 0}
+2026-02-14 04:21:57,844 - ptsearch - INFO - Received MCP message {"method": "notifications/initialized", "id": null}
+2026-02-14 04:21:57,844 - ptsearch - INFO - Client initialized, ready for requests
+2026-02-14 04:21:57,844 - ptsearch - INFO - Received MCP message {"method": "tools/list", "id": 1}
+2026-02-14 04:22:11,237 - ptsearch - INFO - Received signal 2, shutting down
+2026-02-14 04:22:11,238 - ptsearch - INFO - Stopping STDIO transport
+2026-02-14 04:22:11,371 - ptsearch - INFO - Received signal 15, shutting down
+2026-02-14 04:22:11,371 - ptsearch - INFO - Stopping STDIO transport
+2026-02-14 04:22:35,257 - ptsearch - INFO - Starting PyTorch Documentation Search MCP Server {"transport": "stdio", "python_version": "3.13.7 (main, Jan 22 2026, 20:15:57) [GCC 15.2.0]", "current_dir": "/home/dave/source/nanochat"}
+2026-02-14 04:22:35,257 - ptsearch - INFO - Starting PyTorch Documentation Search MCP Server with STDIO transport
+2026-02-14 04:22:35,257 - ptsearch - INFO - Initialized STDIOTransport
+2026-02-14 04:22:35,257 - ptsearch - INFO - Starting STDIO transport
+2026-02-14 04:22:35,258 - ptsearch - INFO - Received MCP message {"method": "initialize", "id": 0}
+2026-02-14 04:22:35,258 - ptsearch - INFO - Received MCP message {"method": "notifications/initialized", "id": null}
+2026-02-14 04:22:35,258 - ptsearch - INFO - Client initialized, ready for requests
+2026-02-14 04:22:35,258 - ptsearch - INFO - Received MCP message {"method": "tools/list", "id": 1}

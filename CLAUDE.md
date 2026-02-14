@@ -133,61 +133,150 @@ Contains:
 
 For full TPU setup guide, see [docs/TPU_SETUP.md](docs/TPU_SETUP.md).
 
-### Quick Start: v6e with 16K Flash Attention
+### Architecture: How PyTorch Uses TPU Hardware
 
-The v6e TPU supports 16K context training using XLA Pallas flash attention. This requires a **Python 3.11 venv** with specific JAX versions.
+Our TPU stack has three layers:
 
-**Critical package versions:**
-
-| Package   | Version   | Why                                            |
-| --------- | --------- | ---------------------------------------------- |
-| Python    | 3.11      | jaxlib 0.7.x needs >= 3.11                     |
-| jax       | **0.7.0** | Pallas flash attention kernels                 |
-| jaxlib    | **0.7.0** | Must match jax version                         |
-| libtpu    | 0.0.21    | PJRT API 0.75, compatible with torch_xla 2.9.0 |
-| torch_xla | 2.9.0     | Latest stable release                          |
-
-> **Do NOT use jax 0.7.1** — it generates Mosaic IR v8, but libtpu 0.0.21 only supports v7.
-
-**Setup venv:**
-```bash
-python3.11 -m venv ~/venv311
-source ~/venv311/bin/activate
-pip install torch~=2.9.0 torch_xla[tpu]~=2.9.0 \
-  -f https://storage.googleapis.com/libtpu-releases/index.html \
-  -f https://storage.googleapis.com/libtpu-wheels/index.html
-pip install jax==0.7.0 jaxlib==0.7.0
-pip install libtpu==0.0.21
-pip install wandb filelock pyarrow psutil regex tabulate tiktoken tokenizers rustbpe
+```
+nanochat (pure PyTorch)
+    ↓
+torch_xla 2.9.0 (translates PyTorch ops → XLA HLO graphs via PJRT runtime)
+    ↓
+libtpu 0.0.21–0.0.23.1 (user-space TPU driver, shared library libtpu.so)
+    ↓
+TPU hardware (v6e Trillium / v5e)
 ```
 
-**Launch 16K training:**
+**We do NOT import JAX directly anywhere in our code.** JAX is installed solely
+because `torch_xla.experimental.custom_kernel.flash_attention` internally uses JAX's
+Pallas kernel language to implement flash attention on TPU. This is an implementation
+detail of torch_xla, not something we interact with.
+
+**We do NOT use:** torchax, jax_import_guard, Pallas directly, or any JAX APIs.
+
+### Package Version Matrix (verified Feb 14, 2026)
+
+All v6e TPUs run a single Python 3.11 venv with these pinned versions:
+
+| Package    | Version         | Why this exact version                                        |
+| ---------- | --------------- | ------------------------------------------------------------- |
+| Python     | **3.11**        | jaxlib 0.7.x+ requires >= 3.11; 3.12 tested but no benefit yet |
+| torch      | **2.9.1**       | Stable release; torch_xla 2.9.0 is compatible                |
+| torch_xla  | **2.9.0**       | Latest stable XLA backend (Nov 2025); 2.10 does NOT exist yet |
+| libtpu     | **0.0.23.1**    | Max compatible with torch_xla 2.9.0 (range: 0.0.21–0.0.23.1) |
+| jax        | **0.9.0**       | Required by torch_xla's Pallas flash attention kernel         |
+| jaxlib     | **0.9.0**       | Must match jax version exactly                                |
+
+> **Version pinning is critical.** Do NOT upgrade any of these independently:
+> - `libtpu >= 0.0.24` breaks with PJRT_ExecuteOptions size mismatch (expects 112, torch_xla provides 80)
+> - `jax` 0.7.0 through 0.9.0 all work with libtpu 0.0.23.1 (tested Feb 14, 2026)
+> - `torch_xla 2.10.0` does not exist yet (PyTorch 2.10 released Jan 2026, but no XLA match)
+> - Nightly torch_xla wheels stopped publishing Oct 2025 and matching PyTorch nightlies are purged
+
+### libtpu Compatibility Testing (Feb 14, 2026)
+
+Binary search results for libtpu + torch_xla 2.9.0 + flash attention:
+
+| libtpu     | PJRT API | Flash Attention | Status              |
+| ---------- | -------- | --------------- | ------------------- |
+| 0.0.21     | OK       | PASSED          | Default (pinned)    |
+| 0.0.21.1   | OK       | PASSED          | Compatible          |
+| 0.0.22     | OK       | PASSED          | Compatible          |
+| 0.0.23     | OK       | PASSED          | Compatible          |
+| **0.0.23.1** | **OK** | **PASSED**      | **Max compatible**  |
+| 0.0.24     | v0.78    | FAILED          | PJRT API mismatch   |
+| 0.0.27     | v0.80    | FAILED          | PJRT API mismatch   |
+| 0.0.29+    | v0.81+   | FAILED          | PJRT API mismatch   |
+| 0.0.35     | v0.90    | FAILED          | PJRT API mismatch   |
+
+The PJRT_ExecuteOptions struct size changed from 80→112 bytes between libtpu 0.0.23.1 and 0.0.24.
+Note: basic TPU init (`xm.xla_device()`) passes with all versions due to XLA's lazy execution,
+but actual computation (`xm.mark_step()`) fails on 0.0.24+.
+
+### Setup: v6e TPU from Scratch
+
 ```bash
-source ~/venv311/bin/activate && source ~/.tpu_env
+# 1. Install Python 3.11 venv support
+sudo apt-get update -qq && sudo apt-get install -y python3.11-venv python3.11-dev
+
+# 2. Create venv
+python3.11 -m venv ~/venv && source ~/venv/bin/activate && pip install --upgrade pip
+
+# 3. Install PyTorch + XLA (auto-resolves compatible libtpu)
+pip install 'torch~=2.9.0' 'torch_xla[tpu]~=2.9.0' \
+  -f https://storage.googleapis.com/libtpu-releases/index.html \
+  -f https://storage.googleapis.com/libtpu-wheels/index.html
+
+# 4. Install JAX 0.9.0 (needed by torch_xla's flash attention kernel)
+pip install 'jax==0.9.0' 'jaxlib==0.9.0' \
+  -f https://storage.googleapis.com/libtpu-releases/index.html \
+  -f https://storage.googleapis.com/libtpu-wheels/index.html
+
+# 5. Re-pin libtpu (jax install may pull a newer incompatible version)
+pip install 'libtpu==0.0.23.1' \
+  -f https://storage.googleapis.com/libtpu-releases/index.html \
+  -f https://storage.googleapis.com/libtpu-wheels/index.html
+
+# 6. Install training dependencies
+pip install pyarrow tokenizers wandb tqdm datasets transformers \
+  psutil tabulate scipy regex tiktoken rustbpe
+```
+
+Automated setup: `bash scripts/tpu/setup_v6e.sh` (runs all steps above).
+
+### Launch Training
+
+```bash
+source ~/venv/bin/activate && source ~/.tpu_env
 cd ~/nanochat
 export NANOCHAT_BASE_DIR=/home/dave/data
-export WANDB_API_KEY=<key>
 export XLA_NO_SPECIAL_SCALARS=1
-export NANOCHAT_GCS_CHECKPOINT_BUCKET=gs://nanochat-training-data-2026/checkpoints/v6e-longctx
+export NANOCHAT_GCS_CHECKPOINT_BUCKET=gs://nanochat-training-data-2026/checkpoints/<experiment>
 
 nohup python3 -u -m scripts.base_train \
     --depth=16 --num_iterations=50000 \
-    --device_batch_size=1 --max_seq_len=16384 \
+    --device_batch_size=2 --max_seq_len=16384 \
     --kernel=current --no_compile --xla_flash_attn \
     --data_dir=/home/dave/data/parquet --streaming_data \
-    --run=d16_400M_v6e4_longctx_16k_flash_cppeval \
-    --core_metric_every=5000 --save_every=5000 --sample_every=5000 \
-    > ~/train_longctx_16k.log 2>&1 &
+    --run=dummy \
+    --core_metric_every=2500 --save_every=2500 --sample_every=2500 \
+    > ~/train.log 2>&1 &
 ```
 
-**Performance:** 470-630K tok/sec, 35-62% MFU on v6e-4 (4 chips, 32GB HBM each).
+### Current Experiments (v6e-4, 16K context, d16/270M params)
+
+| Experiment   | Features                  | device_bs | Loss (latest) | MFU     |
+| ------------ | ------------------------- | --------- | ------------- | ------- |
+| longctx      | baseline                  | 2         | ~0.96         | ~66%    |
+| engram       | --engram --engram_layers  | 2         | ~1.05         | ~47%    |
+| mhc          | --mhc                     | 1         | ~1.02         | ~35%    |
+| mhc+engram   | --mhc --engram            | 2         | **~0.91**     | ~49%    |
+
+v6e-8 full pipeline (64K context): `--mhc --engram --mtp --dsa --fim_rate=0.5 --gradient_checkpointing`
 
 ### Flash Attention Integration
 
 The `--xla_flash_attn` flag calls `enable_xla_flash_attention()` in `nanochat/flash_attention.py`, which:
 1. Imports `flash_attention` from `torch_xla.experimental.custom_kernel`
-2. Uses it in `flash_attn_func()` for training (B, T, H, D) -> transpose to (B, H, T, D)
-3. Does NOT support sliding window attention — use `--window_pattern=L` for long-context models
+2. Internally, torch_xla uses JAX Pallas to compile a TPU flash attention kernel
+3. We call it as a pure PyTorch function — no JAX code in our codebase
+4. Does NOT support sliding window attention — use `--window_pattern=L`
+
+### Babysitter for Spot TPU Recovery
+
+Spot TPUs get preempted without warning. The babysitter script auto-recovers:
+
+```bash
+# Run on build3 (external machine), not on the TPU itself
+ssh build3
+tmux new-session -s babysit
+# Start one per spot TPU:
+bash scripts/tpu/babysit_tpu.sh v6e-engram
+bash scripts/tpu/babysit_tpu.sh v6e-longctx
+bash scripts/tpu/babysit_tpu.sh v6e-mhc
+```
+
+Recovery cycle: detect PREEMPTED → delete TPU → recreate → deploy code → setup env → download data → resume from GCS checkpoint.
 
 ### TPU Training Gotchas
 
@@ -197,6 +286,10 @@ The `--xla_flash_attn` flag calls `enable_xla_flash_attention()` in `nanochat/fl
 - **Checkpoint save order**: Save BEFORE eval/sample to prevent data loss on eval crash
 - **First XLA compilation** takes 30-60+ minutes — this is normal
 - **Spot instances** can be preempted — always use `NANOCHAT_GCS_CHECKPOINT_BUCKET` for cloud checkpoints
+- **gsutil fails on composite objects** without crcmod — use `gcloud storage cp` instead
+- **Avoid data-dependent Python branches** in model code — forces XLA host-device sync (37x slowdown)
+- **Checkpoint resume on XLA**: load to CPU first, use `assign=False` in load_state_dict
+- **mhc at bs=2 OOMs** on v6e-4 (31.25G HBM limit) — use bs=1 for mhc-only experiments
 
 ## C++ Data Pipeline (Rust cpp-chunker)
 
