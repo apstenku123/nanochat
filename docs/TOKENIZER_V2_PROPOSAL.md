@@ -555,88 +555,192 @@ SQLGetDiagRec, SQLGetDiagField
 
 ## Query Language & ORM Tokens (IDs 6300-6599)
 
-### C++ OQL (cpplinq/boolinq) (~40 tokens)
-```
-# cpplinq
-from, where, select, orderby, orderby_descending
-thenby, thenby_descending, take, skip, take_while, skip_while
-concat, contains, count, distinct, element_at
-first, first_or_default, last, last_or_default
-max, min, sum, avg, aggregate
-any, all, empty, range, repeat, generate
-to_vector, to_list, to_map, for_each, ref, experimental_container
+Comprehensive catalog derived from research across ODMG OQL, db4o, ObjectStore, Realm, LINQ-like C++ libraries, Protocol Buffers, gRPC, GraphQL, MongoDB, Redis, SOCI, ODB, and sqlpp11. Full research output: ~1,600+ unique tokens; 300 highest-frequency tokens selected for fixed vocab.
 
-# boolinq
-where, take, skip, select, groupBy, distinct
-orderBy, reverse, count, sum, avg, min, max
-any, all, contains, first, last, toVector, toSet, toDeque
+### Protocol Buffers + gRPC (~60 tokens)
 ```
+# Proto file keywords (embedded in C++ as string literals & .proto files)
+syntax, package, import, option, message, enum, service, rpc, returns
+repeated, optional, required, oneof, map, reserved, extensions, extend, stream
 
-### Protocol Buffers C++ API (~30 tokens)
-```
-# Core types
+# Core protobuf classes
 google::protobuf::Message, google::protobuf::MessageLite
 google::protobuf::Arena, google::protobuf::Descriptor
 google::protobuf::FieldDescriptor, google::protobuf::Reflection
+google::protobuf::RepeatedField, google::protobuf::RepeatedPtrField
+
+# Protobuf I/O
 google::protobuf::io::CodedInputStream, google::protobuf::io::CodedOutputStream
 
-# Common methods
+# Common Message methods
 SerializeToString, ParseFromString, SerializeToArray, ParseFromArray
 ByteSizeLong, IsInitialized, CopyFrom, MergeFrom, Clear
-GetDescriptor, GetReflection, New, GetArena
+GetDescriptor, GetReflection, New, GetArena, SpaceUsedLong, DebugString
 
-# Macros
-GOOGLE_PROTOBUF_VERIFY_VERSION
+# gRPC core classes
+grpc::Server, grpc::ServerBuilder, grpc::ServerContext
+grpc::Channel, grpc::ClientContext, grpc::CompletionQueue
+grpc::Status, grpc::Service, grpc::CallCredentials, grpc::ChannelCredentials
+
+# gRPC status codes
+OK, CANCELLED, UNKNOWN, INVALID_ARGUMENT, DEADLINE_EXCEEDED, NOT_FOUND
+ALREADY_EXISTS, PERMISSION_DENIED, UNAUTHENTICATED, RESOURCE_EXHAUSTED
+FAILED_PRECONDITION, ABORTED, OUT_OF_RANGE, UNIMPLEMENTED, INTERNAL
+UNAVAILABLE, DATA_LOSS
+
+# gRPC credential functions
+CreateChannel, InsecureChannelCredentials, SslCredentials
 ```
 
-### GraphQL C++ (~20 tokens)
+### C++ LINQ-like Libraries (~35 tokens)
 ```
-# Core keywords
-query, mutation, subscription, fragment
+# cpplinq (operator>> chain)
+from, from_array, from_range, from_copy
+where, select, select_many, orderby, orderby_descending
+thenby, thenby_descending, take, skip, take_while, skip_while
+distinct, concat, join, zip_with, reverse, pairwise
+count, sum, avg, min, max, aggregate
+first, first_or_default, last, last_or_default
+any, all, for_each, element_at
+to_vector, to_list, to_map
+
+# boolinq additions (beyond shared with cpplinq)
+groupBy, selectMany, toStdSet, toStdDeque
+leftJoin, rightJoin, crossJoin
+bytes, unbytes, bits, unbits
+```
+
+### GraphQL C++ (~25 tokens)
+```
+# GraphQL language keywords
+query, mutation, subscription, fragment, on
 type, input, enum, interface, union, scalar, schema, directive
-extend, implements, on, repeatable
+extend, implements, repeatable
 __typename, __schema, __type
 
-# Libraries
-cppgraphqlgen, libgraphqlparser
+# Built-in scalars & directives
+Int, Float, String, Boolean, ID
+@skip, @include, @deprecated, @specifiedBy
+
+# libgraphqlparser key AST types (42 classes total)
+Document, OperationDefinition, VariableDefinition, SelectionSet
+Field, Argument, FragmentSpread, InlineFragment, FragmentDefinition
+NamedType, ListType, NonNullType, SchemaDefinition, DirectiveDefinition
 ```
 
-### MongoDB C++ Driver (~25 tokens)
+### MongoDB C++ Driver (~40 tokens)
 ```
-# Aggregation stages
+# mongocxx core classes
+mongocxx::client, mongocxx::database, mongocxx::collection
+mongocxx::cursor, mongocxx::pipeline, mongocxx::pool, mongocxx::instance
+
+# mongocxx::collection methods
+find, find_one, insert_one, insert_many, update_one, update_many
+delete_one, delete_many, aggregate, count_documents, distinct
+find_one_and_update, find_one_and_delete, find_one_and_replace
+
+# bsoncxx builder
+bsoncxx::builder::basic::document, bsoncxx::builder::basic::array
+bsoncxx::document::view, bsoncxx::document::value
+
+# Aggregation stages (top 15)
 $match, $group, $project, $sort, $limit, $skip, $unwind
-$lookup, $graphLookup, $merge, $out, $sample
-$set, $unset, $count, $redact, $densify, $fill
-$addFields, $replaceRoot, $facet, $bucket, $bucketAuto
+$lookup, $graphLookup, $merge, $out, $addFields, $facet, $set, $unset
 
-# Core types
-bsoncxx::document, mongocxx::client, mongocxx::collection
-mongocxx::pipeline, mongocxx::cursor
+# Query operators
+$eq, $ne, $gt, $gte, $lt, $lte, $in, $nin
+$and, $or, $not, $nor, $exists, $type, $regex, $elemMatch
+
+# Update operators
+$set, $unset, $inc, $mul, $push, $pull, $addToSet, $pop
+$rename, $min, $max, $currentDate, $setOnInsert
 ```
 
-### Redis C++ Client (~25 tokens)
+### Redis C++ Client (~40 tokens)
 ```
 # String commands
 GET, SET, MGET, MSET, INCR, DECR, APPEND, STRLEN
-SETEX, SETNX, PSETEX, GETSET, GETDEL, GETEX
+SETEX, SETNX, PSETEX, GETSET, GETDEL, GETEX, INCRBY, INCRBYFLOAT
 
-# Collection commands
-LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX
-SADD, SREM, SMEMBERS, SCARD, SISMEMBER, SINTER, SUNION
-ZADD, ZREM, ZRANGE, ZRANK, ZSCORE, ZCARD, ZINCRBY
-HGET, HSET, HMGET, HMSET, HDEL, HGETALL, HKEYS, HVALS
+# Hash commands
+HGET, HSET, HMGET, HMSET, HDEL, HGETALL, HKEYS, HVALS, HEXISTS, HINCRBY
 
-# Pub/Sub
+# List commands
+LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX, LINSERT, BLPOP, BRPOP
+
+# Set commands
+SADD, SREM, SMEMBERS, SCARD, SISMEMBER, SINTER, SUNION, SDIFF, SPOP
+
+# Sorted set commands
+ZADD, ZREM, ZRANGE, ZRANK, ZSCORE, ZCARD, ZINCRBY, ZRANGEBYSCORE, ZCOUNT
+
+# Pub/Sub & Streams
 SUBSCRIBE, UNSUBSCRIBE, PUBLISH, PSUBSCRIBE
+XADD, XREAD, XREADGROUP, XACK, XLEN, XRANGE, XGROUP
 
-# Streams
-XADD, XREAD, XREADGROUP, XACK, XLEN, XRANGE, XREVRANGE, XGROUP
-
-# Transaction
+# Transaction & Key
 MULTI, EXEC, DISCARD, WATCH, UNWATCH
+DEL, EXISTS, EXPIRE, TTL, KEYS, SCAN, TYPE, RENAME
+
+# RedisJSON & RediSearch (modules)
+JSON.SET, JSON.GET, JSON.DEL, JSON.MGET
+FT.CREATE, FT.SEARCH, FT.AGGREGATE, FT.INFO
 
 # Libraries
 hiredis, redis-plus-plus
+```
+
+### C++ Database ORMs & SQL Libraries (~40 tokens)
+```
+# sqlpp11 (type-safe SQL for C++)
+select, from, where, group_by, having, order_by, limit, offset
+join, inner_join, left_outer_join, cross_join, on, using_
+insert_into, update, remove_from, set, columns, values
+in, not_in, is_null, is_not_null, like, between, exists
+dynamic_select, dynamic_where, dynamic_join, unconditionally
+
+# SOCI (SQL for C++)
+session, statement, transaction, rowset, row
+use, into, indicator, procedure, once, prepare, execute, fetch, got_data
+
+# ODB (C++ ORM)
+database, transaction, query, result, view, session, schema_catalog
+persist, load, update, erase, reload, find, begin, commit, rollback
+```
+
+### Common Query Pattern Identifiers (~20 tokens)
+```
+# Cross-library high-frequency query patterns
+query, filter, predicate, criteria, expression, condition
+cursor, iterator, result, resultset, batch, bulk
+connection, pool, schema, index, constraint, binding
+ascending, descending, pagination, limit, offset
+```
+
+### OQL Databases (ODMG/Realm) (~20 tokens)
+```
+# ODMG OQL operators
+select, from, where, order by, group by, having, distinct
+flatten, element, exists, for all, like, in, between
+is_defined, is_undefined, count, sum, avg, min, max, abs
+struct, list, set, bag, array, first, last
+
+# Realm C++ SDK
+realm::db, realm::results, realm::object, realm::query
+sort_descriptor, ascending, descending
+contains, begins_with, ends_with, like
+```
+
+### Expanded ODBC API (~20 tokens)
+```
+# Additional ODBC functions beyond SQL section
+SQLAllocEnv, SQLAllocConnect, SQLAllocStmt
+SQLDriverConnect, SQLBrowseConnect
+SQLFetchScroll, SQLSetConnectAttr, SQLGetConnectAttr
+SQLSetStmtAttr, SQLGetStmtAttr, SQLSetEnvAttr, SQLGetEnvAttr
+SQLColumns, SQLTables, SQLStatistics, SQLPrimaryKeys, SQLForeignKeys
+SQLGetTypeInfo, SQLBulkOperations, SQLSetPos
+SQLDescribeParam, SQLNumParams, SQLCompleteAsync
 ```
 
 ---
@@ -1026,3 +1130,21 @@ If budget is constrained, add in this order:
 - [CUDA Toolkit Documentation](https://docs.nvidia.com/cuda/)
 - [ROCm/HIP Documentation](https://rocm.docs.amd.com/projects/HIP/)
 - [XLA/MHLO Dialect](https://github.com/openxla/stablehlo)
+
+### Query Languages & Database APIs
+- [Protocol Buffers C++ API](https://protobuf.dev/reference/cpp/api-docs/) -- Google protobuf C++ reference
+- [gRPC C++ Reference](https://grpc.github.io/grpc/cpp/namespacegrpc.html) -- gRPC C++ namespace (105 classes)
+- [libgraphqlparser](https://github.com/graphql/libgraphqlparser) -- Facebook's C++ GraphQL parser (42 AST types)
+- [cppgraphqlgen](https://github.com/microsoft/cppgraphqlgen) -- Microsoft's C++ GraphQL service generator
+- [MongoDB C++ Driver](https://www.mongodb.com/docs/languages/cpp/cpp-driver/current/) -- mongocxx/bsoncxx classes
+- [Redis Commands Reference](https://redis.io/docs/latest/commands/) -- Complete Redis command set
+- [redis-plus-plus](https://github.com/sewenew/redis-plus-plus) -- Modern C++ Redis client
+- [hiredis](https://github.com/redis/hiredis) -- Minimalistic C Redis client
+- [sqlpp11](https://github.com/rbock/sqlpp11) -- Type-safe SQL for C++
+- [SOCI](https://soci.sourceforge.net/) -- SQL library for C++
+- [ODB](https://www.codesynthesis.com/products/odb/) -- C++ ORM
+- [cpplinq](https://github.com/mrange/cpplinq) -- LINQ query operators for C++ sequences
+- [boolinq](https://github.com/k06a/boolinq) -- C++ header-only LINQ library
+- [Realm C++ SDK](https://github.com/realm/realm-cpp) -- MongoDB Realm object database
+- [SQLite C/C++ Interface](https://sqlite.org/cintro.html) -- SQLite3 C API (225+ functions)
+- [ODBC API Reference](https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/odbc-api-reference) -- Microsoft ODBC specification
