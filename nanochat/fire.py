@@ -24,6 +24,33 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# Compiled ReDo Surgery Kernels
+# =============================================================================
+
+def _get_compile_decorator():
+    """Returns torch.compile for CUDA, identity for XLA."""
+    try:
+        import torch_xla
+        return lambda f: f
+    except ImportError:
+        return torch.compile(mode="reduce-overhead", fullgraph=True) if hasattr(torch, 'compile') else lambda f: f
+
+_compile_online = _get_compile_decorator()
+
+@_compile_online
+def _redo_surgery_in(W: torch.Tensor, mask: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    """Fused kernel: reinit incoming weights for dormant neurons. std is 0D device tensor."""
+    new_w = torch.randn_like(W) * std
+    return torch.where(mask, new_w, W)
+
+@_compile_online
+def _redo_surgery_out(W: torch.Tensor, mask: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    """Fused kernel: reinit outgoing weights (weakened) for dormant neurons."""
+    new_w = torch.randn_like(W) * (std * 0.1)
+    return torch.where(mask, new_w, W)
+
+
+# =============================================================================
 # FIRE: Newton-Schulz Orthogonalization
 # =============================================================================
 
@@ -121,6 +148,42 @@ def apply_fire(
 
     logger.info(f"[FIRE] Orthogonalized {len(modified)} 2D matrices, {iters} NS iterations")
     return modified
+
+
+def get_fire_targets(model: nn.Module, mode: str = 'aggressive') -> Set[nn.Parameter]:
+    """Topology-aware FIRE target selection using block.is_mamba attribute.
+
+    mode='aggressive': All 2D params except embeddings/head (for phase transitions)
+    mode='context_extension': Only Q/K attention projections (for 64K->128K)
+    """
+    targets = set()
+    global_skips = set()
+
+    if hasattr(model, 'transformer'):
+        if hasattr(model.transformer, 'wte'):
+            global_skips.add(model.transformer.wte.weight)
+    if hasattr(model, 'lm_head'):
+        global_skips.add(model.lm_head.weight)
+
+    blocks = getattr(model.transformer, 'h', []) if hasattr(model, 'transformer') else []
+
+    for block in blocks:
+        is_mamba = getattr(block, 'is_mamba', False)
+
+        if mode == 'context_extension':
+            if is_mamba:
+                continue  # Mamba is position-invariant
+            if hasattr(block, 'attn'):
+                for proj_name in ['c_q', 'c_k']:
+                    proj = getattr(block.attn, proj_name, None)
+                    if proj is not None and hasattr(proj, 'weight') and proj.weight.dim() == 2:
+                        targets.add(proj.weight)
+        elif mode == 'aggressive':
+            for p in block.parameters():
+                if p.dim() == 2 and p not in global_skips:
+                    targets.add(p)
+
+    return targets
 
 
 # =============================================================================
@@ -319,7 +382,7 @@ class ReDoDiagnostics:
                     self.stats[name] = mean_abs.clone()
                 else:
                     # Exponential moving average (alpha=0.1)
-                    self.stats[name] = 0.9 * self.stats[name] + 0.1 * mean_abs
+                    self.stats[name].lerp_(mean_abs, weight=0.1)
         return hook
 
     def get_dormant_ratio(self, tau: float = 0.025) -> Dict[str, float]:
@@ -413,18 +476,16 @@ def _recycle_core(
         return 0
 
     for in_mod in in_modules:
-        std_in = in_mod.weight.std().item()
-        new_w = torch.empty_like(in_mod.weight).normal_(0, max(std_in, 1e-4))
-        mask = is_dormant.unsqueeze(1).expand_as(in_mod.weight)
-        in_mod.weight.copy_(torch.where(mask, new_w, in_mod.weight))
+        std_in = in_mod.weight.std()  # 0D tensor, no .item() sync
+        mask_in = is_dormant.unsqueeze(1).expand_as(in_mod.weight)
+        in_mod.weight.copy_(_redo_surgery_in(in_mod.weight, mask_in, std_in))
 
         if hasattr(in_mod, 'bias') and in_mod.bias is not None:
             in_mod.bias.copy_(torch.where(is_dormant, torch.zeros_like(in_mod.bias), in_mod.bias))
 
-    std_out = out_module.weight.std().item()
-    new_w = torch.empty_like(out_module.weight).normal_(0, max(std_out * 0.1, 1e-5))
-    mask = is_dormant.unsqueeze(0).expand_as(out_module.weight)
-    out_module.weight.copy_(torch.where(mask, new_w, out_module.weight))
+    std_out = out_module.weight.std()  # 0D tensor, no .item() sync
+    mask_out = is_dormant.unsqueeze(0).expand_as(out_module.weight)
+    out_module.weight.copy_(_redo_surgery_out(out_module.weight, mask_out, std_out))
 
     if redo_stats is not None and name is not None:
         redo_stats[name] = torch.where(is_dormant, layer_mean, stats)

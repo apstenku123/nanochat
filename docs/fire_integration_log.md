@@ -399,3 +399,108 @@ Status: **DESIGN PHASE** — awaiting review before implementation.
 3. DASH frequency = every 2000 steps (not 50)?
 4. ReDo only with relu^2, skip if SwiGLU?
 5. Optimizer reset = selective (only FIRE'd params), not global clear?
+
+---
+
+## Iteration 1: Newton-Schulz Convergence Testing
+
+### Problem: Paper claims 5 iterations sufficient, but fails on random matrices
+
+The FIRE paper (arXiv 2602.08040) states N=5 Newton-Schulz iterations is enough. Testing showed this is only true for well-conditioned trained weights, not for random initialization matrices.
+
+### Test Results
+
+| Matrix | Init Norm | Iters | DfI | Status |
+|--------|-----------|-------|-----|--------|
+| 64x64 random, Frobenius norm init | ||W||_F | 10 | 530+ | DIVERGED |
+| 64x64 random, Frobenius norm init | ||W||_F | 15 | 508+ | DIVERGED |
+| 64x64 random, spectral norm init | ||W||_2 | 10 | 0.71 | Slow convergence |
+| 64x64 random, spectral norm init | ||W||_2 | 15 | ~0 | CONVERGED |
+| 64x64 random, spectral norm init | ||W||_2 | 20 | ~0 | CONVERGED |
+| 128x64 tall, spectral norm init | ||W||_2 | 15 | ~0 | CONVERGED |
+| 512x128 wide, spectral norm init | ||W||_2 | 15 | ~0 | CONVERGED |
+
+### Root Cause Analysis
+
+1. **Frobenius norm init** puts average singular value at 1/sqrt(min(m,n)). For 64x64, avg sigma ~ 0.125. The smallest sigmas (~0.0005) are far below the convergence basin of cubic NS iteration. The iteration pushes them toward 0 instead of toward 1.
+
+2. **Spectral norm init** puts max sigma at 1.0, all sigmas in (0,1]. Convergence is guaranteed but slow for ill-conditioned matrices (condition number ~500 for random 64x64).
+
+3. **Quintic (Muon-style) iteration diverges** on well-conditioned matrices. Tested a=3.4445, b=-4.7750, c=2.0315 — diverged after iteration 8. The quintic is tuned for gradient orthogonalization (small updates each step), not weight orthogonalization (one-shot).
+
+### Decision
+
+- Use **spectral norm** initialization (not Frobenius)
+- Use **cubic** iteration (a=1.5, b=-0.5), not quintic
+- Default **15 iterations** (not 5)
+- All computation in **float32** (bf16 linalg.matrix_norm(ord=2) not supported)
+
+---
+
+## Iteration 2: Norm-Preserving Scaling Bug
+
+### Problem: orig_norm / new_norm scaling destroys orthogonality
+
+The v3.0 proposal suggested preserving the original Frobenius norm after NS orthogonalization:
+```python
+return X * (orig_norm / new_norm)
+```
+
+### Test Result
+
+After NS convergence, all singular values = 1.0, so new_norm = sqrt(min(m,n)). For a 64x64 matrix with orig_norm = 63.7:
+- Scale factor = 63.7 / 8.0 = 7.96
+- All singular values become 7.96
+- W^T W = 63.4 * I (not I)
+- DfI = 64 * (63.4 - 1)^2 = 249,000+
+
+**Norm preservation is fundamentally incompatible with orthogonality.** An orthogonal matrix has a fixed Frobenius norm of sqrt(min(m,n)). You cannot have DfI=0 AND arbitrary Frobenius norm simultaneously.
+
+### Decision
+
+- Use paper's `sqrt(d_out/d_in)` scaling in `apply_fire` (not in `newton_schulz`)
+- `newton_schulz` returns pure orthogonal matrix (all sigmas = 1.0)
+- Scaling is the caller's responsibility
+
+### Impact on residual stream
+
+The `sqrt(d_out/d_in)` scaling may differ from the original init variance. For our uniform(-s, s) init, the expected Frobenius norm is `s * sqrt(d_out * d_in / 3)`. After FIRE with sqrt(d_out/d_in) scaling, the norm is `sqrt(d_out)`. These differ by `sqrt(d_in/3) / s`. The resid_lambdas and x0_lambdas compensate for this at the residual stream level, so the impact is manageable.
+
+---
+
+## Iteration 3: v4 External Code Review
+
+### What v4 got right (adopted)
+
+1. **Compiled ReDo surgery kernels**: Separate `_redo_surgery_in` and `_redo_surgery_out` functions under `@torch.compile` avoid intermediate tensors on GPU. Triton fuses `randn_like * std + where` into a single kernel.
+
+2. **0D tensor std (no .item() sync)**: Our code used `c_fc.weight.std().item()` which forces CPU-GPU synchronization. v4 passes `std` as a 0D device tensor directly to the compiled kernel. Eliminates pipeline stalls.
+
+3. **`.lerp_` for EMA**: `stats.lerp_(mean_abs, weight=0.1)` is in-place and fuses better than `0.9 * stats + 0.1 * mean_abs`.
+
+4. **Topology-aware `get_fire_targets`**: Uses `getattr(block, 'is_mamba', False)` instead of string matching on parameter names. Our `skip_keywords=['mamba']` approach fails because parameter names are `transformer.h.2.attn.in_proj.weight` — no "mamba" substring.
+
+5. **Separate targeting from execution**: `get_fire_targets(mode)` returns `Set[Parameter]`, then `apply_fire(targets, iters)` executes. More composable.
+
+### What v4 got wrong (rejected)
+
+1. **Norm-preserving FIRE**: Still uses `orig_norm / new_norm` rescaling. Mathematically wrong (see Iteration 2).
+
+2. **iters=5 default**: Too few for random matrices. Needs 15 (see Iteration 1).
+
+3. **No standalone `newton_schulz`**: Embedded in `_fire_kernel_norm_preserving`. Untestable.
+
+4. **Redundant `adamw_params` + `muon_params` in DASH**: If you have one set, you can derive the other. Our `muon_params` skip is simpler.
+
+---
+
+## Bug Tracker
+
+| # | Severity | Description | Source | Status |
+|---|----------|-------------|--------|--------|
+| 1 | CRITICAL | Frobenius norm init causes NS divergence | Paper's code | FIXED: use spectral norm |
+| 2 | CRITICAL | orig_norm/new_norm scaling destroys orthogonality | v3.0 proposal | FIXED: use sqrt(d_out/d_in) in apply_fire |
+| 3 | MODERATE | .item() CPU-GPU sync in ReDo surgery | Our v1.0 | FIXED: 0D tensor std (from v4) |
+| 4 | MODERATE | String matching fails for Mamba layer detection | Our v1.0 | FIXED: topology-aware get_fire_targets (from v4) |
+| 5 | LOW | EMA not fused | Our v1.0 | FIXED: .lerp_() (from v4) |
+| 6 | LOW | ReDo surgery not compiled | Our v1.0 | FIXED: @torch.compile kernels (from v4) |
