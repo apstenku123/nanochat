@@ -133,6 +133,8 @@ class GPTConfig:
     window_short: int = 0
     # RoPE
     rope_theta: float = 10000.0
+    # MLP activation: "relu2" (Primer) or "swiglu" (Llama-style with 8/3 hidden)
+    activation: str = "relu2"
 
 
 def _parse_csv_ints(value: str) -> list[int]:
@@ -225,10 +227,21 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.activation = getattr(config, 'activation', 'relu2')
+        if self.activation == 'swiglu':
+            # Llama trick: hidden = 8/3 * n_embd, rounded to multiple of 8
+            hidden = int(8 * config.n_embd / 3)
+            hidden = ((hidden + 7) // 8) * 8
+            self.c_gate = nn.Linear(config.n_embd, hidden, bias=False)
+            self.c_fc = nn.Linear(config.n_embd, hidden, bias=False)
+            self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
+        else:
+            self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+            self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
+        if self.activation == 'swiglu':
+            return self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x))
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)
@@ -393,6 +406,8 @@ class GPT(nn.Module):
             # 2. Init MLP (always)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if hasattr(block.mlp, 'c_gate'):
+                torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             # 3. Engram
             if block.engram is not None:
                 torch.nn.init.uniform_(block.engram.in_proj.weight, -s, s)

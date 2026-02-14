@@ -57,6 +57,7 @@ def _patch_missing_config_keys(model_config_kwargs):
     model_config_kwargs.setdefault("window_long", 0)
     model_config_kwargs.setdefault("window_short", 0)
     model_config_kwargs.setdefault("rope_theta", 10000.0)
+    model_config_kwargs.setdefault("activation", "relu2")
 
 
 def _build_gpt_config(model_config_kwargs):
