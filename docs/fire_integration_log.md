@@ -410,15 +410,15 @@ The FIRE paper (arXiv 2602.08040) states N=5 Newton-Schulz iterations is enough.
 
 ### Test Results
 
-| Matrix | Init Norm | Iters | DfI | Status |
-|--------|-----------|-------|-----|--------|
-| 64x64 random, Frobenius norm init | ||W||_F | 10 | 530+ | DIVERGED |
-| 64x64 random, Frobenius norm init | ||W||_F | 15 | 508+ | DIVERGED |
-| 64x64 random, spectral norm init | ||W||_2 | 10 | 0.71 | Slow convergence |
-| 64x64 random, spectral norm init | ||W||_2 | 15 | ~0 | CONVERGED |
-| 64x64 random, spectral norm init | ||W||_2 | 20 | ~0 | CONVERGED |
-| 128x64 tall, spectral norm init | ||W||_2 | 15 | ~0 | CONVERGED |
-| 512x128 wide, spectral norm init | ||W||_2 | 15 | ~0 | CONVERGED |
+| Matrix                            | Init Norm | Iters | DfI | Status |
+| --------------------------------- | --------- | ----- | --- | ------ |
+| 64x64 random, Frobenius norm init |           |       | W   |        | _F | 10 | 530+ | DIVERGED         |
+| 64x64 random, Frobenius norm init |           |       | W   |        | _F | 15 | 508+ | DIVERGED         |
+| 64x64 random, spectral norm init  |           |       | W   |        | _2 | 10 | 0.71 | Slow convergence |
+| 64x64 random, spectral norm init  |           |       | W   |        | _2 | 15 | ~0   | CONVERGED        |
+| 64x64 random, spectral norm init  |           |       | W   |        | _2 | 20 | ~0   | CONVERGED        |
+| 128x64 tall, spectral norm init   |           |       | W   |        | _2 | 15 | ~0   | CONVERGED        |
+| 512x128 wide, spectral norm init  |           |       | W   |        | _2 | 15 | ~0   | CONVERGED        |
 
 ### Root Cause Analysis
 
@@ -496,11 +496,122 @@ The `sqrt(d_out/d_in)` scaling may differ from the original init variance. For o
 
 ## Bug Tracker
 
-| # | Severity | Description | Source | Status |
-|---|----------|-------------|--------|--------|
-| 1 | CRITICAL | Frobenius norm init causes NS divergence | Paper's code | FIXED: use spectral norm |
-| 2 | CRITICAL | orig_norm/new_norm scaling destroys orthogonality | v3.0 proposal | FIXED: use sqrt(d_out/d_in) in apply_fire |
-| 3 | MODERATE | .item() CPU-GPU sync in ReDo surgery | Our v1.0 | FIXED: 0D tensor std (from v4) |
-| 4 | MODERATE | String matching fails for Mamba layer detection | Our v1.0 | FIXED: topology-aware get_fire_targets (from v4) |
-| 5 | LOW | EMA not fused | Our v1.0 | FIXED: .lerp_() (from v4) |
-| 6 | LOW | ReDo surgery not compiled | Our v1.0 | FIXED: @torch.compile kernels (from v4) |
+| #   | Severity | Description                                       | Source        | Status                                           |
+| --- | -------- | ------------------------------------------------- | ------------- | ------------------------------------------------ |
+| 1   | CRITICAL | Frobenius norm init causes NS divergence          | Paper's code  | FIXED: use spectral norm                         |
+| 2   | CRITICAL | orig_norm/new_norm scaling destroys orthogonality | v3.0 proposal | FIXED: use sqrt(d_out/d_in) in apply_fire        |
+| 3   | MODERATE | .item() CPU-GPU sync in ReDo surgery              | Our v1.0      | FIXED: 0D tensor std (from v4)                   |
+| 4   | MODERATE | String matching fails for Mamba layer detection   | Our v1.0      | FIXED: topology-aware get_fire_targets (from v4) |
+| 5   | LOW      | EMA not fused                                     | Our v1.0      | FIXED: .lerp_() (from v4)                        |
+| 6   | LOW      | ReDo surgery not compiled                         | Our v1.0      | FIXED: @torch.compile kernels (from v4)          |
+
+---
+
+## Iteration 4: V5 External Code Review
+
+V5 is essentially identical to our implementation after adopting v4 improvements. Key differences:
+
+### What V5 does differently
+
+| Feature                  | V5                             | Our implementation             | Verdict                                                               |
+| ------------------------ | ------------------------------ | ------------------------------ | --------------------------------------------------------------------- |
+| NS normalization         | Frobenius norm                 | Spectral norm                  | **Ours better** — Frobenius diverges on random matrices (Iteration 1) |
+| Default iterations       | 20                             | 15                             | **V5 safer for Frobenius** — but spectral norm converges in 15        |
+| Scaling                  | sqrt(d_out/d_in) in apply_fire | sqrt(d_out/d_in) in apply_fire | **Same**                                                              |
+| newton_schulz standalone | Yes                            | Yes                            | **Same**                                                              |
+| DASH isolation           | muon_params skip               | muon_params skip               | **Same**                                                              |
+| ReDo surgery             | compiled kernels, 0D std       | compiled kernels, 0D std       | **Same** (adopted from v4)                                            |
+| EMA                      | .lerp_()                       | .lerp_()                       | **Same** (adopted from v4)                                            |
+| Topology targeting       | get_fire_targets with is_mamba | get_fire_targets with is_mamba | **Same** (adopted from v4)                                            |
+
+### Conclusion
+
+Nothing new to adopt from V5. It converges on the same design we already have, minus the spectral norm fix.
+
+---
+
+## Iteration 5: Original Paper Implementations — ReDo and DASH
+
+### ReDo (Sokar et al., ICML 2023)
+
+**Original paper**: "The Dormant Neuron Phenomenon in Deep Reinforcement Learning"
+
+The paper was written for Deep RL (DQN, SAC), not LLMs. Key differences from our adaptation:
+
+| Aspect          | Original ReDo      | Our Implementation                   | Rationale                                            |
+| --------------- | ------------------ | ------------------------------------ | ---------------------------------------------------- |
+| Domain          | Deep RL            | LLM pretraining                      | Different scale, different activation patterns       |
+| Activation      | ReLU (binary dead) | relu^2 / SwiGLU (soft dead)          | relu^2 kills neurons more aggressively               |
+| Threshold tau   | 0.1                | 0.025                                | LLMs have denser activations, need tighter threshold |
+| Outgoing reinit | Zeros              | std * 0.1 (weakened)                 | Full zero causes loss spikes in large LLMs           |
+| Incoming reinit | Kaiming normal     | Match existing weight std            | Preserves custom init variance                       |
+| XLA safety      | Not addressed      | torch.where (no boolean indexing)    | Required for TPU static shapes                       |
+| Hook target     | nn.ReLU module     | c_fc output + lambda act_fn          | Our activations are functional, not modules          |
+| SwiGLU support  | N/A                | Hook on c_gate, recycle gate+up+proj | Original has no gated architecture support           |
+
+**What we fixed**: Original zeros outgoing weights completely. In a 24-layer transformer with residual connections, zeroing an entire neuron's output in one MLP layer creates a sudden void in the residual stream. The loss spikes by 0.01-0.05 and takes ~200 steps to recover. Our `std * 0.1` weakening preserves signal flow while still marking the neuron as "fresh".
+
+### DASH (Shin et al., NeurIPS 2024)
+
+**Original paper**: "DASH: Warm-Starting Neural Network Training in Stationary Settings without Loss of Plasticity"
+
+| Aspect           | Original DASH                 | Our Implementation              | Rationale                                                                 |
+| ---------------- | ----------------------------- | ------------------------------- | ------------------------------------------------------------------------- |
+| Granularity      | Per-element cosine_similarity | Per-neuron (row-wise, dim=1)    | Per-element is O(d_in*d_out) cos_sim per param, too fine-grained for LLMs |
+| Frequency        | Every step                    | Every 2000 steps (configurable) | Every step conflicts with Muon's gradient orthogonalization               |
+| Muon interaction | Not addressed                 | muon_params skip set            | DASH + Muon on same weights tears phase space                             |
+| Compilation      | Not compiled                  | @torch.compile for GPU fusion   | Original is pure Python, too slow for large models                        |
+| Scope            | All parameters                | Only AdamW-managed 2D params    | Muon already handles its own plasticity                                   |
+
+**What we fixed**: Original DASH was designed for vanilla SGD/Adam. It doesn't know about Muon. Applying DASH shrinking to weights that Muon is simultaneously orthogonalizing creates contradictory updates — DASH shrinks toward zero while Muon pushes toward orthogonal manifold. We isolate DASH to AdamW-only parameters.
+
+**Frequency change**: Original applies DASH every step. With our Muon+AdamW setup, this creates 50 DASH interventions per 50 gradient steps — too aggressive. We changed to every 2000 steps, aligned with ReDo diagnostics. This gives the optimizer time to settle between interventions.
+
+---
+
+## Iteration 6: Triton on XLA — State of the Art (Feb 2026)
+
+### Triton Kernel Support
+
+| Backend          | Kernel Language       | Status for Our Code                                                      |
+| ---------------- | --------------------- | ------------------------------------------------------------------------ |
+| CUDA (A100/H100) | Triton                | mamba_ssm Triton kernels available, torch.compile fuses DASH/ReDo        |
+| TPU (v6e)        | Pallas (Mosaic)       | No Mamba Pallas kernels exist. Our _ssd_scan_ref pure PyTorch path works |
+| TPU via XLA      | Triton (experimental) | PyTorch/XLA now supports Triton on GPU, NOT on TPU                       |
+
+### Key Findings
+
+1. **Triton on XLA**: PyTorch/XLA supports Triton custom kernels, but ONLY on GPU backend. TPU uses Pallas/Mosaic. The docs at pytorch.org/xla/master/features/triton.html describe GPU Triton integration via the XLA compiler, not TPU Triton.
+
+2. **Fused Mamba2 SSD Triton Kernel** (IBM Research, Triton Developer Conference 2025): Fuses all 5 SSD sub-kernels (chunk_state, chunk_scan, state_passing, state_to_output, chunk_output) into a single monolithic Triton kernel. 1.5-2.5x speedup on A100/H100. CUDA-only. Published by Rishi Astra, Tri Dao, Adnan Hoque.
+
+3. **DeepFusionKernel** (Feb 2026): Fused SwiGLU MLP kernel — cuts HBM traffic, 13.2% speedup on H100, 9.7% on A100. Relevant if we switch to SwiGLU.
+
+4. **mamba_ssm package**: CUDA-only, requires nvcc for build. Will NOT install on TPU VMs. Latest is v2.3.0 (Jan 2026). Our three-way dispatch (Triton > XLA scan > ref) is correct architecture.
+
+### Impact on Our Code
+
+- **No changes needed** for TPU path — our _ssd_scan_ref and _ssd_scan_xla already work
+- **CUDA path** could benefit from fused SSD kernel (IBM), but requires custom integration
+- **DASH/ReDo compiled kernels** already use torch.compile which generates Triton on CUDA
+- **SwiGLU fusion** (DeepFusionKernel) is worth tracking if we adopt SwiGLU widely
+
+### Recommendation
+
+Keep current three-way dispatch. When fused Mamba2 SSD kernel becomes available as a pip package (or via mamba_ssm update), add it as a fourth dispatch path. No architectural changes needed.
+
+---
+
+## Bug Tracker (Updated)
+
+| #   | Severity | Description                                                 | Source        | Status                                           |
+| --- | -------- | ----------------------------------------------------------- | ------------- | ------------------------------------------------ |
+| 1   | CRITICAL | Frobenius norm init causes NS divergence on random matrices | Paper code    | FIXED: spectral norm                             |
+| 2   | CRITICAL | orig_norm/new_norm scaling destroys orthogonality           | v3.0 proposal | FIXED: sqrt(d_out/d_in) in apply_fire            |
+| 3   | MODERATE | .item() CPU-GPU sync in ReDo surgery                        | Our v1.0      | FIXED: 0D tensor std (from v4)                   |
+| 4   | MODERATE | String matching fails for Mamba layer detection             | Our v1.0      | FIXED: topology-aware get_fire_targets (from v4) |
+| 5   | LOW      | EMA not fused                                               | Our v1.0      | FIXED: .lerp_() (from v4)                        |
+| 6   | LOW      | ReDo surgery not compiled                                   | Our v1.0      | FIXED: @torch.compile kernels (from v4)          |
+| 7   | DESIGN   | Original ReDo zeros outgoing weights causing loss spikes    | ReDo paper    | FIXED: std*0.1 weakening                         |
+| 8   | DESIGN   | Original DASH conflicts with Muon optimizer                 | DASH paper    | FIXED: muon_params skip                          |
+| 9   | DESIGN   | Original DASH per-step frequency too aggressive             | DASH paper    | FIXED: 2000-step default                         |
