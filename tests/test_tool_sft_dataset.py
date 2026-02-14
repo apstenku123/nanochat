@@ -46,12 +46,16 @@ def test_compute_loss_mask_uses_dynamic_special_ids():
     assert mask[11] == 1
 
 
-def test_tool_call_dataset_loads_text_schema(tmp_path):
+def test_tool_call_dataset_loads_text_schema(cpp_tokenizer_dir, monkeypatch):
+    """Test ToolCallSFTDataset loads and tokenizes text schema using tokenizer.json."""
+    monkeypatch.setenv("NANOCHAT_BASE_DIR", str(cpp_tokenizer_dir))
+    monkeypatch.setenv("NANOCHAT_CPP_TOKENIZER", "1")
+
     sample = {
         "text": "<BOS>\n// task\n<THOUGHT_START>\n// think\n<THOUGHT_END>\n<CODE_START>\nint x = 1;\n<CODE_END>\n<EOS>",
         "source": "no_tool",
     }
-    data_path = tmp_path / "tool_small.jsonl"
+    data_path = cpp_tokenizer_dir / "tool_small.jsonl"
     data_path.write_text(json.dumps(sample) + "\n")
 
     ds = ToolCallSFTDataset(str(data_path), tokenizer_name="cpp", max_len=256)

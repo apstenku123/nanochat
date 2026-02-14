@@ -56,7 +56,11 @@ FIM_SUFFIX = "<FIM_SUFFIX>"
 
 def escape_for_cpp_string(s: str) -> str:
     """Escape a string for use inside a C++ string literal in tool call."""
-    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return (s.replace("\\", "\\\\")
+             .replace('"', '\\"')
+             .replace("\n", "\\n")
+             .replace("\r", "\\r")
+             .replace("\0", "\\0"))
 
 
 def extract_key_terms(text: str) -> str:

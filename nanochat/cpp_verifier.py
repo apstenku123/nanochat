@@ -67,7 +67,11 @@ def verify_cpp(
             f.write(full_source)
 
         # Decide whether to compile-only or compile+link
-        has_main = "int main" in full_source
+        # Strip C/C++ comments before checking, so "int main" in
+        # comments doesn't trigger linking.
+        stripped = re.sub(r'//[^\n]*', '', full_source)
+        stripped = re.sub(r'/\*.*?\*/', '', stripped, flags=re.DOTALL)
+        has_main = bool(re.search(r'\bint\s+main\s*\(', stripped))
         if has_main:
             compile_cmd = [
                 "g++", f"-std={std}", "-Wall", "-Wextra",

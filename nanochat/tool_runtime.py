@@ -149,7 +149,9 @@ class ToolRuntime:
     def _is_within_codebase(self, candidate_path: str) -> bool:
         """Return True if candidate_path resolves under codebase_dir."""
         try:
-            return os.path.commonpath([self.codebase_dir, candidate_path]) == self.codebase_dir
+            real_path = os.path.realpath(candidate_path)
+            real_base = os.path.realpath(self.codebase_dir)
+            return os.path.commonpath([real_base, real_path]) == real_base
         except ValueError:
             return False
 
@@ -203,7 +205,7 @@ class ToolRuntime:
         full_path = os.path.join(self.codebase_dir, path) if not os.path.isabs(path) else path
 
         # Security: don't allow reading outside codebase
-        full_path = os.path.abspath(full_path)
+        full_path = os.path.realpath(full_path)
         if not self._is_within_codebase(full_path):
             return f"// error: path outside codebase: {path}"
 
@@ -265,7 +267,11 @@ class ToolRuntime:
         import tempfile
 
         # If the code doesn't have main(), wrap it
-        if "main" not in code:
+        # Strip C/C++ comments before checking, so "int main" in
+        # comments doesn't trigger a false match.
+        _stripped = re.sub(r'//[^\n]*', '', code)
+        _stripped = re.sub(r'/\*.*?\*/', '', _stripped, flags=re.DOTALL)
+        if not re.search(r'\bint\s+main\s*\(', _stripped):
             code = f'#include <iostream>\n#include <string>\n#include <algorithm>\nusing namespace std;\nint main() {{\n{code}\n    return 0;\n}}'
 
         src_path = None

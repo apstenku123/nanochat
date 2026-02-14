@@ -119,14 +119,18 @@ def compute_loss_mask(token_ids: list[int], special_ids: dict | None = None) -> 
     # Special case: FIM sequences — everything after <FIM_MIDDLE> is trained
     has_fim = fim_prefix_id is not None and fim_middle_id is not None and fim_prefix_id in token_ids
     if has_fim:
-        # For FIM: train on middle content (the infill)
+        # For FIM: train on middle content (the infill), stop at EOS/BOS
         in_middle = False
         for i, tid in enumerate(token_ids):
             if tid == fim_middle_id:
                 in_middle = True
                 mask[i] = 1  # train on the FIM_MIDDLE token itself
                 continue
-            if in_middle and tid != bos_id and tid != eos_id:
+            if tid == eos_id or tid == bos_id:
+                in_middle = False
+                mask[i] = 0
+                continue
+            if in_middle:
                 mask[i] = 1
         return mask
 
@@ -151,6 +155,9 @@ def compute_loss_mask(token_ids: list[int], special_ids: dict | None = None) -> 
             if code_end_id is not None and tid == code_end_id:
                 in_tool_result = False
                 mask[i] = 0  # the CODE_END closing a tool result is also masked
+            elif tid in (thought_start_id, code_start_id, query_tool_id):
+                in_tool_result = False  # recover from unclosed result block
+                mask[i] = 1
             else:
                 mask[i] = 0
             continue
@@ -232,15 +239,15 @@ class ToolCallSFTDataset(Dataset):
         return jsonl_path + f".cache.{h}.pt"
 
     def _pack_examples(self, all_inputs: list, all_targets: list):
-        """Pack variable-length examples into flat int16 tensors + offset index."""
+        """Pack variable-length examples into flat int32 tensors + offset index."""
         n = len(all_inputs)
         offsets = np.zeros(n + 1, dtype=np.int64)
         for i, inp in enumerate(all_inputs):
             offsets[i + 1] = offsets[i] + len(inp)
         total_tokens = int(offsets[-1])
 
-        input_flat = np.zeros(total_tokens, dtype=np.int16)
-        target_flat = np.zeros(total_tokens, dtype=np.int16)
+        input_flat = np.zeros(total_tokens, dtype=np.int32)
+        target_flat = np.zeros(total_tokens, dtype=np.int32)
         for i, (inp, tgt) in enumerate(zip(all_inputs, all_targets)):
             start = offsets[i]
             end = offsets[i + 1]
@@ -251,7 +258,7 @@ class ToolCallSFTDataset(Dataset):
         self.input_flat = torch.from_numpy(input_flat)
         self.target_flat = torch.from_numpy(target_flat)
         self._num_examples = n
-        print(f"Packed {n:,} examples, {total_tokens:,} total tokens ({total_tokens * 4 / 1e9:.2f} GB)")
+        print(f"Packed {n:,} examples, {total_tokens:,} total tokens ({total_tokens * 8 / 1e9:.2f} GB)")
 
     def _save_cache(self, cache_path: str):
         """Save pre-tokenized data to cache file."""
