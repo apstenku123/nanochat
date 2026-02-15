@@ -239,18 +239,43 @@ mHC, DSA (layers 7-23), MTP (lambda=0.3), FIM (50%), gradient checkpointing, XLA
 
 ### Training Data
 
-Dataset: **cpp_compilable_64k** — compilable-ordered C++ training documents.
+All datasets are generated from 93 C++ open-source projects (641K files, 29 GB raw) using
+`tools/cpp_chunker` (Rust tree-sitter + compilable ordering), plus git commit chains and
+clang semantic indexing. Everything is converted to parquet and stored on GCS.
 
-| Dataset | Docs | Size | Tokens | Description |
-|---------|------|------|--------|-------------|
-| cpp_crossfile_16k | 8.1M | 23 GB | 16K | Tree-sitter cross-file (JSONL) |
-| cpp_project_crossfile_16k | 1.0M | 8.0 GB | 16K | Project-aware cross-file |
-| cpp_clang_crossfile_16k | 794K | 883 MB | 16K | Clang semantic indexer |
-| cpp_compilable_16k | 1.0M | 7.3 GB | 16K | Compilable: types->functions |
-| **cpp_compilable_64k** | **394K** | **3.4 GB** | **64K** | **Compilable: types->functions (active)** |
+**Active dataset**: `treesitter_compilable_64k` (used for current d24 training run).
 
-All datasets at `gs://nanochat-training-data-2026/data/`. Generated from 93 C++ open-source
-projects (641K files, 29 GB raw) using `tools/cpp_chunker` (Rust).
+#### Parquet Datasets (`gs://nanochat-training-data-2026/data/parquet/`)
+
+**Tree-sitter Compilable** (compilable C++ units, grouped by project for long-context):
+
+| Dataset | Docs | Shards | Size | Status |
+|---------|------|--------|------|--------|
+| `treesitter_compilable_16k` | 1.64M | 35 | — | COMPLETE |
+| `treesitter_compilable_64k` | 666K | 35 | — | COMPLETE |
+| `treesitter_compilable_128k` | 71.7K | 10 | 12.4 GB | COMPLETE |
+| `treesitter_compilable_256k` | 36.0K | 10 | 12.4 GB | COMPLETE |
+| `treesitter_compilable_512k` | 18.6K | 12 | 12.3 GB | COMPLETE |
+
+**Git Commit Chains** (pre→post code diffs from git history):
+
+| Dataset | Docs | Shards | Size | Status |
+|---------|------|--------|------|--------|
+| `git_commit_chains_16k` | — | — | — | COMPLETE |
+| `git_commit_chains_128k` | 4.89M | 487 | — | COMPLETE |
+| `git_commit_chains_256k` | 4.89M | 971 | — | COMPLETE |
+| `git_commit_chains_512k` | 4.89M | 2,425 | 23.2 GB | COMPLETE |
+
+**Other**: `clang_semantic_16k`, `gpu_npu_compilable_{16k,64k}`, `ms_src_cpp`, `commitpack_chains`, `git_history_chains`, `gpu_npu_chains` — all COMPLETE.
+
+#### Data Pipeline
+
+| Tool/Script | Purpose |
+|-------------|---------|
+| `tools/cpp_chunker` (Rust) | Tree-sitter AST parsing, compilable ordering, project-aware chunking |
+| `scripts/data/build_all_chunk_sizes.sh` | Master orchestrator: 3 methods × 5 sizes → JSONL → parquet |
+| `scripts/data/concat_compilable_docs.py` | Groups small docs by project into 128K/256K/512K documents |
+| `scripts/data/batch_jsonl_to_parquet.py` | Shuffled JSONL → parquet shards with val split |
 
 **Compilable ordering**: Each document is structured as a near-compilable C++ translation unit:
 1. Preamble: `#include`, `using`, forward declarations
