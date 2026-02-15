@@ -33,6 +33,30 @@ def is_generated(content: str, max_check: int = 500) -> bool:
     header = content[:max_check].upper()
     return any(m.upper() in header for m in GENERATED_MARKERS)
 
+def strip_non_ascii_lines(code: str) -> str:
+    """Remove lines containing non-ASCII characters.
+
+    After comment translation, remaining non-ASCII is in string literals,
+    identifiers, or test data (CJK text, box-drawing chars, Unicode test
+    vectors).  These don't teach C++ reasoning so we drop the entire line
+    to keep the corpus ASCII-clean.
+
+    Lines that are part of a multi-line string literal or block comment may
+    leave orphaned delimiters — the quality filter downstream will catch files
+    that become too small or malformed.
+    """
+    lines = code.split('\n')
+    cleaned = []
+    for line in lines:
+        try:
+            line.encode('ascii')
+            cleaned.append(line)
+        except UnicodeEncodeError:
+            # Drop the line — it contains non-ASCII characters
+            continue
+    return '\n'.join(cleaned)
+
+
 def normalize_cpp(code: str) -> str:
     """Normalize C++ code: preserve indentation, compress blank lines, strip trailing whitespace.
 
@@ -140,6 +164,7 @@ def extract_files(raw_dir: str, output_path: str, max_bytes: int):
 
                 # Process
                 content = strip_license_header(content)
+                content = strip_non_ascii_lines(content)
                 content = normalize_cpp(content)
 
                 if len(content) < 50:
@@ -149,7 +174,7 @@ def extract_files(raw_dir: str, output_path: str, max_bytes: int):
                 # Relative path for metadata
                 rel_path = os.path.relpath(fpath, raw_dir)
                 record = {"text": content, "path": rel_path}
-                line = json.dumps(record, ensure_ascii=False)
+                line = json.dumps(record, ensure_ascii=True)
                 out.write(line + '\n')
 
                 total_bytes += len(content)
