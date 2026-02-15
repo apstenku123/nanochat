@@ -131,6 +131,11 @@ parser.add_argument(
 )
 parser.add_argument("--compile", action="store_true", help="Use torch.compile")
 parser.add_argument(
+    "--xla_flash_attn",
+    action="store_true",
+    help="Use XLA Pallas flash attention for TPU (reduces memory for long sequences)",
+)
+parser.add_argument(
     "--dataset_type",
     type=str,
     default="auto",
@@ -163,6 +168,11 @@ xm = None
 if device_type == "xla":
     import torch_xla.core.xla_model as xm
 
+if args.xla_flash_attn:
+    from nanochat.flash_attention import enable_xla_flash_attention
+
+    enable_xla_flash_attention()
+
 precision_plan = select_precision()
 autocast_ctx = make_autocast_ctx(precision_plan, device_type)
 if device_type == "cuda":
@@ -170,8 +180,10 @@ if device_type == "cuda":
 elif device_type == "xla":
     synchronize = xm.mark_step
 else:
+
     def synchronize():
         return None
+
 
 # Tokenizer
 if args.tokenizer == "cpp":
