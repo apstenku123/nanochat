@@ -47,6 +47,7 @@ else:
 
 try:
     import torch._inductor.utils as inductor_utils
+
     inductor_utils.is_big_gpu = lambda index=0: True
 except Exception:
     pass
@@ -71,13 +72,35 @@ from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_l
 parser = argparse.ArgumentParser(description="SFT training for C++ code generation")
 # Data
 parser.add_argument("--data", type=str, required=True, help="Path to JSONL SFT dataset")
-parser.add_argument("--tokenizer", type=str, default="cpp", choices=["cpp", "default"], help="Tokenizer to use")
-parser.add_argument("--max_seq_len", type=int, default=16384, help="Max sequence length")
+parser.add_argument(
+    "--tokenizer",
+    type=str,
+    default="cpp",
+    choices=["cpp", "default"],
+    help="Tokenizer to use",
+)
+parser.add_argument(
+    "--max_seq_len", type=int, default=16384, help="Max sequence length"
+)
 # Model
-parser.add_argument("--checkpoint_path", type=str, default="", help="Path to pretrained checkpoint directory (empty = train from scratch)")
-parser.add_argument("--checkpoint_step", type=int, default=-1, help="Checkpoint step to load (-1 = latest)")
-parser.add_argument("--depth", type=int, default=12, help="Model depth (used if training from scratch)")
-parser.add_argument("--aspect_ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
+parser.add_argument(
+    "--checkpoint_path",
+    type=str,
+    default="",
+    help="Path to pretrained checkpoint directory (empty = train from scratch)",
+)
+parser.add_argument(
+    "--checkpoint_step",
+    type=int,
+    default=-1,
+    help="Checkpoint step to load (-1 = latest)",
+)
+parser.add_argument(
+    "--depth", type=int, default=12, help="Model depth (used if training from scratch)"
+)
+parser.add_argument(
+    "--aspect_ratio", type=int, default=64, help="model_dim = depth * aspect_ratio"
+)
 parser.add_argument("--head_dim", type=int, default=128, help="Target head dimension")
 # Training
 parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
@@ -86,17 +109,43 @@ parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
 parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
 parser.add_argument("--warmup_ratio", type=float, default=0.1, help="LR warmup ratio")
 # Output
-parser.add_argument("--output_dir", type=str, default="", help="Output checkpoint directory (empty = auto)")
-parser.add_argument("--save_every", type=int, default=-1, help="Save every N steps (-1 = only at end)")
+parser.add_argument(
+    "--output_dir",
+    type=str,
+    default="",
+    help="Output checkpoint directory (empty = auto)",
+)
+parser.add_argument(
+    "--save_every", type=int, default=-1, help="Save every N steps (-1 = only at end)"
+)
 parser.add_argument("--log_every", type=int, default=10, help="Log every N steps")
 # Runtime
-parser.add_argument("--device_type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
-parser.add_argument("--kernel", type=str, default="current", choices=["current", "liger", "cce", "triton"])
+parser.add_argument(
+    "--device_type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)"
+)
+parser.add_argument(
+    "--kernel",
+    type=str,
+    default="current",
+    choices=["current", "liger", "cce", "triton"],
+)
 parser.add_argument("--compile", action="store_true", help="Use torch.compile")
-parser.add_argument("--dataset_type", type=str, default="auto", choices=["auto", "instruction", "tool"],
-                    help="Dataset type: 'instruction' for {instruction,response}, 'tool' for {text,source}, 'auto' detects from data")
-parser.add_argument("--resume", type=str, default="", help="Resume from SFT checkpoint directory (loads model + optimizer + step)")
-parser.add_argument("--resume_step", type=int, default=-1, help="Step to resume from (-1 = latest)")
+parser.add_argument(
+    "--dataset_type",
+    type=str,
+    default="auto",
+    choices=["auto", "instruction", "tool"],
+    help="Dataset type: 'instruction' for {instruction,response}, 'tool' for {text,source}, 'auto' detects from data",
+)
+parser.add_argument(
+    "--resume",
+    type=str,
+    default="",
+    help="Resume from SFT checkpoint directory (loads model + optimizer + step)",
+)
+parser.add_argument(
+    "--resume_step", type=int, default=-1, help="Step to resume from (-1 = latest)"
+)
 args = parser.parse_args()
 
 # Set kernel backend
@@ -109,7 +158,7 @@ master_process = ddp_rank == 0
 
 if device_type == "cuda":
     torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision('high')
+    torch.set_float32_matmul_precision("high")
 xm = None
 if device_type == "xla":
     import torch_xla.core.xla_model as xm
@@ -121,7 +170,8 @@ if device_type == "cuda":
 elif device_type == "xla":
     synchronize = xm.mark_step
 else:
-    synchronize = lambda: None
+    def synchronize():
+        return None
 
 # Tokenizer
 if args.tokenizer == "cpp":
@@ -137,6 +187,7 @@ print0(f"Loading SFT dataset from {args.data}")
 dataset_type = args.dataset_type
 if dataset_type == "auto":
     import json as _json
+
     with open(args.data) as _f:
         first_line = None
         for _line in _f:
@@ -153,11 +204,24 @@ if dataset_type == "auto":
     print0(f"Auto-detected dataset type: {dataset_type}")
 
 if dataset_type == "tool":
-    dataset = ToolCallSFTDataset(args.data, tokenizer_name=args.tokenizer, max_len=args.max_seq_len)
+    dataset = ToolCallSFTDataset(
+        args.data, tokenizer_name=args.tokenizer, max_len=args.max_seq_len
+    )
     collate_fn = tool_sft_collate_fn
 else:
-    dataset = SFTDataset(args.data, tokenizer_name=args.tokenizer, max_len=args.max_seq_len)
+    dataset = SFTDataset(
+        args.data, tokenizer_name=args.tokenizer, max_len=args.max_seq_len
+    )
     collate_fn = sft_collate_fn
+
+# On XLA/TPU, pad all sequences to a fixed length to avoid recompilation
+# on every unique sequence length (XLA compiles a new graph per shape).
+if device_type == "xla":
+    from functools import partial
+
+    collate_fn = partial(collate_fn, pad_to=args.max_seq_len)
+    print0(f"XLA: fixed padding to {args.max_seq_len} tokens (avoids recompilation)")
+
 print0(f"SFT dataset size: {len(dataset)} examples")
 
 sampler = None
@@ -181,6 +245,7 @@ dataloader = DataLoader(
     num_workers=0,
 )
 
+
 # Model
 def find_num_heads(model_dim, target_head_dim):
     ideal = max(1, round(model_dim / target_head_dim))
@@ -190,6 +255,7 @@ def find_num_heads(model_dim, target_head_dim):
                 return candidate
     return 1
 
+
 resume_step = 0
 resume_epoch = 0
 resume_optim_state = None
@@ -197,7 +263,9 @@ resume_optim_state = None
 if args.resume:
     # Resume from SFT checkpoint (model + optimizer + step)
     print0(f"Resuming SFT training from {args.resume}")
-    step_to_load = args.resume_step if args.resume_step >= 0 else find_last_step(args.resume)
+    step_to_load = (
+        args.resume_step if args.resume_step >= 0 else find_last_step(args.resume)
+    )
     model_state, optim_states, meta = load_checkpoint(args.resume, step_to_load, device)
     model_config_kwargs = meta["model_config"]
     model_config = GPTConfig(**model_config_kwargs)
@@ -214,7 +282,11 @@ if args.resume:
 elif args.checkpoint_path:
     # Load from pretrained checkpoint (model only, fresh optimizer)
     print0(f"Loading pretrained model from {args.checkpoint_path}")
-    step_to_load = args.checkpoint_step if args.checkpoint_step >= 0 else find_last_step(args.checkpoint_path)
+    step_to_load = (
+        args.checkpoint_step
+        if args.checkpoint_step >= 0
+        else find_last_step(args.checkpoint_path)
+    )
     model_state, _, meta = load_checkpoint(args.checkpoint_path, step_to_load, device)
     model_config_kwargs = meta["model_config"]
     model_config = GPTConfig(**model_config_kwargs)
@@ -252,7 +324,11 @@ if args.compile and (ddp or device_type == "xla"):
 if args.compile and not ddp and device_type != "xla":
     model = torch.compile(model, dynamic=False)
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank] if device_type == "cuda" else None, broadcast_buffers=False)
+    model = DDP(
+        model,
+        device_ids=[ddp_local_rank] if device_type == "cuda" else None,
+        broadcast_buffers=False,
+    )
     orig_model = model.module
 
 # Optimizer (simple AdamW for SFT, no Muon)
@@ -280,8 +356,11 @@ os.makedirs(output_dir, exist_ok=True)
 num_steps_per_epoch = len(dataloader)
 total_steps = args.epochs * num_steps_per_epoch
 warmup_steps = int(args.warmup_ratio * total_steps)
-print0(f"Training for {args.epochs} epochs, {num_steps_per_epoch} steps/epoch, {total_steps} total steps")
+print0(
+    f"Training for {args.epochs} epochs, {num_steps_per_epoch} steps/epoch, {total_steps} total steps"
+)
 print0(f"Warmup steps: {warmup_steps}")
+
 
 def all_reduce_sums(loss_sum, token_sum):
     if ddp:
@@ -291,6 +370,7 @@ def all_reduce_sums(loss_sum, token_sum):
         xm.all_reduce(xm.REDUCE_SUM, [loss_sum, token_sum])
     return loss_sum, token_sum
 
+
 global_step = resume_step
 model.train()
 
@@ -299,7 +379,7 @@ for epoch in range(args.epochs):
     if epoch < resume_epoch:
         global_step_would_be = (epoch + 1) * num_steps_per_epoch
         if global_step_would_be <= resume_step:
-            print0(f"Skipping epoch {epoch+1}/{args.epochs} (already completed)")
+            print0(f"Skipping epoch {epoch + 1}/{args.epochs} (already completed)")
             continue
 
     if sampler is not None:
@@ -310,7 +390,9 @@ for epoch in range(args.epochs):
     if epoch == resume_epoch and resume_step > 0:
         skip_batches = resume_step - epoch * num_steps_per_epoch
         if skip_batches > 0:
-            print0(f"Epoch {epoch+1}: skipping {skip_batches} batches to resume at step {resume_step}")
+            print0(
+                f"Epoch {epoch + 1}: skipping {skip_batches} batches to resume at step {resume_step}"
+            )
 
     epoch_loss = 0.0
     epoch_tokens = 0
@@ -330,7 +412,9 @@ for epoch in range(args.epochs):
             lr = args.lr * (global_step + 1) / warmup_steps
         else:
             progress = (global_step - warmup_steps) / max(total_steps - warmup_steps, 1)
-            lr = args.lr * 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
+            lr = (
+                args.lr * 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
+            )
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
@@ -358,13 +442,21 @@ for epoch in range(args.epochs):
             token_sum = torch.tensor(float(epoch_tokens), device=device)
             loss_sum, token_sum = all_reduce_sums(loss_sum, token_sum)
             avg_loss = loss_sum.item() / max(token_sum.item(), 1)
-            print0(f"  step {global_step:05d}/{total_steps} | epoch {epoch+1}/{args.epochs} | loss: {loss.item():.4f} | avg: {avg_loss:.4f} | lr: {lr:.2e}")
+            print0(
+                f"  step {global_step:05d}/{total_steps} | epoch {epoch + 1}/{args.epochs} | loss: {loss.item():.4f} | avg: {avg_loss:.4f} | lr: {lr:.2e}"
+            )
 
         if args.save_every > 0 and global_step % args.save_every == 0:
             save_checkpoint(
-                output_dir, global_step,
-                orig_model.state_dict(), [optimizer.state_dict()],
-                {"step": global_step, "epoch": epoch, "model_config": vars(model_config)},
+                output_dir,
+                global_step,
+                orig_model.state_dict(),
+                [optimizer.state_dict()],
+                {
+                    "step": global_step,
+                    "epoch": epoch,
+                    "model_config": vars(model_config),
+                },
                 rank=ddp_rank,
             )
 
@@ -374,12 +466,16 @@ for epoch in range(args.epochs):
     loss_sum, token_sum = all_reduce_sums(loss_sum, token_sum)
     avg_loss = loss_sum.item() / max(token_sum.item(), 1)
     total_tokens = int(token_sum.item())
-    print0(f"Epoch {epoch+1}/{args.epochs} done in {dt:.1f}s | avg loss: {avg_loss:.4f} | tokens: {total_tokens:,}")
+    print0(
+        f"Epoch {epoch + 1}/{args.epochs} done in {dt:.1f}s | avg loss: {avg_loss:.4f} | tokens: {total_tokens:,}"
+    )
 
 # Save final checkpoint
 save_checkpoint(
-    output_dir, global_step,
-    orig_model.state_dict(), [optimizer.state_dict()],
+    output_dir,
+    global_step,
+    orig_model.state_dict(),
+    [optimizer.state_dict()],
     {"step": global_step, "epoch": args.epochs, "model_config": vars(model_config)},
     rank=ddp_rank,
 )

@@ -53,6 +53,7 @@ FIM_SUFFIX_ID = DEFAULT_SPECIAL_IDS["fim_suffix"]
 
 def _resolve_special_ids(tokenizer) -> dict:
     """Resolve special token IDs from tokenizer with fallback defaults."""
+
     def get_id(token: str, default: int | None = None) -> int | None:
         tid = tokenizer.encode_special(token)
         return default if tid is None else tid
@@ -66,7 +67,9 @@ def _resolve_special_ids(tokenizer) -> dict:
         "eos": eos_id,
         "code_start": get_id("<CODE_START>", DEFAULT_SPECIAL_IDS["code_start"]),
         "code_end": get_id("<CODE_END>", DEFAULT_SPECIAL_IDS["code_end"]),
-        "thought_start": get_id("<THOUGHT_START>", DEFAULT_SPECIAL_IDS["thought_start"]),
+        "thought_start": get_id(
+            "<THOUGHT_START>", DEFAULT_SPECIAL_IDS["thought_start"]
+        ),
         "thought_end": get_id("<THOUGHT_END>", DEFAULT_SPECIAL_IDS["thought_end"]),
         "query_tool": get_id("<QUERY_TOOL>", DEFAULT_SPECIAL_IDS["query_tool"]),
         "tool_result": get_id("<TOOL_RESULT>", DEFAULT_SPECIAL_IDS["tool_result"]),
@@ -76,7 +79,9 @@ def _resolve_special_ids(tokenizer) -> dict:
     }
 
 
-def compute_loss_mask(token_ids: list[int], special_ids: dict | None = None) -> list[int]:
+def compute_loss_mask(
+    token_ids: list[int], special_ids: dict | None = None
+) -> list[int]:
     """Compute loss mask from token IDs.
 
     Rules:
@@ -103,7 +108,9 @@ def compute_loss_mask(token_ids: list[int], special_ids: dict | None = None) -> 
     fim_middle_id = ids.get("fim_middle")
 
     response_start_tokens = {
-        tid for tid in (thought_start_id, code_start_id, query_tool_id, fim_prefix_id) if tid is not None
+        tid
+        for tid in (thought_start_id, code_start_id, query_tool_id, fim_prefix_id)
+        if tid is not None
     }
 
     n = len(token_ids)
@@ -117,7 +124,11 @@ def compute_loss_mask(token_ids: list[int], special_ids: dict | None = None) -> 
             break
 
     # Special case: FIM sequences — everything after <FIM_MIDDLE> is trained
-    has_fim = fim_prefix_id is not None and fim_middle_id is not None and fim_prefix_id in token_ids
+    has_fim = (
+        fim_prefix_id is not None
+        and fim_middle_id is not None
+        and fim_prefix_id in token_ids
+    )
     if has_fim:
         # For FIM: train on middle content (the infill), stop at EOS/BOS
         in_middle = False
@@ -181,7 +192,9 @@ class ToolCallSFTDataset(Dataset):
         max_len: Maximum sequence length (truncated if longer).
     """
 
-    def __init__(self, jsonl_path: str, tokenizer_name: str = "cpp", max_len: int = 16384):
+    def __init__(
+        self, jsonl_path: str, tokenizer_name: str = "cpp", max_len: int = 16384
+    ):
         self.max_len = max_len
 
         # Load tokenizer
@@ -218,10 +231,14 @@ class ToolCallSFTDataset(Dataset):
                     skipped += 1
 
                 if total % 100000 == 0:
-                    print(f"  tokenized {total:,} examples ({len(all_inputs):,} kept)...")
+                    print(
+                        f"  tokenized {total:,} examples ({len(all_inputs):,} kept)..."
+                    )
 
         dt = time.time() - t0
-        print(f"Tokenized {len(all_inputs):,} examples in {dt:.1f}s (skipped {skipped})")
+        print(
+            f"Tokenized {len(all_inputs):,} examples in {dt:.1f}s (skipped {skipped})"
+        )
 
         # Pack into flat tensors for fast cache/load
         self._pack_examples(all_inputs, all_targets)
@@ -263,11 +280,14 @@ class ToolCallSFTDataset(Dataset):
     def _save_cache(self, cache_path: str):
         """Save pre-tokenized data to cache file."""
         t0 = time.time()
-        torch.save({
-            "offsets": self.offsets,
-            "input_flat": self.input_flat,
-            "target_flat": self.target_flat,
-        }, cache_path)
+        torch.save(
+            {
+                "offsets": self.offsets,
+                "input_flat": self.input_flat,
+                "target_flat": self.target_flat,
+            },
+            cache_path,
+        )
         dt = time.time() - t0
         sz = os.path.getsize(cache_path) / 1e9
         print(f"Saved cache to {cache_path} ({sz:.2f} GB, {dt:.1f}s)")
@@ -278,7 +298,7 @@ class ToolCallSFTDataset(Dataset):
             return False
         # Invalidate if JSONL is newer
         if os.path.getmtime(jsonl_path) > os.path.getmtime(cache_path):
-            print(f"Cache stale (JSONL newer), re-tokenizing...")
+            print("Cache stale (JSONL newer), re-tokenizing...")
             return False
         try:
             t0 = time.time()
@@ -289,7 +309,9 @@ class ToolCallSFTDataset(Dataset):
             self._num_examples = len(self.offsets) - 1
             dt = time.time() - t0
             total_tokens = len(self.input_flat)
-            print(f"Loaded {self._num_examples:,} examples ({total_tokens:,} tokens) from cache in {dt:.1f}s")
+            print(
+                f"Loaded {self._num_examples:,} examples ({total_tokens:,} tokens) from cache in {dt:.1f}s"
+            )
             return True
         except Exception as e:
             print(f"Cache load failed ({e}), re-tokenizing...")
@@ -310,7 +332,7 @@ class ToolCallSFTDataset(Dataset):
             return None
 
         # Truncate to max_len + 1
-        all_ids = all_ids[:self.max_len + 1]
+        all_ids = all_ids[: self.max_len + 1]
 
         # Compute loss mask on the full sequence
         full_mask = compute_loss_mask(all_ids, self.special_ids)
@@ -341,21 +363,24 @@ class ToolCallSFTDataset(Dataset):
         )
 
 
-def tool_sft_collate_fn(batch, pad_id=0):
+def tool_sft_collate_fn(batch, pad_id=0, pad_to=None):
     """Collate variable-length tool SFT examples into a padded batch.
 
     Pads input_ids with pad_id and target_ids with -1 (ignored by loss).
-    Returns (input_ids, targets) both of shape (B, max_len_in_batch).
+    Returns (input_ids, targets) both of shape (B, pad_len).
+    When pad_to is set, all sequences are padded to that fixed length
+    (required for XLA/TPU to avoid recompilation on every unique length).
     """
     inputs, targets = zip(*batch)
     max_len = max(x.size(0) for x in inputs)
+    pad_len = pad_to if pad_to is not None else max_len
 
-    padded_inputs = torch.full((len(inputs), max_len), pad_id, dtype=torch.long)
-    padded_targets = torch.full((len(targets), max_len), -1, dtype=torch.long)
+    padded_inputs = torch.full((len(inputs), pad_len), pad_id, dtype=torch.long)
+    padded_targets = torch.full((len(targets), pad_len), -1, dtype=torch.long)
 
     for i, (inp, tgt) in enumerate(zip(inputs, targets)):
-        padded_inputs[i, :inp.size(0)] = inp
-        padded_targets[i, :tgt.size(0)] = tgt
+        padded_inputs[i, : inp.size(0)] = inp
+        padded_targets[i, : tgt.size(0)] = tgt
 
     return padded_inputs, padded_targets
 
@@ -375,29 +400,35 @@ if __name__ == "__main__":
         trained = (y != -1).sum().item()
         print(f"Masked positions (target=-1): {masked}")
         print(f"Training positions (target!=-1): {trained}")
-        print(f"Training ratio: {100*trained/(masked+trained):.1f}%")
+        print(f"Training ratio: {100 * trained / (masked + trained):.1f}%")
 
         # Show token breakdown
         tok = ds.tokenizer
-        print(f"\nFirst 30 input tokens:")
+        print("\nFirst 30 input tokens:")
         for i in range(min(30, len(x))):
             tid = x[i].item()
             tgt = y[i].item() if i < len(y) else -1
-            token_str = tok.id_to_token(tid) if hasattr(tok, 'id_to_token') else str(tid)
+            token_str = (
+                tok.id_to_token(tid) if hasattr(tok, "id_to_token") else str(tid)
+            )
             mask_str = "TRAIN" if tgt != -1 else "mask"
             print(f"  [{i:3d}] id={tid:5d} target={tgt:5d} {mask_str:5s}  {token_str}")
 
         # Verify collation
         from torch.utils.data import DataLoader
+
         loader = DataLoader(ds, batch_size=4, collate_fn=tool_sft_collate_fn)
         bx, by = next(iter(loader))
         print(f"\nBatch input shape: {bx.shape}, Batch target shape: {by.shape}")
-        print(f"Batch masked: {(by == -1).sum().item()}, training: {(by != -1).sum().item()}")
+        print(
+            f"Batch masked: {(by == -1).sum().item()}, training: {(by != -1).sum().item()}"
+        )
 
         # Show source distribution
-        print(f"\nChecking source distribution (first 1000)...")
+        print("\nChecking source distribution (first 1000)...")
         sources = {}
         import json as _json
+
         with open(data_path) as f:
             for i, line in enumerate(f):
                 if i >= 1000:

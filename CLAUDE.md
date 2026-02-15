@@ -158,14 +158,14 @@ detail of torch_xla, not something we interact with.
 
 All v6e TPUs run a single Python 3.11 venv with these pinned versions:
 
-| Package    | Version         | Why this exact version                                        |
-| ---------- | --------------- | ------------------------------------------------------------- |
-| Python     | **3.11**        | jaxlib 0.7.x+ requires >= 3.11; 3.12 tested but no benefit yet |
-| torch      | **2.9.1**       | Stable release; torch_xla 2.9.0 is compatible                |
-| torch_xla  | **2.9.0**       | Latest stable XLA backend (Nov 2025); 2.10 does NOT exist yet |
-| libtpu     | **0.0.23.1**    | Max compatible with torch_xla 2.9.0 (range: 0.0.21–0.0.23.1) |
-| jax        | **0.9.0**       | Required by torch_xla's Pallas flash attention kernel         |
-| jaxlib     | **0.9.0**       | Must match jax version exactly                                |
+| Package   | Version      | Why this exact version                                         |
+| --------- | ------------ | -------------------------------------------------------------- |
+| Python    | **3.11**     | jaxlib 0.7.x+ requires >= 3.11; 3.12 tested but no benefit yet |
+| torch     | **2.9.1**    | Stable release; torch_xla 2.9.0 is compatible                  |
+| torch_xla | **2.9.0**    | Latest stable XLA backend (Nov 2025); 2.10 does NOT exist yet  |
+| libtpu    | **0.0.23.1** | Max compatible with torch_xla 2.9.0 (range: 0.0.21–0.0.23.1)   |
+| jax       | **0.9.0**    | Required by torch_xla's Pallas flash attention kernel          |
+| jaxlib    | **0.9.0**    | Must match jax version exactly                                 |
 
 > **Version pinning is critical.** Do NOT upgrade any of these independently:
 > - `libtpu >= 0.0.24` breaks with PJRT_ExecuteOptions size mismatch (expects 112, torch_xla provides 80)
@@ -177,17 +177,17 @@ All v6e TPUs run a single Python 3.11 venv with these pinned versions:
 
 Binary search results for libtpu + torch_xla 2.9.0 + flash attention:
 
-| libtpu     | PJRT API | Flash Attention | Status              |
-| ---------- | -------- | --------------- | ------------------- |
-| 0.0.21     | OK       | PASSED          | Default (pinned)    |
-| 0.0.21.1   | OK       | PASSED          | Compatible          |
-| 0.0.22     | OK       | PASSED          | Compatible          |
-| 0.0.23     | OK       | PASSED          | Compatible          |
-| **0.0.23.1** | **OK** | **PASSED**      | **Max compatible**  |
-| 0.0.24     | v0.78    | FAILED          | PJRT API mismatch   |
-| 0.0.27     | v0.80    | FAILED          | PJRT API mismatch   |
-| 0.0.29+    | v0.81+   | FAILED          | PJRT API mismatch   |
-| 0.0.35     | v0.90    | FAILED          | PJRT API mismatch   |
+| libtpu       | PJRT API | Flash Attention | Status             |
+| ------------ | -------- | --------------- | ------------------ |
+| 0.0.21       | OK       | PASSED          | Default (pinned)   |
+| 0.0.21.1     | OK       | PASSED          | Compatible         |
+| 0.0.22       | OK       | PASSED          | Compatible         |
+| 0.0.23       | OK       | PASSED          | Compatible         |
+| **0.0.23.1** | **OK**   | **PASSED**      | **Max compatible** |
+| 0.0.24       | v0.78    | FAILED          | PJRT API mismatch  |
+| 0.0.27       | v0.80    | FAILED          | PJRT API mismatch  |
+| 0.0.29+      | v0.81+   | FAILED          | PJRT API mismatch  |
+| 0.0.35       | v0.90    | FAILED          | PJRT API mismatch  |
 
 The PJRT_ExecuteOptions struct size changed from 80→112 bytes between libtpu 0.0.23.1 and 0.0.24.
 Note: basic TPU init (`xm.xla_device()`) passes with all versions due to XLA's lazy execution,
@@ -198,14 +198,14 @@ but actual computation (`xm.mark_step()`) fails on 0.0.24+.
 With libtpu 0.0.23.1 + torch_xla 2.9.0, all JAX versions from 0.7.0 through 0.9.0 pass
 flash attention tests:
 
-| JAX    | jaxlib | Flash Attention | Status |
-| ------ | ------ | --------------- | ------ |
-| 0.7.0  | 0.7.0  | PASSED          | Minimum compatible |
-| 0.7.1  | 0.7.1  | PASSED          | Compatible |
-| 0.7.2  | 0.7.2  | PASSED          | Compatible |
-| 0.8.0  | 0.8.0  | PASSED          | Compatible |
-| 0.8.3  | 0.8.3  | PASSED          | Compatible |
-| **0.9.0** | **0.9.0** | **PASSED** | **Recommended (latest stable)** |
+| JAX       | jaxlib    | Flash Attention | Status                          |
+| --------- | --------- | --------------- | ------------------------------- |
+| 0.7.0     | 0.7.0     | PASSED          | Minimum compatible              |
+| 0.7.1     | 0.7.1     | PASSED          | Compatible                      |
+| 0.7.2     | 0.7.2     | PASSED          | Compatible                      |
+| 0.8.0     | 0.8.0     | PASSED          | Compatible                      |
+| 0.8.3     | 0.8.3     | PASSED          | Compatible                      |
+| **0.9.0** | **0.9.0** | **PASSED**      | **Recommended (latest stable)** |
 
 A/B performance test (20-step training, v6e-4, 16K seq_len, flash attention) confirmed
 **zero performance regression**: jax 0.9.0 + libtpu 0.0.23.1 matches jax 0.7.0 + libtpu 0.0.21
@@ -263,12 +263,12 @@ nohup python3 -u -m scripts.base_train \
 
 ### Current Experiments (v6e-4, 16K context, d16/270M params)
 
-| Experiment   | Features                  | device_bs | Loss (latest) | MFU     |
-| ------------ | ------------------------- | --------- | ------------- | ------- |
-| longctx      | baseline                  | 2         | ~0.96         | ~66%    |
-| engram       | --engram --engram_layers  | 2         | ~1.05         | ~47%    |
-| mhc          | --mhc                     | 1         | ~1.02         | ~35%    |
-| mhc+engram   | --mhc --engram            | 2         | **~0.91**     | ~49%    |
+| Experiment | Features                 | device_bs | Loss (latest) | MFU  |
+| ---------- | ------------------------ | --------- | ------------- | ---- |
+| longctx    | baseline                 | 2         | ~0.96         | ~66% |
+| engram     | --engram --engram_layers | 2         | ~1.05         | ~47% |
+| mhc        | --mhc                    | 1         | ~1.02         | ~35% |
+| mhc+engram | --mhc --engram           | 2         | **~0.91**     | ~49% |
 
 ### v6e-8 Full Pipeline (64K context, d24/877M, TP=4)
 
@@ -300,18 +300,18 @@ nohup python3 -u -m scripts.base_train \
 
 **Run config**:
 
-| Parameter | Value |
-|-----------|-------|
-| Model | d=24, model_dim=1536, 12 heads, head_dim=128 |
-| Parameters | 877M (AAM hybrid: Attention-Attention-Mamba pattern) |
-| Sequence length | 65,536 (64K) |
-| Parallelism | 2-way data × 4-way tensor (SPMD 2D mesh) |
-| Batch size | 524,288 tokens per optimizer step |
-| Grad accumulation | 4 steps (131K tokens per fwd/bwd) |
-| Training tokens | 26.2B (30:1 token:param ratio) |
-| Iterations | 50,000 |
-| Throughput | ~200K tok/sec, ~2.5s per step |
-| ETA | ~36 hours |
+| Parameter         | Value                                                |
+| ----------------- | ---------------------------------------------------- |
+| Model             | d=24, model_dim=1536, 12 heads, head_dim=128         |
+| Parameters        | 877M (AAM hybrid: Attention-Attention-Mamba pattern) |
+| Sequence length   | 65,536 (64K)                                         |
+| Parallelism       | 2-way data × 4-way tensor (SPMD 2D mesh)             |
+| Batch size        | 524,288 tokens per optimizer step                    |
+| Grad accumulation | 4 steps (131K tokens per fwd/bwd)                    |
+| Training tokens   | 26.2B (30:1 token:param ratio)                       |
+| Iterations        | 50,000                                               |
+| Throughput        | ~200K tok/sec, ~2.5s per step                        |
+| ETA               | ~36 hours                                            |
 
 **Training data**: `cpp_compilable_64k` — 393,782 documents, 3.4 GB (8 shards + val)
 - Source: 93 C++ open-source projects processed by `tools/cpp_chunker` in compilable mode
@@ -346,25 +346,25 @@ With 8 chips and `--tensor_parallel=4`, the mesh is `(dp=2, tp=4)` — 2-way dat
 
 #### TP Dimension Compatibility Table
 
-| Depth | model_dim | num_heads (head_dim=128) | TP=2 | TP=4 | TP=8 |
-|-------|-----------|--------------------------|------|------|------|
-| 12    | 768       | 6                        | OK   | NO   | NO   |
-| 16    | 1024      | 8                        | OK   | OK   | OK   |
-| 20    | 1280      | 10                       | OK   | NO   | NO   |
-| **24**| **1536**  | **12**                   | **OK** | **OK** | **NO** |
-| 32    | 2048      | 16                       | OK   | OK   | OK   |
-| 48    | 3072      | 24                       | OK   | OK   | OK   |
+| Depth  | model_dim | num_heads (head_dim=128) | TP=2   | TP=4   | TP=8   |
+| ------ | --------- | ------------------------ | ------ | ------ | ------ |
+| 12     | 768       | 6                        | OK     | NO     | NO     |
+| 16     | 1024      | 8                        | OK     | OK     | OK     |
+| 20     | 1280      | 10                       | OK     | NO     | NO     |
+| **24** | **1536**  | **12**                   | **OK** | **OK** | **NO** |
+| 32     | 2048      | 16                       | OK     | OK     | OK     |
+| 48     | 3072      | 24                       | OK     | OK     | OK     |
 
 **Why TP=8 fails for d=24**: 12 heads / 8 chips = 1.5 — not integer. The Q/K/V weight
 sharding creates tensors with incompatible dimensions for the attention head reshape.
 
 #### Memory & Throughput Scaling
 
-| Config (d=24, 877M) | Per-chip HBM | Seq Len | Grad Accum | Status |
-|---------------------|-------------|---------|------------|--------|
-| TP=1, dp=8          | 45.5 GB     | 65536   | 1          | OOM (31.25 GB limit) |
-| TP=4, dp=2          | ~12 GB      | 65536   | 4          | **WORKING** (~200K tok/s) |
-| TP=1, dp=8          | ~6 GB       | 2048    | 32         | OK (sanity test only) |
+| Config (d=24, 877M) | Per-chip HBM | Seq Len | Grad Accum | Status                    |
+| ------------------- | ------------ | ------- | ---------- | ------------------------- |
+| TP=1, dp=8          | 45.5 GB      | 65536   | 1          | OOM (31.25 GB limit)      |
+| TP=4, dp=2          | ~12 GB       | 65536   | 4          | **WORKING** (~200K tok/s) |
+| TP=1, dp=8          | ~6 GB        | 2048    | 32         | OK (sanity test only)     |
 
 #### Grad Accum Calculation
 
@@ -428,11 +428,11 @@ cd tools/cpp_chunker && cargo build --release
 
 ### Processing Modes
 
-| Mode | Flags | Use Case |
-|------|-------|----------|
-| Project-aware | `--project-dirs <dir>` | Process raw project dirs with dependency DAG |
+| Mode           | Flags                               | Use Case                                             |
+| -------------- | ----------------------------------- | ---------------------------------------------------- |
+| Project-aware  | `--project-dirs <dir>`              | Process raw project dirs with dependency DAG         |
 | **Compilable** | `--project-dirs <dir> --compilable` | **Best quality** — types before functions, bottom-up |
-| Cross-file | `--cross-file --inputs <jsonl>` | Two-pass JSONL mode with global function index |
+| Cross-file     | `--cross-file --inputs <jsonl>`     | Two-pass JSONL mode with global function index       |
 
 ### Quick Commands (build3: 35.242.211.80)
 
@@ -582,44 +582,44 @@ for zone in us-central1-f us-east1-c us-east5-a europe-west4-a asia-northeast1-b
 done
 ```
 
-| Name | Zone | Type | Chips | Status | Purpose |
-|------|------|------|-------|--------|---------|
-| nanochat-v6e-engram | asia-northeast1-b | v6e-4 | 4 | READY (idle) | Engram pretraining (50K steps complete) |
-| nanochat-v6e-longctx | asia-northeast1-b | v6e-4 | 4 | READY (idle) | Long-context training |
-| nanochat-v6e-mhc | asia-northeast1-b | v6e-4 | 4 | READY (idle) | MHC experiments |
-| nanochat-v6e-small | asia-northeast1-b | v6e-4 | 4 | PREEMPTED | Spot instance (dead) |
-| nanochat-v6e-mhc-engram | europe-west4-a | v6e-4 | 4 | READY | SFT training (tool_call_sft) |
-| nanochat-v6e8-hybrid-eu | europe-west4-a | v6e-8 | 8 | READY | d24 hybrid Mamba+Attn+Engram+MHC+MTP+DSA, 64K ctx, TP=4 |
-| nanochat-v6e8-mtp | europe-west4-a | v6e-8 | 8 | READY | d16 MTP+DSA+Engram+MHC, 64K ctx, 50K steps |
+| Name                    | Zone              | Type  | Chips | Status       | Purpose                                                 |
+| ----------------------- | ----------------- | ----- | ----- | ------------ | ------------------------------------------------------- |
+| nanochat-v6e-engram     | asia-northeast1-b | v6e-4 | 4     | READY (idle) | Engram pretraining (50K steps complete)                 |
+| nanochat-v6e-longctx    | asia-northeast1-b | v6e-4 | 4     | READY (idle) | Long-context training                                   |
+| nanochat-v6e-mhc        | asia-northeast1-b | v6e-4 | 4     | READY (idle) | MHC experiments                                         |
+| nanochat-v6e-small      | asia-northeast1-b | v6e-4 | 4     | PREEMPTED    | Spot instance (dead)                                    |
+| nanochat-v6e-mhc-engram | europe-west4-a    | v6e-4 | 4     | READY        | SFT training (tool_call_sft)                            |
+| nanochat-v6e8-hybrid-eu | europe-west4-a    | v6e-8 | 8     | READY        | d24 hybrid Mamba+Attn+Engram+MHC+MTP+DSA, 64K ctx, TP=4 |
+| nanochat-v6e8-mtp       | europe-west4-a    | v6e-8 | 8     | READY        | d16 MTP+DSA+Engram+MHC, 64K ctx, 50K steps              |
 
 ### GPU VMs
 
-| Name | Zone | Type | GPU | Status | Purpose |
-|------|------|------|-----|--------|---------|
+| Name            | Zone          | Type          | GPU       | Status  | Purpose     |
+| --------------- | ------------- | ------------- | --------- | ------- | ----------- |
 | small-a100-40gb | us-central1-f | a2-highgpu-1g | A100 40GB | RUNNING | Dev/testing |
 
 ### Build / CI VMs
 
-| Name | Zone | Type | Status | Purpose |
-|------|------|------|--------|---------|
-| build3 | europe-west3-c | c4-highmem-48-lssd | RUNNING | Primary data pipeline (2.9TB NVMe, 48 CPUs) |
-| build2 | europe-west3-c | c4-highmem-32-lssd | RUNNING | Secondary build |
-| build1 | europe-west3-b | c4-highmem-32-lssd | RUNNING | Build |
-| github-runner-16c-64g-1tb-2 | us-east5-a | c2-standard-60 | RUNNING | GitHub Actions runner |
-| github-runner-16c-64g-512ssd | us-east5-a | custom n2-16-78GB | RUNNING | GitHub Actions runner |
+| Name                         | Zone           | Type               | Status  | Purpose                                     |
+| ---------------------------- | -------------- | ------------------ | ------- | ------------------------------------------- |
+| build3                       | europe-west3-c | c4-highmem-48-lssd | RUNNING | Primary data pipeline (2.9TB NVMe, 48 CPUs) |
+| build2                       | europe-west3-c | c4-highmem-32-lssd | RUNNING | Secondary build                             |
+| build1                       | europe-west3-b | c4-highmem-32-lssd | RUNNING | Build                                       |
+| github-runner-16c-64g-1tb-2  | us-east5-a     | c2-standard-60     | RUNNING | GitHub Actions runner                       |
+| github-runner-16c-64g-512ssd | us-east5-a     | custom n2-16-78GB  | RUNNING | GitHub Actions runner                       |
 
 ### Other VMs (non-nanochat)
 
-| Name | Zone | Status | Purpose |
-|------|------|--------|---------|
-| azaycev-codepush-contazer | us-central1-c | RUNNING | Codepush container |
-| instance-20250829-* (x2) | us-central1-c | RUNNING | Legacy e2-medium |
-| instance-20250829-212121 | europe-west3-c | RUNNING | Legacy e2-medium |
-| colab-1-vm | us-west1-b | RUNNING | Colab |
-| rescue-vm | europe-west3-b | RUNNING | Rescue/recovery |
-| rdavlets | me-west1-b | RUNNING | e2-micro |
-| azaycev-img-downloader | us-central1-f | TERMINATED | Image processing |
-| azaycev-img-receiver | us-central1-f | TERMINATED | Image processing |
+| Name                      | Zone           | Status     | Purpose            |
+| ------------------------- | -------------- | ---------- | ------------------ |
+| azaycev-codepush-contazer | us-central1-c  | RUNNING    | Codepush container |
+| instance-20250829-* (x2)  | us-central1-c  | RUNNING    | Legacy e2-medium   |
+| instance-20250829-212121  | europe-west3-c | RUNNING    | Legacy e2-medium   |
+| colab-1-vm                | us-west1-b     | RUNNING    | Colab              |
+| rescue-vm                 | europe-west3-b | RUNNING    | Rescue/recovery    |
+| rdavlets                  | me-west1-b     | RUNNING    | e2-micro           |
+| azaycev-img-downloader    | us-central1-f  | TERMINATED | Image processing   |
+| azaycev-img-receiver      | us-central1-f  | TERMINATED | Image processing   |
 
 ### GCS Buckets
 
